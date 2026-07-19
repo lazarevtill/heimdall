@@ -1,0 +1,5 @@
+{
+  "_comment": "Example only. Real manifest is tofu-rendered from the IaC repo; no real addresses here.",
+  "generated_at": "<rfc3339>",
+  "expectations": [], "targets": [], "tier2": [], "signatures": [], "exemptions": []
+}
