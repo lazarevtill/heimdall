@@ -1,0 +1,10 @@
+# HELP heimdall_finding Active Heimdall finding; 1 while firing or unknown.
+# TYPE heimdall_finding gauge
+heimdall_finding{check="c1-deadman",class="hard",fingerprint="d86c07b5a41742c1",group="backup-ds1",node="node-a",severity="critical",source="heimdall",target="backup:ds1/vm-100"} 1
+heimdall_finding{check="c2-unit-failed",class="hard",fingerprint="34915542b733a584",group="node-a",node="node-a",severity="warning",source="heimdall",target="node-a"} 1
+# HELP heimdall_redaction_failures_total Redaction failures during the last run; any nonzero value pages.
+# TYPE heimdall_redaction_failures_total counter
+heimdall_redaction_failures_total 0
+# HELP heimdall_last_run_timestamp_seconds Unix time of the last completed detector run.
+# TYPE heimdall_last_run_timestamp_seconds gauge
+heimdall_last_run_timestamp_seconds{plane="tier1"} 1752900000
