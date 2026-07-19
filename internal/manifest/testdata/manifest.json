@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-07-19T00:00:00Z",
+  "expectations": [
+    {
+      "id": "backup-vm-100",
+      "check": "c1-deadman",
+      "group": "backup-ds1",
+      "target": "backup:ds1/vm-100",
+      "node": "node-a",
+      "grace_seconds": 3600,
+      "severity_on_miss": "critical",
+      "verify": {
+        "backend": "prometheus",
+        "query": "max(backup_last_success_timestamp_seconds{backup_id=\"vm-100\"})"
+      }
+    },
+    {
+      "id": "unit-failures-node-a",
+      "check": "c4-signature",
+      "group": "node-a",
+      "target": "node-a",
+      "node": "node-a",
+      "grace_seconds": 0,
+      "severity_on_miss": "warning",
+      "verify": {
+        "backend": "prometheus",
+        "query": "sum(node_systemd_units{state=\"failed\"})",
+        "min_count": 1
+      }
+    }
+  ]
+}

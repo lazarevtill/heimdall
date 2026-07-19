@@ -464,10 +464,15 @@ func Redact(s string) string {
 	return s
 }
 
-// EvidenceOrWithheld is the mandatory egress wrapper: truncate, then redact;
+// EvidenceOrWithheld is the mandatory egress wrapper: redact, then truncate;
 // if the redactor fails for any reason, withhold the content entirely and
 // report the failure (failed=true) so the caller can count it into
 // heimdall_redaction_failures_total.
+//
+// Order matters: redaction MUST run before truncation. Truncating first can
+// cut a secret's tail at the byte boundary, leaving a head that no longer
+// matches any pattern and leaks. Truncating the redacted output can at worst
+// clip a "[REDACTED:...]" marker, never a secret.
 func EvidenceOrWithheld(s string) (out string, failed bool) {
 	return evidenceOrWithheld(s, Redact)
 }
@@ -478,10 +483,11 @@ func evidenceOrWithheld(s string, redact func(string) string) (out string, faile
 			out, failed = Withheld, true
 		}
 	}()
-	if len(s) > maxEvidenceBytes {
-		s = s[:maxEvidenceBytes]
+	r := redact(s)
+	if len(r) > maxEvidenceBytes {
+		r = r[:maxEvidenceBytes]
 	}
-	return redact(s), false
+	return r, false
 }
 ```
 
