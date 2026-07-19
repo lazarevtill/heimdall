@@ -1,0 +1,31 @@
+# Heimdall meta-rules: the alerts that watch the watcher. Until these are
+# applied to Prometheus via the IaC alerts path, a crashed detector is NOT
+# alertable — deploying this file is part of the detector slice, not
+# optional polish.
+groups:
+  - name: heimdall-meta
+    rules:
+      - alert: HeimdallDetectorStale
+        expr: time() - heimdall_last_run_timestamp_seconds{plane="tier1"} > 900
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall detector has not completed a run in 15m"
+          description: "The heartbeat gauge stopped advancing: the detector is crashing, hanging, or failing before its atomic .prom write (which deliberately withholds the heartbeat on failure)."
+      - alert: HeimdallDetectorAbsent
+        expr: absent(heimdall_last_run_timestamp_seconds{plane="tier1"})
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall heartbeat series is absent"
+          description: "Bootstrap gap, deleted textfile, or node_exporter rejected the .prom file (e.g. stray line timestamp). Absence is never treated as ok."
+      - alert: HeimdallRedactionFailure
+        expr: heimdall_redaction_failures_total > 0
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall redaction failed during the last run"
+          description: "Evidence was withheld (content-fail-closed). A broken redactor must page — it can never silently withhold forever."
