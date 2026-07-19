@@ -13,6 +13,14 @@ import (
 // untouched and the temp file is removed.
 func WriteFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	// Create the textfile dir if absent (WriteSpool already does this for the
+	// spool dir); a first run before the systemd unit's tmpfiles entry lands
+	// otherwise fails every time instead of self-healing. If a path component
+	// is a non-directory this still errors, preserving the fail-closed
+	// contract exercised by TestWriteFileAtomicCreateFailure.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("emit: ensure dir %s: %w", dir, err)
+	}
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("emit: create temp in %s: %w", dir, err)

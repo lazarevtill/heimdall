@@ -54,6 +54,15 @@ func Load(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest: parse %s: %w", path, err)
 	}
 	seen := make(map[string]bool, len(m.Expectations))
+	// The ID is the human-facing manifest key, but every downstream package
+	// (the .prom series identity in emit, the spool filename) keys on
+	// Fingerprint(check,target) — NOT the ID. Two expectations with distinct
+	// IDs but identical (check,target) pass the ID dedup, then emit two
+	// byte-identical heimdall_finding series; node_exporter's textfile
+	// collector rejects a file with duplicate series and drops EVERY metric
+	// in it, heartbeat included — one manifest typo blinds the whole detector.
+	// Reject the collision here, at the validation boundary.
+	seenFP := make(map[string]string, len(m.Expectations))
 	for i, e := range m.Expectations {
 		where := fmt.Sprintf("expectations[%d] (id %q)", i, e.ID)
 		switch {
@@ -80,6 +89,11 @@ func Load(path string) (*Manifest, error) {
 		default:
 			return nil, fmt.Errorf("%w: %s: invalid severity_on_miss %q", ErrInvalid, where, e.SeverityOnMiss)
 		}
+		fp := contract.Fingerprint(e.Check, e.Target)
+		if prev, ok := seenFP[fp]; ok {
+			return nil, fmt.Errorf("%w: %s: (check,target) collides with id %q — identical fingerprint %s would emit duplicate .prom series and clobber a spool doc", ErrInvalid, where, prev, fp)
+		}
+		seenFP[fp] = e.ID
 		seen[e.ID] = true
 	}
 	return &m, nil

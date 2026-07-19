@@ -41,6 +41,9 @@ func TestLoadRejectsInvalid(t *testing.T) {
 		{"duplicate id", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}},
 			{"id":"a","check":"c4-signature","group":"g","target":"t2","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`},
+		{"duplicate (check,target) fingerprint", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"backup-primary","check":"c1-deadman","group":"g","target":"backup:ds1/vm-100","node":"n","grace_seconds":60,"severity_on_miss":"critical","verify":{"backend":"prometheus","query":"up"}},
+			{"id":"backup-secondary","check":"c1-deadman","group":"g","target":"backup:ds1/vm-100","node":"n","grace_seconds":60,"severity_on_miss":"critical","verify":{"backend":"prometheus","query":"up"}}]}`},
 		{"bad severity", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"panic","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`},
 		{"pipe in check id", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[

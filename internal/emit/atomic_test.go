@@ -30,6 +30,18 @@ func TestWriteFileAtomicRoundTrip(t *testing.T) {
 
 // Root-proof failure injection #1: the temp-create step fails when the
 // parent "directory" is a regular file (ENOTDIR ignores CAP_DAC_OVERRIDE).
+func TestWriteFileAtomicCreatesMissingDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "textfile", "heimdall.prom")
+	if err := emit.WriteFileAtomic(path, []byte("v1\n")); err != nil {
+		t.Fatalf("WriteFileAtomic into missing dir: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "v1\n" {
+		t.Fatalf("content = %q err = %v", got, err)
+	}
+}
+
 func TestWriteFileAtomicCreateFailure(t *testing.T) {
 	dir := t.TempDir()
 	notdir := filepath.Join(dir, "plainfile")

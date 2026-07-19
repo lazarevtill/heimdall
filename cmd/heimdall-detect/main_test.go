@@ -63,8 +63,11 @@ func TestRunEndToEnd(t *testing.T) {
 	if strings.Contains(string(prom), "state=") {
 		t.Errorf("state label leaked into wire label set:\n%s", prom)
 	}
-	if !strings.Contains(string(prom), "heimdall_last_run_timestamp_seconds") {
-		t.Error("heartbeat sample missing")
+	// Pin the FULL series, not just the metric name: both meta-rules
+	// (HeimdallDetectorStale/Absent) select on {plane="tier1"}, so the
+	// emitted label must match that literal at the integration layer too.
+	if !strings.Contains(string(prom), `heimdall_last_run_timestamp_seconds{plane="tier1"}`) {
+		t.Errorf("heartbeat series heimdall_last_run_timestamp_seconds{plane=\"tier1\"} missing:\n%s", prom)
 	}
 	if !strings.Contains(string(prom), "heimdall_redaction_failures_total 0") {
 		t.Error("redaction failure counter missing")
