@@ -53,7 +53,7 @@
 - Fingerprint contract, frozen: `hex(sha256(check_id + "|" + target))[:16]`; check IDs must not contain `|`; the four golden vectors in Task 1 may never change.
 - Wire label set for `heimdall_finding`, frozen: `{check, class, fingerprint, group, node, severity, source, target}` — NO `state` label (state is spool-doc-only; series identity must survive firing↔unknown).
 - Trust invariants every task preserves: a failed/unknown query, missing wiring, or panicking check ALWAYS yields exactly one alertable Unknown finding (never a silent ok, never a blanked sibling); `.prom` is replaced whole-file via temp-in-same-dir + fsync + rename, never with line timestamps; `class=trend` capped at warning in code; `class=hypothesis` refused by the constructor; redaction failures are counted and exported, never swallowed.
-- No real IPs, hostnames, or secrets anywhere — placeholders only (`node-a`, `ds1`, `vm-100`, `127.0.0.1`, httptest URLs). The only token-shaped string allowed is the defanged `glpat-EXAMPLEexample12345678`. Enforced by `make lint`.
+- No real IPs, hostnames, or secrets in the SHIPPED surface (code, plan, deploy) — placeholders only (`node-a`, `ds1`, `vm-100`, `127.0.0.1`, httptest URLs). The only token-shaped string allowed is the defanged `glpat-EXAMPLEexample12345678`. Enforced by `make lint` (which excludes `design/` + `README.md` — prose design records kept full-detail on the private GitLab remote and sanitized separately for the public GitHub mirror).
 - Tests: stdlib `testing` + go-cmp, table-driven subtests; suite green under `-race` at the end of every task. Commit after every green cycle.
 
 ---
@@ -2894,9 +2894,15 @@ lint:
 	@if grep -rn --include='*.go' 'contract\.Finding{' cmd/ internal/ | grep -v '^internal/contract/' \
 		| sed 's/\[\]contract\.Finding{//g' | grep 'contract\.Finding{'; then \
 		echo "contract.Finding literals outside internal/contract are banned: use NewFinding (ADR-G09)"; exit 1; fi
-	@if git grep -nE '192\.168\.|lazarev\.cloud|pbsHGST' -- ':!Makefile'; then \
-		echo "real-infrastructure string leaked into the public repo"; exit 1; fi
-	@if git grep -nE 'glpat-[A-Za-z0-9_-]{20,}' -- ':!Makefile' ':!internal/contract/redact.go' ':!*_test.go'; then \
+	# Scope: the shipped CODE + deploy + CI surface. Prose records (design/,
+	# docs/, README.md) legitimately QUOTE these patterns (redaction rules,
+	# this very gate) and are kept full-detail on the private GitLab remote,
+	# sanitized separately for the public GitHub mirror (two-repo model) — so
+	# they are excluded here, exactly as the Makefile and redact.go are. The
+	# gate still guarantees no real infra string reaches code/deploy/CI.
+	@if git grep -nE '192\.168\.|lazarev\.cloud|pbsHGST' -- ':!Makefile' ':!design/' ':!docs/' ':!README.md'; then \
+		echo "real-infrastructure string leaked into shipped code/deploy/CI"; exit 1; fi
+	@if git grep -nE 'glpat-[A-Za-z0-9_-]{20,}' -- ':!Makefile' ':!design/' ':!docs/' ':!README.md' ':!internal/contract/redact.go' ':!*_test.go'; then \
 		echo "secret-shaped token outside the defanged test fixtures"; exit 1; fi
 	$(GO) mod verify
 
