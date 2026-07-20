@@ -135,3 +135,52 @@ func TestRenderPromEscapesLabelValues(t *testing.T) {
 		t.Errorf("label value not escaped per exposition format:\n%s", out)
 	}
 }
+
+// RenderAnalystProm's output is a small, fully deterministic body (no map
+// iteration, no finding loop) — pin it exactly rather than via a golden
+// file.
+func TestRenderAnalystPromGolden(t *testing.T) {
+	got := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), 2, 1, 3, 4, 5, 6))
+	want := "" +
+		"# HELP heimdall_analyst_last_success_timestamp_seconds Unix time of the last successful Tier-3 analyst run.\n" +
+		"# TYPE heimdall_analyst_last_success_timestamp_seconds gauge\n" +
+		"heimdall_analyst_last_success_timestamp_seconds 1752900000\n" +
+		"# HELP heimdall_analyst_hypotheses_posted_total Hypotheses POSTed to the bridge during the last analyst run.\n" +
+		"# TYPE heimdall_analyst_hypotheses_posted_total counter\n" +
+		"heimdall_analyst_hypotheses_posted_total 2\n" +
+		"# HELP heimdall_analyst_hypotheses_hallucinated_total Hypotheses dropped for citing an empty or nonexistent evidence row_id.\n" +
+		"# TYPE heimdall_analyst_hypotheses_hallucinated_total counter\n" +
+		"heimdall_analyst_hypotheses_hallucinated_total 1\n" +
+		"# HELP heimdall_analyst_hypotheses_deduped_total Hypotheses dropped: the same hyp_fp was posted within the cooldown window.\n" +
+		"# TYPE heimdall_analyst_hypotheses_deduped_total counter\n" +
+		"heimdall_analyst_hypotheses_deduped_total 3\n" +
+		"# HELP heimdall_analyst_hypotheses_capped_total Hypotheses dropped for exceeding the per-run volume cap.\n" +
+		"# TYPE heimdall_analyst_hypotheses_capped_total counter\n" +
+		"heimdall_analyst_hypotheses_capped_total 4\n" +
+		"# HELP heimdall_analyst_hypotheses_invalid_total Hypotheses dropped for an out-of-vocabulary kind or confidence.\n" +
+		"# TYPE heimdall_analyst_hypotheses_invalid_total counter\n" +
+		"heimdall_analyst_hypotheses_invalid_total 5\n" +
+		"# HELP heimdall_redaction_failures_total Redaction failures during the last run; any nonzero value pages.\n" +
+		"# TYPE heimdall_redaction_failures_total counter\n" +
+		`heimdall_redaction_failures_total{plane="tier3"} 6` + "\n"
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("RenderAnalystProm output mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// The Tier-1 redaction series is unlabeled; the Tier-3 one must carry a
+// distinct plane label so the two textfiles, once merged by node_exporter's
+// textfile collector, never collide on an identical metric+label set.
+func TestRenderAnalystPromRedactionPlaneLabelAvoidsCollision(t *testing.T) {
+	tier1 := string(emit.RenderProm(time.Unix(1752900000, 0).UTC(), nil, 1, time.Time{}))
+	tier3 := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), 0, 0, 0, 0, 0, 1))
+	if !strings.Contains(tier1, "heimdall_redaction_failures_total 1\n") {
+		t.Fatalf("tier1 fixture missing unlabeled redaction series:\n%s", tier1)
+	}
+	if !strings.Contains(tier3, `heimdall_redaction_failures_total{plane="tier3"} 1`) {
+		t.Errorf("tier3 redaction series missing plane label:\n%s", tier3)
+	}
+	if strings.Contains(tier3, "heimdall_redaction_failures_total 1\n") {
+		t.Errorf("tier3 redaction series must not also render the unlabeled Tier-1 shape:\n%s", tier3)
+	}
+}

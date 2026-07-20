@@ -6,6 +6,7 @@ GO ?= go
 # run with cgo enabled because `go test -race` requires it (ADR-G14).
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-detect ./cmd/heimdall-detect
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-analyst ./cmd/heimdall-analyst
 
 test:
 	CGO_ENABLED=1 $(GO) test -race ./...
