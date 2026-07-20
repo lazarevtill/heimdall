@@ -7,13 +7,42 @@ reasons over the results but is structurally barred from the alerting path.
 
 ## Architecture
 
-```
- sources                detect                       emit / deliver
- ───────                ──────                       ──────────────
- Prometheus  ┐                                    ┌ .prom textfile → Alertmanager ┐
- VictoriaLogs├─▶ Tier 1: hard checks ─────────────┤                               ├─▶ Telegram
- PBS         │   Tier 2: soft signals ─┐          └ YouTrack issues (bridge)      │   (notifier)
- plugins     ┘                         └─▶ digest ─▶ Tier 3: llama.cpp analyst ───┘   + silences
+```mermaid
+flowchart LR
+    subgraph src[Sources]
+        P[Prometheus]
+        V[VictoriaLogs]
+        B[PBS]
+        PL[plugins]
+    end
+
+    subgraph det[heimdall-detect]
+        T1[Tier 1<br/>hard checks]
+        T2[Tier 2<br/>soft signals]
+        DG[(digest)]
+    end
+
+    T3[heimdall-analyst<br/>Tier 3 · llama.cpp]
+    BR[heimdall-bridge]
+    NO[heimdall-notifier]
+    PROM[[.prom textfile]]
+    AM{{Alertmanager}}
+    YT[(YouTrack)]
+    TG[Telegram]
+
+    P & V & B & PL --> T1 & T2
+    T1 --> PROM
+    T2 --> PROM
+    T2 --> DG
+    DG --> T3
+
+    PROM --> AM
+    AM -->|webhook /am| BR
+    T3 -->|POST /hypothesis| BR
+    BR --> YT
+    BR -->|notify_outbox| NO
+    NO --> TG
+    NO -->|silences| AM
 ```
 
 Four independent binaries, each with its own liveness heartbeat:
