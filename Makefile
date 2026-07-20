@@ -7,6 +7,7 @@ GO ?= go
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-detect ./cmd/heimdall-detect
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-analyst ./cmd/heimdall-analyst
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-bridge ./cmd/heimdall-bridge
 
 test:
 	CGO_ENABLED=1 $(GO) test -race ./...
