@@ -14,12 +14,16 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/lazarevtill/heimdall/internal/baseline"
 	"github.com/lazarevtill/heimdall/internal/config"
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/detect"
+	"github.com/lazarevtill/heimdall/internal/digest"
 	"github.com/lazarevtill/heimdall/internal/emit"
 	"github.com/lazarevtill/heimdall/internal/ledger"
 	"github.com/lazarevtill/heimdall/internal/manifest"
 	"github.com/lazarevtill/heimdall/internal/source"
+	"github.com/lazarevtill/heimdall/internal/tier2"
 )
 
 func main() {
@@ -44,6 +48,15 @@ func run() error {
 	}
 	defer led.Close()
 
+	// bstore is the Tier-2 baseline/warm-up/crossing store, opened against
+	// the SAME state.db file as the ledger — an intended shared-file design
+	// (see internal/baseline's package doc).
+	bstore, err := baseline.Open(cfg.StateDBPath)
+	if err != nil {
+		return err
+	}
+	defer bstore.Close()
+
 	sources := map[string]source.Source{
 		"prometheus": source.NewProm(cfg.PromURL, nil),
 	}
@@ -62,6 +75,70 @@ func run() error {
 	now := time.Now().UTC() // the only time.Now() in the program
 	findings := eng.Run(ctx, now, m)
 
+	// Tier-2: soft-signal evaluation over the manifest's declarative specs.
+	// Every spec produces exactly one tier2.Result (a digest row, and/or
+	// marker, and/or a graduated finding); graduated trend findings are
+	// appended into the SAME findings slice so they ride the one ledger +
+	// spool + .prom emission path — there is no second emission path.
+	tier2Sources := map[string]source.Source{
+		"prometheus": source.NewProm(cfg.PromURL, nil),
+	}
+	if cfg.VLURL != "" {
+		tier2Sources["victorialogs"] = source.NewVictoriaLogs(
+			cfg.VLURL, cfg.Credentials["HEIMDALL_VL_USER"], cfg.Credentials["HEIMDALL_VL_PASS"], nil)
+	}
+	tier2Results := make([]tier2.Result, 0, len(m.Tier2))
+	for _, spec := range m.Tier2 {
+		var sig source.Signal
+		if src, ok := tier2Sources[spec.Backend]; ok {
+			var qerr error
+			sig, qerr = src.Query(ctx, source.Query{ID: spec.ID, Expr: spec.Query})
+			if qerr != nil {
+				// Fail-closed: mirror the Tier-1 engine's evalOne pattern —
+				// the check sees an explicit Unknown signal.
+				sig = source.Signal{QueryID: spec.ID, State: contract.StateUnknown, Err: qerr.Error()}
+			}
+		} else {
+			// A missing backend must surface as an unknown digest row, never
+			// silently vanish — do NOT skip this spec.
+			sig = source.Signal{QueryID: spec.ID, State: contract.StateUnknown,
+				Err: "no source wired for backend " + spec.Backend}
+		}
+		res, everr := tier2.Eval(now, spec, sig, bstore)
+		if everr != nil {
+			// A single spec's store error must not abort the whole run or
+			// the digest: log and continue with whatever partial res holds.
+			fmt.Fprintln(os.Stderr, "heimdall-detect: tier2 eval", spec.ID, "failed:", everr)
+		}
+		tier2Results = append(tier2Results, res)
+		if res.Finding != nil {
+			findings = append(findings, *res.Finding)
+		}
+	}
+
+	// openTier1 cross-links the digest to already-firing/unknown hard
+	// findings on the same target; Tier-2's own graduated findings are
+	// class=trend, excluded here.
+	var openTier1 []contract.OpenTier1Finding
+	for _, f := range findings {
+		if f.Class == contract.ClassHard && f.State != contract.StateOK {
+			openTier1 = append(openTier1, contract.OpenTier1Finding{
+				Fingerprint: f.Fingerprint, Check: f.Check, Target: f.Target,
+			})
+		}
+	}
+	var suppressed []string // TODO(S5): suppression authority feeds this
+
+	dg := digest.Build(now, m.GeneratedAt, tier2Results, openTier1, suppressed)
+	// The digest is written BEFORE the ledger upsert / spool / .prom: if this
+	// fails we return here WITHOUT touching the old .prom, so the heartbeat
+	// stays withheld and the staleness meta-rule reports us — a failed
+	// digest write can never look like a clean run.
+	digestFailures, err := digest.Write(cfg.DigestDir, dg, now)
+	if err != nil {
+		return err
+	}
+
 	if err := led.Upsert(now, findings); err != nil {
 		return err
 	}
@@ -76,6 +153,6 @@ func run() error {
 	}
 	return emit.WriteFileAtomic(
 		filepath.Join(cfg.TextfileDir, "heimdall.prom"),
-		emit.RenderProm(now, findings, redactionFailures),
+		emit.RenderProm(now, findings, redactionFailures+digestFailures, dg.GeneratedAt),
 	)
 }

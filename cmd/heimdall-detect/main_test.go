@@ -1,25 +1,37 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lazarevtill/heimdall/internal/contract"
 )
 
 // End-to-end: manifest -> engine -> ledger -> spool -> atomic .prom,
 // against an httptest Prometheus stand-in. The dead-man target has no
-// fresh success, so the run must produce a firing finding.
+// fresh success, so the run must produce a firing finding. The manifest
+// also carries one Tier-2 quantile spec (backend prometheus, same stub) so
+// the Tier-2 phase, the digest producer, and the digest-freshness metric
+// are all exercised end to end.
 func TestRunEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// stale success timestamp -> dead-man fires; threshold query returns 0
-		if strings.Contains(r.URL.RawQuery, "backup_last_success") {
+		switch {
+		// stale success timestamp -> dead-man fires
+		case strings.Contains(r.URL.RawQuery, "backup_last_success"):
 			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"1752800000"]}]}}`))
-			return
+		// Tier-2 quantile query: a real measured sample, well past the
+		// spec's graduate_threshold, so the ONLY thing that can be
+		// suppressing graduation on a fresh DB is the warm-up gate.
+		case strings.Contains(r.URL.RawQuery, "quantile_over_time"):
+			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"0.95"]}]}}`))
+		default: // threshold query returns 0
+			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"0"]}]}}`))
 		}
-		w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"0"]}]}}`))
 	}))
 	defer srv.Close()
 
@@ -34,6 +46,14 @@ func TestRunEndToEnd(t *testing.T) {
 	    {"id":"unit-failures-node-a","check":"c4-signature","group":"node-a","target":"node-a","node":"node-a",
 	     "severity_on_miss":"warning",
 	     "verify":{"backend":"prometheus","query":"sum(node_systemd_units)","min_count":1}}
+	  ],
+	  "tier2": [
+	    {"id":"c6-quantile-creep-node-a","signal":"quantile","check":"c6-quantile-creep","group":"node",
+	     "entity":"host","target":"node-a","node":"node-a","feature":"cpu_p95_creep","unit":"ratio",
+	     "backend":"prometheus","query":"quantile_over_time(...)",
+	     "window_seconds":300,"baseline_window_seconds":604800,
+	     "graduate_threshold":0.9,"clear_threshold":0.7,"min_hold_seconds":3600,
+	     "digest":true,"severity":"info"}
 	  ]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -42,11 +62,13 @@ func TestRunEndToEnd(t *testing.T) {
 	if err := os.MkdirAll(textfileDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	digestDir := filepath.Join(dir, "digest")
 	t.Setenv("HEIMDALL_MANIFEST", manifestPath)
 	t.Setenv("HEIMDALL_TEXTFILE_DIR", textfileDir)
 	t.Setenv("HEIMDALL_SPOOL_DIR", filepath.Join(dir, "findings"))
 	t.Setenv("HEIMDALL_STATE_DB", filepath.Join(dir, "state.db"))
 	t.Setenv("HEIMDALL_PROM_URL", srv.URL)
+	t.Setenv("HEIMDALL_DIGEST_DIR", digestDir)
 
 	if err := run(); err != nil {
 		t.Fatalf("run: %v", err)
@@ -72,6 +94,15 @@ func TestRunEndToEnd(t *testing.T) {
 	if !strings.Contains(string(prom), "heimdall_redaction_failures_total 0") {
 		t.Error("redaction failure counter missing")
 	}
+	// (a) the digest-freshness gauge must be present now that Tier-2 ran.
+	if !strings.Contains(string(prom), "heimdall_digest_generated_timestamp_seconds") {
+		t.Errorf("digest freshness metric missing from .prom:\n%s", prom)
+	}
+	// A fresh state.db means the warm-up gate holds: no trend finding, even
+	// though the Tier-2 sample (0.95) is well past graduate_threshold (0.9).
+	if strings.Contains(string(prom), `check="c6-quantile-creep"`) {
+		t.Errorf("Tier-2 graduated on a fresh (warming) DB, want warm-up gate to hold:\n%s", prom)
+	}
 	// spool doc exists for the firing fingerprint and carries the state
 	doc, err := os.ReadFile(filepath.Join(dir, "findings", "d86c07b5a41742c1.json"))
 	if err != nil {
@@ -79,5 +110,35 @@ func TestRunEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(string(doc), `"state": "firing"`) {
 		t.Errorf("spool doc missing firing state:\n%s", doc)
+	}
+
+	// (b) DigestDir/latest.json exists and parses to a Digest whose Tier-2
+	// row reflects warm-up (a brand-new baseline has no 7d history yet).
+	digestData, err := os.ReadFile(filepath.Join(digestDir, "latest.json"))
+	if err != nil {
+		t.Fatalf("digest latest.json missing: %v", err)
+	}
+	var dg contract.Digest
+	if err := json.Unmarshal(digestData, &dg); err != nil {
+		t.Fatalf("parse digest latest.json: %v", err)
+	}
+	if len(dg.Rows) != 1 {
+		t.Fatalf("digest Rows = %d, want 1", len(dg.Rows))
+	}
+	row := dg.Rows[0]
+	if row.Status != contract.StatusBaselineWarming {
+		t.Errorf("digest row Status = %v, want StatusBaselineWarming (fresh DB, warm-up gate)", row.Status)
+	}
+	if row.RowID != contract.Fingerprint("c6-quantile-creep", "node-a") {
+		t.Errorf("digest row RowID = %q, want fingerprint(c6-quantile-creep,node-a)", row.RowID)
+	}
+	if row.Target != "node-a" || row.Feature != "cpu_p95_creep" {
+		t.Errorf("digest row Target/Feature = %q/%q, want node-a/cpu_p95_creep", row.Target, row.Feature)
+	}
+	// (c) no graduation on a fresh warming DB: the digest carries no
+	// unknown/new-template/flap markers for this spec either (it WAS
+	// measured, just warming).
+	if len(dg.UnknownMarkers) != 0 {
+		t.Errorf("UnknownMarkers = %v, want none (Tier-2 signal was measured)", dg.UnknownMarkers)
 	}
 }

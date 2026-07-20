@@ -1,10 +1,11 @@
 // Package config loads detector configuration: environment variables first,
-// plus an optional Vault-seeded KEY=VALUE credential file holding the one
-// least-privilege token. Fail fast, no package-level state.
+// plus an optional Vault-seeded KEY=VALUE credential file holding the
+// least-privilege tokens. Fail fast, no package-level state.
 //
-// Scope note: Credentials is parsed and validated here but has no consumer
-// in this slice — its first consumer is the VictoriaLogs source (vmauth
-// token) in the next slice. Do not wire it anywhere else prematurely.
+// VLURL (HEIMDALL_VL_URL) is optional: empty when no victorialogs Tier-2
+// specs are configured. Credentials' first consumers are the VictoriaLogs
+// source's basic-auth pair, keyed HEIMDALL_VL_USER / HEIMDALL_VL_PASS in the
+// cred file (both may be absent — no new required env vars for them).
 package config
 
 import (
@@ -21,6 +22,8 @@ type Config struct {
 	SpoolDir     string
 	StateDBPath  string
 	PromURL      string
+	DigestDir    string
+	VLURL        string // optional: empty when no victorialogs tier2 specs are configured
 	QueryLimit   int
 	Credentials  map[string]string
 }
@@ -34,6 +37,8 @@ func Load(getenv func(string) string) (Config, error) {
 		SpoolDir:     getenv("HEIMDALL_SPOOL_DIR"),
 		StateDBPath:  getenv("HEIMDALL_STATE_DB"),
 		PromURL:      getenv("HEIMDALL_PROM_URL"),
+		DigestDir:    getenv("HEIMDALL_DIGEST_DIR"),
+		VLURL:        getenv("HEIMDALL_VL_URL"), // optional
 		QueryLimit:   8,
 	}
 	required := []struct{ name, val string }{
@@ -42,6 +47,7 @@ func Load(getenv func(string) string) (Config, error) {
 		{"HEIMDALL_SPOOL_DIR", c.SpoolDir},
 		{"HEIMDALL_STATE_DB", c.StateDBPath},
 		{"HEIMDALL_PROM_URL", c.PromURL},
+		{"HEIMDALL_DIGEST_DIR", c.DigestDir},
 	}
 	for _, r := range required {
 		if r.val == "" {

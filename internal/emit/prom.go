@@ -27,6 +27,8 @@ const (
 		"# TYPE heimdall_redaction_failures_total counter\n"
 	helpLastRun = "# HELP heimdall_last_run_timestamp_seconds Unix time of the last completed detector run.\n" +
 		"# TYPE heimdall_last_run_timestamp_seconds gauge\n"
+	helpDigest = "# HELP heimdall_digest_generated_timestamp_seconds Unix time the Tier-2 feature digest was last written.\n" +
+		"# TYPE heimdall_digest_generated_timestamp_seconds gauge\n"
 )
 
 // Exposition format escapes for label values: backslash, quote, newline.
@@ -45,7 +47,12 @@ func lv(s string) string { return labelEscaper.Replace(contract.Redact(s)) }
 // {check, class, fingerprint, group, node, severity, source, target} so a
 // firing<->unknown transition keeps series identity (no stale-series
 // resolve, no manufactured all-clear). State lives in the spool doc.
-func RenderProm(now time.Time, fs []contract.Finding, redactionFailures int) []byte {
+//
+// digestGeneratedAt is the Tier-2 feature digest's GeneratedAt: when it is
+// the zero time (a run that produced no digest), the
+// heimdall_digest_generated_timestamp_seconds series is omitted entirely
+// rather than emitted as a fake epoch-0 sample.
+func RenderProm(now time.Time, fs []contract.Finding, redactionFailures int, digestGeneratedAt time.Time) []byte {
 	sorted := make([]contract.Finding, len(fs))
 	copy(sorted, fs)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -70,5 +77,10 @@ func RenderProm(now time.Time, fs []contract.Finding, redactionFailures int) []b
 	b.WriteString(helpLastRun)
 	b.WriteString(`heimdall_last_run_timestamp_seconds{plane="tier1"} ` +
 		strconv.FormatInt(now.Unix(), 10) + "\n")
+	if !digestGeneratedAt.IsZero() {
+		b.WriteString(helpDigest)
+		b.WriteString("heimdall_digest_generated_timestamp_seconds " +
+			strconv.FormatInt(digestGeneratedAt.Unix(), 10) + "\n")
+	}
 	return b.Bytes()
 }
