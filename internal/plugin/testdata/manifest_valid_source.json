@@ -1,0 +1,15 @@
+{
+  "plugin_api": 1,
+  "id": "refplug",
+  "kind": "source",
+  "version": "0.1.0-fixture",
+  "capabilities": {
+    "credential": "HEIMDALL_PLUGIN_SECRET",
+    "endpoints": ["https://192.0.2.10:9090"]
+  },
+  "budgets": {
+    "deadline_seconds": 5,
+    "memory_mb": 64,
+    "max_output_bytes": 1048576
+  }
+}

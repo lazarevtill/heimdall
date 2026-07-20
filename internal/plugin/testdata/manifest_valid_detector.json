@@ -1,0 +1,11 @@
+{
+  "plugin_api": 1,
+  "id": "refdet",
+  "kind": "detector",
+  "version": "0.1.0-fixture",
+  "budgets": {
+    "deadline_seconds": 5,
+    "memory_mb": 0,
+    "max_output_bytes": 65536
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "plugin_api": 99,
+  "id": "refplug",
+  "kind": "source",
+  "version": "0.1.0-fixture",
+  "budgets": {
+    "deadline_seconds": 5,
+    "memory_mb": 0,
+    "max_output_bytes": 1048576
+  }
+}
