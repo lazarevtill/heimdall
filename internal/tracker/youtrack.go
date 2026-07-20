@@ -291,6 +291,27 @@ func (y *YouTrack) Transition(ctx context.Context, issueID, state string) error 
 	return nil
 }
 
+// Priority sets an issue's Priority custom field via POST /api/issues/{id},
+// the same StateIssueCustomField/SingleEnumIssueCustomField update shape as
+// Transition — see its doc-comment for the live-adjustment caveat.
+func (y *YouTrack) Priority(ctx context.Context, issueID, priority string) error {
+	body := struct {
+		CustomFields []youtrackCustomFieldIn `json:"customFields"`
+	}{
+		CustomFields: []youtrackCustomFieldIn{
+			{Type: "SingleEnumIssueCustomField", Name: "Priority", Value: youtrackCustomFieldValueIn{Name: priority}},
+		},
+	}
+	req, err := y.newRequest(ctx, http.MethodPost, "/api/issues/"+url.PathEscape(issueID), body)
+	if err != nil {
+		return fmt.Errorf("youtrack: priority %s to %q: %w", issueID, priority, err)
+	}
+	if err := y.do(req, nil); err != nil {
+		return fmt.Errorf("youtrack: priority %s to %q: %w", issueID, priority, err)
+	}
+	return nil
+}
+
 // Tag adds tag via POST /api/issues/{id}/tags {name}.
 func (y *YouTrack) Tag(ctx context.Context, issueID, tag string) error {
 	payload := youtrackTag{Name: tag}

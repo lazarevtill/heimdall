@@ -27,6 +27,7 @@ type fakeTracker struct {
 	comments    []string
 	transitions []string
 	tags        []string
+	priorities  []string
 }
 
 func newFakeTracker() *fakeTracker {
@@ -81,6 +82,13 @@ func (f *fakeTracker) Tag(_ context.Context, issueID, tag string) error {
 			iss.Tags = append(iss.Tags, tag)
 		}
 	}
+	return nil
+}
+
+// Priority records the call (tracker.Issue has no Priority field to mutate
+// against; recording is all fakeTracker needs for assertions).
+func (f *fakeTracker) Priority(_ context.Context, issueID, priority string) error {
+	f.priorities = append(f.priorities, issueID+": "+priority)
 	return nil
 }
 

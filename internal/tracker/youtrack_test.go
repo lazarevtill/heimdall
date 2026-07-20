@@ -293,6 +293,48 @@ func TestTransitionNon2xx(t *testing.T) {
 	}
 }
 
+func TestPriorityIssuesRightMethodAndPath(t *testing.T) {
+	var gotPath, gotMethod string
+	var gotBody map[string]any
+	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &gotBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := y.Priority(ctxWithDeadline(t), "HEIM-1", "Show-stopper"); err != nil {
+		t.Fatalf("Priority: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/api/issues/HEIM-1" {
+		t.Errorf("path = %q, want /api/issues/HEIM-1", gotPath)
+	}
+	cfs, ok := gotBody["customFields"].([]any)
+	if !ok || len(cfs) != 1 {
+		t.Fatalf("request customFields = %v, want 1 entry", gotBody["customFields"])
+	}
+	cf, _ := cfs[0].(map[string]any)
+	if cf["name"] != "Priority" {
+		t.Errorf("customFields[0].name = %v, want Priority", cf["name"])
+	}
+	val, _ := cf["value"].(map[string]any)
+	if val["name"] != "Show-stopper" {
+		t.Errorf("customFields[0].value.name = %v, want Show-stopper", val["name"])
+	}
+}
+
+func TestPriorityNon2xx(t *testing.T) {
+	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	if err := y.Priority(ctxWithDeadline(t), "HEIM-1", "Show-stopper"); err == nil {
+		t.Fatal("Priority: want error on 500, got nil")
+	}
+}
+
 func TestTagIssuesRightMethodAndPath(t *testing.T) {
 	var gotPath, gotMethod string
 	var gotBody map[string]any

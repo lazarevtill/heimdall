@@ -5,8 +5,8 @@
 // engine: open/update-checklist/close plus the storm fuse that bounds
 // new-issue creation to a rolling per-hour cap.
 //
-// This slice (S6-b) deliberately does NOT import internal/contract: the
-// mute-gating decision point (Reconcile step 5b) needs only
+// S6-b deliberately did NOT import internal/contract: the mute-gating
+// decision point (Reconcile step 5b) needs only
 // suppress.Authority.MatchFields' four raw strings (fingerprint, group,
 // check, target) taken straight off the webhook's alert labels — there is
 // no sanctioned way to build a contract.Finding composite literal outside
@@ -16,8 +16,19 @@
 // unnecessary, since MatchFields reads exactly the fields already in hand.
 // See the S6-b report for the full rationale.
 //
-// Hypothesis routing + escalation (S6-c) and the HTTP server wiring (S6-d)
-// build on top of this package; neither exists yet in this slice.
+// S6-c (hypothesis.go, escalate.go) adds the /hypothesis ingress and the
+// periodic escalation sweep. hypothesis.go DOES import internal/contract —
+// for contract.HypothesisFinding (arrives via json.Unmarshal, never a
+// composite literal) and contract.EvidenceOrWithheld, the bridge's re-
+// redaction egress boundary — but still never constructs a
+// contract.Finding composite literal; the ADR-G09 gate is unaffected. The
+// hypothesis path (HandleHypothesis) is structurally unable to page (G1):
+// its only side effects are outbox.Enqueue(ChannelAnalyst, ...) and,
+// optionally, tracker.Open(...) a Task-priority ticket — never
+// ChannelMain, never Transition/Priority.
+//
+// The HTTP server wiring (S6-d) builds on top of this package; it does not
+// exist yet in this slice.
 //
 // Design ref: design/2026-07-19-final-design.md (+ at-scale doc).
 package bridge

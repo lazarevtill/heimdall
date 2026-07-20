@@ -218,3 +218,69 @@ func (s *Store) OpensSince(cutoff time.Time) (int, error) {
 	}
 	return n, nil
 }
+
+// ListOpen returns every ledger row with state="open" (the escalation
+// sweep's candidate set), oldest firing_since first — so a sweep that
+// errors partway through (see EscalationSweep's per-issue error handling)
+// has already escalated the longest-overdue issues first.
+func (s *Store) ListOpen() ([]IssueRow, error) {
+	rows, err := s.db.Query(`
+SELECT marker, issue_id, grp, check_id, severity, firing_since, opened_at, state, escalated, acked
+FROM issues WHERE state = 'open'
+ORDER BY firing_since ASC, marker ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: list open: %w", err)
+	}
+	defer rows.Close()
+
+	var out []IssueRow
+	for rows.Next() {
+		var (
+			row                   IssueRow
+			firingSince, openedAt int64
+			escalated, acked      int
+		)
+		if err := rows.Scan(
+			&row.Marker, &row.IssueID, &row.Group, &row.Check, &row.Severity,
+			&firingSince, &openedAt, &row.State, &escalated, &acked,
+		); err != nil {
+			return nil, fmt.Errorf("bridge: list open: scan: %w", err)
+		}
+		row.FiringSince = time.Unix(firingSince, 0).UTC()
+		row.OpenedAt = time.Unix(openedAt, 0).UTC()
+		row.Escalated = escalated != 0
+		row.Acked = acked != 0
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bridge: list open: rows: %w", err)
+	}
+	return out, nil
+}
+
+// MarkEscalated sets escalated=1 for marker. Idempotent: a second call for
+// an already-escalated marker is a harmless no-op rewrite. A marker with no
+// row is silently a no-op (0 rows affected) — the caller only ever calls
+// this right after reading the row via ListOpen, so this should not arise
+// in practice, but it is not an error either way.
+func (s *Store) MarkEscalated(marker string) error {
+	if _, err := s.db.Exec(`UPDATE issues SET escalated = 1 WHERE marker = ?`, marker); err != nil {
+		return fmt.Errorf("bridge: mark escalated %s: %w", marker, err)
+	}
+	return nil
+}
+
+// SetAcked sets acked to the given value for marker (idempotent). S6-c only
+// READS acked (EscalationSweep's qualification predicate); this setter is
+// provided now so S7's mute/ack feedback handler can call it without a
+// further store change.
+func (s *Store) SetAcked(marker string, acked bool) error {
+	a := 0
+	if acked {
+		a = 1
+	}
+	if _, err := s.db.Exec(`UPDATE issues SET acked = ? WHERE marker = ?`, a, marker); err != nil {
+		return fmt.Errorf("bridge: set acked %s: %w", marker, err)
+	}
+	return nil
+}

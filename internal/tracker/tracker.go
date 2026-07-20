@@ -40,4 +40,6 @@ type Tracker interface {
 	Transition(ctx context.Context, issueID, state string) error
 	// Tag adds a tag (e.g. "heimdall-auto") to an issue.
 	Tag(ctx context.Context, issueID, tag string) error
+	// Priority sets an issue's priority (e.g. "Show-stopper", "Minor").
+	Priority(ctx context.Context, issueID, priority string) error
 }
