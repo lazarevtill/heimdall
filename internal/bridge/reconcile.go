@@ -39,6 +39,10 @@ type Deps struct {
 	// richer evidence when opening an issue. "" skips the read entirely.
 	SpoolDir string
 	Fuse     StormFuse
+	// DefaultAssignee, if non-empty, is the tracker login every newly opened
+	// issue (findings and hypothesis tickets) is assigned to. "" leaves new
+	// issues unassigned.
+	DefaultAssignee string
 }
 
 // ReconcileResult reports what one Reconcile call did, for metrics/logging.
@@ -349,6 +353,7 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (Reconci
 			Description: desc,
 			Type:        "Task",
 			Priority:    severityToPriority(severity),
+			Assignee:    d.DefaultAssignee,
 			Tags:        []string{"heimdall"},
 			Marker:      marker,
 		})

@@ -57,6 +57,7 @@ type config struct {
 	YouTrackURL      string // HEIMDALL_YOUTRACK_URL
 	YouTrackToken    string // HEIMDALL_YOUTRACK_TOKEN — read directly from the env (see loadConfig's doc for why, vs a cred file)
 	YouTrackProject  string // HEIMDALL_YOUTRACK_PROJECT; e.g. "HEIM"
+	YouTrackAssignee string // HEIMDALL_YOUTRACK_ASSIGNEE; optional — login every opened issue is assigned to; "" leaves them unassigned
 	SpoolDir         string // HEIMDALL_SPOOL_DIR; optional — "" skips finding-doc enrichment, falling back to alert annotations
 	TicketPolicy     bridge.TicketPolicy
 	StormFusePerHour int
@@ -87,7 +88,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 		YouTrackURL:      getenv("HEIMDALL_YOUTRACK_URL"),
 		YouTrackToken:    getenv("HEIMDALL_YOUTRACK_TOKEN"),
 		YouTrackProject:  getenv("HEIMDALL_YOUTRACK_PROJECT"),
-		SpoolDir:         getenv("HEIMDALL_SPOOL_DIR"), // optional
+		YouTrackAssignee: getenv("HEIMDALL_YOUTRACK_ASSIGNEE"), // optional
+		SpoolDir:         getenv("HEIMDALL_SPOOL_DIR"),         // optional
 		TicketPolicy:     defaultTicketPolicy,
 		StormFusePerHour: defaultStormFusePerHour,
 	}
@@ -181,7 +183,7 @@ func run() error {
 	cancel()
 
 	srv := newServer(store, ob, engineSuppress, cfg.SuppressionsFile, trk, cfg.TicketPolicy,
-		bridge.StormFuse{MaxPerHour: cfg.StormFusePerHour}, cfg.SpoolDir, youtrackOK)
+		bridge.StormFuse{MaxPerHour: cfg.StormFusePerHour}, cfg.SpoolDir, cfg.YouTrackAssignee, youtrackOK)
 
 	go runEscalationTicker(srv)
 

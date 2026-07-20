@@ -19,6 +19,7 @@ type OpenRequest struct {
 	Description string   // already redacted by the caller
 	Type        string   // e.g. "Task"
 	Priority    string   // e.g. "Minor"
+	Assignee    string   // login to assign the issue to (e.g. "lazarevtill"); "" leaves it unassigned
 	Tags        []string // e.g. ["heimdall","heimdall-hypothesis"]
 	Marker      string   // the [hb:<key>] to embed (in summary or description per impl)
 }

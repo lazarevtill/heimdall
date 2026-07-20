@@ -194,6 +194,7 @@ func HandleHypothesis(ctx context.Context, now time.Time, d Deps, post Hypothesi
 				Description: desc,
 				Type:        "Task",
 				Priority:    "Minor",
+				Assignee:    d.DefaultAssignee,
 				Tags:        []string{"heimdall", "heimdall-hypothesis"},
 				Marker:      marker,
 			}); err != nil {

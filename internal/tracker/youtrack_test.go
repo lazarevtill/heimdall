@@ -439,3 +439,47 @@ func TestVerifyIdentityTransportError(t *testing.T) {
 		t.Fatal("VerifyIdentity: want error on unreachable URL, got nil")
 	}
 }
+
+// TestOpenSetsAssignee verifies OpenRequest.Assignee is sent as a
+// SingleUserIssueCustomField with value.login (the shape YouTrack requires for
+// the Assignee field) in the create body.
+func TestOpenSetsAssignee(t *testing.T) {
+	var body map[string]any
+	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tags":
+			w.Write([]byte(`[]`))
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tags":
+			w.Write([]byte(`{"id":"10-1","name":"heimdall"}`))
+			return
+		case strings.HasSuffix(r.URL.Path, "/tags"):
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Write([]byte(`{"idReadable":"HEIM-1","summary":"s","description":"d","customFields":[],"tags":[]}`))
+	})
+	if _, err := y.Open(ctxWithDeadline(t), tracker.OpenRequest{
+		Summary: "s", Marker: "[hb:g--c]", Type: "Task", Priority: "Minor",
+		Assignee: "opstest", Tags: []string{"heimdall"},
+	}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cfs, _ := body["customFields"].([]any)
+	var found bool
+	for _, c := range cfs {
+		m, _ := c.(map[string]any)
+		if m["$type"] == "SingleUserIssueCustomField" && m["name"] == "Assignee" {
+			v, _ := m["value"].(map[string]any)
+			if v["login"] != "opstest" {
+				t.Errorf("Assignee value = %v, want login opstest", m["value"])
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Open body missing SingleUserIssueCustomField Assignee; customFields=%v", body["customFields"])
+	}
+}

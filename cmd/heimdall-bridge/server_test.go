@@ -114,7 +114,7 @@ func testServer(t *testing.T) (*httptest.Server, *fakeTracker, *bridge.Store) {
 
 	ft := newFakeTracker()
 	srv := newServer(store, ob, engineSuppress, "", ft, bridge.PolicyTelegramOnly,
-		bridge.StormFuse{MaxPerHour: 10}, "", true)
+		bridge.StormFuse{MaxPerHour: 10}, "", "", true)
 
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)

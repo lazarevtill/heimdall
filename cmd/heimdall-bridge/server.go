@@ -45,6 +45,7 @@ type server struct {
 	policy           bridge.TicketPolicy
 	fuse             bridge.StormFuse
 	spoolDir         string
+	assignee         string // default assignee login for opened issues; "" = unassigned
 
 	// youtrackOK holds the LAST known VerifyIdentity result (set once at
 	// startup by main; never re-verified periodically — see the brief).
@@ -59,7 +60,7 @@ type server struct {
 // it with a fakeTracker.
 func newServer(store *bridge.Store, ob *outbox.Store, engineSuppress *suppress.Store,
 	suppressionsFile string, trk tracker.Tracker, policy bridge.TicketPolicy,
-	fuse bridge.StormFuse, spoolDir string, youtrackOK bool) *server {
+	fuse bridge.StormFuse, spoolDir, assignee string, youtrackOK bool) *server {
 	s := &server{
 		store:            store,
 		outbox:           ob,
@@ -69,6 +70,7 @@ func newServer(store *bridge.Store, ob *outbox.Store, engineSuppress *suppress.S
 		policy:           policy,
 		fuse:             fuse,
 		spoolDir:         spoolDir,
+		assignee:         assignee,
 	}
 	s.youtrackOK.Store(youtrackOK)
 	return s
@@ -115,12 +117,13 @@ func (s *server) buildAuthority(now time.Time) (*suppress.Authority, error) {
 // collaborators.
 func (s *server) deps(authority *suppress.Authority) bridge.Deps {
 	return bridge.Deps{
-		Tracker:   s.tracker,
-		Store:     s.store,
-		Outbox:    s.outbox,
-		Authority: authority,
-		SpoolDir:  s.spoolDir,
-		Fuse:      s.fuse,
+		Tracker:         s.tracker,
+		Store:           s.store,
+		Outbox:          s.outbox,
+		Authority:       authority,
+		SpoolDir:        s.spoolDir,
+		Fuse:            s.fuse,
+		DefaultAssignee: s.assignee,
 	}
 }
 

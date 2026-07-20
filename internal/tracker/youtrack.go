@@ -212,10 +212,13 @@ type youtrackProjectRef struct {
 	ShortName string `json:"shortName"`
 }
 
-// youtrackCustomFieldValueIn is the write-side value of a single/state enum
-// custom field: {"name": "..."}.
+// youtrackCustomFieldValueIn is the write-side value of a custom field: enum/
+// state fields (Type, Priority, State) are set by {"name": "..."}; user fields
+// (Assignee) are set by {"login": "..."}. Exactly one is populated per field;
+// both are omitempty so the unused one is absent.
 type youtrackCustomFieldValueIn struct {
-	Name string `json:"name"`
+	Name  string `json:"name,omitempty"`
+	Login string `json:"login,omitempty"`
 }
 
 // youtrackCustomFieldIn is the write-side shape for setting one custom
@@ -272,6 +275,12 @@ func (y *YouTrack) Open(ctx context.Context, req OpenRequest) (*Issue, error) {
 		body.CustomFields = append(body.CustomFields, youtrackCustomFieldIn{
 			Type: "SingleEnumIssueCustomField", Name: "Priority",
 			Value: youtrackCustomFieldValueIn{Name: req.Priority},
+		})
+	}
+	if req.Assignee != "" {
+		body.CustomFields = append(body.CustomFields, youtrackCustomFieldIn{
+			Type: "SingleUserIssueCustomField", Name: "Assignee",
+			Value: youtrackCustomFieldValueIn{Login: req.Assignee},
 		})
 	}
 
