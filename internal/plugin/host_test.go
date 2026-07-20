@@ -17,28 +17,53 @@ import (
 )
 
 // helperplugPath is the path to the compiled testdata/helperplug fixture,
-// built once in TestMain. Using a real subprocess (not a mock) is the point
+// refsrcPath to the compiled REAL plugins/source-reference plugin, and
+// badsrcPath to the compiled testdata/badsrc misbehavior fixture — all
+// built once in TestMain. Using real subprocesses (not mocks) is the point
 // of this package's tests: Run's scrubbed-env, deadline, and output-cap
-// guarantees only mean something against an actual OS process.
-var helperplugPath string
+// guarantees, and source.go's ABI decode, only mean something against an
+// actual OS process.
+var (
+	helperplugPath string
+	refsrcPath     string
+	badsrcPath     string
+)
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "heimdall-plugin-test-")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "helperplug: mkdtemp:", err)
+		fmt.Fprintln(os.Stderr, "plugin test fixtures: mkdtemp:", err)
 		os.Exit(1)
 	}
-	helperplugPath = filepath.Join(dir, "helperplug")
-	if runtime.GOOS == "windows" {
-		helperplugPath += ".exe"
+
+	exePath := func(name string) string {
+		p := filepath.Join(dir, name)
+		if runtime.GOOS == "windows" {
+			p += ".exe"
+		}
+		return p
 	}
-	build := exec.Command("go", "build", "-o", helperplugPath, "./testdata/helperplug")
-	build.Stdout = os.Stderr
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "helperplug: build failed:", err)
-		os.RemoveAll(dir)
-		os.Exit(1)
+	helperplugPath = exePath("helperplug")
+	refsrcPath = exePath("source-reference")
+	badsrcPath = exePath("badsrc")
+
+	builds := []struct{ out, pkg string }{
+		{helperplugPath, "./testdata/helperplug"},
+		// The REAL reference plugin, built from its actual location under
+		// plugins/ — not a copy — so the compiled binary under test is
+		// exactly what a third party would build and run.
+		{refsrcPath, "../../plugins/source-reference"},
+		{badsrcPath, "./testdata/badsrc"},
+	}
+	for _, b := range builds {
+		build := exec.Command("go", "build", "-o", b.out, b.pkg)
+		build.Stdout = os.Stderr
+		build.Stderr = os.Stderr
+		if err := build.Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "plugin test fixtures: build", b.pkg, "failed:", err)
+			os.RemoveAll(dir)
+			os.Exit(1)
+		}
 	}
 
 	code := m.Run()

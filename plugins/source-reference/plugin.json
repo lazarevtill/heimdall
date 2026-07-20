@@ -1,0 +1,14 @@
+{
+  "plugin_api": 1,
+  "id": "refsrc",
+  "kind": "source",
+  "version": "0.1.0",
+  "capabilities": {
+    "credential": "HEIMDALL_PLUGIN_SECRET"
+  },
+  "budgets": {
+    "deadline_seconds": 10,
+    "memory_mb": 64,
+    "max_output_bytes": 65536
+  }
+}
