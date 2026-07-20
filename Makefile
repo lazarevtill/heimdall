@@ -31,8 +31,8 @@ lint:
 		echo "real-infrastructure string leaked into shipped code/deploy/CI"; exit 1; fi
 	@if git grep -nE 'glpat-[A-Za-z0-9_-]{20,}' -- ':!Makefile' ':!design/' ':!docs/' ':!README.md' ':!internal/contract/redact.go' ':!*_test.go'; then \
 		echo "secret-shaped token outside the defanged test fixtures"; exit 1; fi
-	@if grep -rn --include='*.go' 'internal/llm' cmd/heimdall-detect/ internal/detect/ internal/tier2/ internal/digest/ internal/emit/ 2>/dev/null; then \
-		echo "internal/llm imported by the trusted detection/emission path: Tier-3 must stay off it (G1)"; exit 1; fi
+	@if $(GO) list -deps ./cmd/heimdall-detect | grep -q '/internal/llm$$'; then \
+		echo "internal/llm reachable from the heimdall-detect dependency graph: Tier-3 must stay off the trusted detection/emission path (G1)"; exit 1; fi
 	$(GO) mod verify
 
 # pinned: bump deliberately, never @latest (reproducible CI)

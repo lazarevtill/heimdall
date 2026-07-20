@@ -114,3 +114,26 @@ func TestAnalystButtonsFourButtonRow(t *testing.T) {
 		}
 	}
 }
+
+// TestMainButtonsLongSubjectDegradesToExplainOnly pins the graceful-degradation
+// fix: a group--check key long enough that "<action>|<key>" exceeds Telegram's
+// 64-byte callback_data cap must NOT make MainButtons error (which would leave
+// the escalation re-ping stuck pending in the outbox forever). Instead the mute
+// buttons are omitted and the message still delivers with [Explain].
+func TestMainButtonsLongSubjectDegradesToExplainOnly(t *testing.T) {
+	key := strings.Repeat("a", 30) + "--" + strings.Repeat("b", 31) // 63 chars
+	idem := "escalate-[hb:" + key + "]"
+
+	buttons, err := notify.MainButtons(idem)
+	if err != nil {
+		t.Fatalf("MainButtons returned an error, want graceful degradation: %v", err)
+	}
+	if len(buttons) != 1 || buttons[0].Text != "Explain" {
+		t.Fatalf("want only [Explain] for an over-long subject, got %+v", buttons)
+	}
+	for _, b := range buttons {
+		if len(b.CallbackData) > 64 {
+			t.Fatalf("button callback_data %q is %d bytes, exceeds the 64-byte cap", b.CallbackData, len(b.CallbackData))
+		}
+	}
+}

@@ -79,29 +79,56 @@ var analystButtonSpecs = []struct{ label, action string }{
 	{"Explain", "ex"},
 }
 
+// encodeMuteButtons encodes every (label,action) in specs against subject,
+// returning ok=false if ANY would exceed the callback_data budget (all-or-
+// nothing, so a partial mute row is never shown). A too-long subject arises
+// only for a group--check key near the 64-char marker-grammar limit, where
+// "<action>|<key>" tips over Telegram's 64-byte callback_data cap.
+func encodeMuteButtons(specs []struct{ label, action string }, subject string) ([]telegram.Button, bool) {
+	out := make([]telegram.Button, 0, len(specs))
+	for _, spec := range specs {
+		data, err := Encode(spec.action, subject)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, telegram.Button{Text: spec.label, CallbackData: data})
+	}
+	return out, true
+}
+
+// explainButton builds an [Explain] button whose callback_data is ALWAYS
+// within budget: it carries the subject when that fits, else an empty subject.
+// Dispatch's "ex" branch ignores the subject (it only toasts), so dropping it
+// changes nothing functional — and it guarantees [Explain] can never be the
+// reason a message fails to send.
+func explainButton(subject string) telegram.Button {
+	data, err := Encode("ex", subject)
+	if err != nil {
+		data, _ = Encode("ex", "") // "ex|" — 3 bytes, always valid
+	}
+	return telegram.Button{Text: "Explain", CallbackData: data}
+}
+
 // MainButtons builds the inline button row for a ChannelMain outbox entry:
 // [Ack 1d] [Mute 7d] [Noise 30d] [Explain], each button's callback_data
 // computed from idemKey's derived subject. When idemKey has no single
 // mutable subject (a storm notice), the mute buttons are omitted and only
-// [Explain] is returned.
+// [Explain] is returned. When the subject is too long to encode a mute button
+// within Telegram's 64-byte cap (a group--check key near the 64-char limit),
+// the mute buttons are likewise omitted so the message (e.g. an escalation
+// re-ping) still DELIVERS with [Explain] — graceful degradation, never a
+// stuck-pending, never-delivered outbox entry. MainButtons therefore never
+// returns a non-nil error; the error result is retained for API symmetry.
 func MainButtons(idemKey string) ([]telegram.Button, error) {
 	subject, mutable := subjectFromIdemKey(idemKey)
 
 	var buttons []telegram.Button
 	if mutable {
-		for _, spec := range mainButtonSpecs {
-			data, err := Encode(spec.action, subject)
-			if err != nil {
-				return nil, fmt.Errorf("notify: main buttons %q: %w", idemKey, err)
-			}
-			buttons = append(buttons, telegram.Button{Text: spec.label, CallbackData: data})
+		if muteButtons, ok := encodeMuteButtons(mainButtonSpecs, subject); ok {
+			buttons = append(buttons, muteButtons...)
 		}
 	}
-	explainData, err := Encode("ex", subject)
-	if err != nil {
-		return nil, fmt.Errorf("notify: main buttons %q: %w", idemKey, err)
-	}
-	buttons = append(buttons, telegram.Button{Text: "Explain", CallbackData: explainData})
+	buttons = append(buttons, explainButton(subject))
 	return buttons, nil
 }
 

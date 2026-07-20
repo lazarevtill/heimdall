@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/tracker"
@@ -156,6 +157,15 @@ func buildDescription(group, check string, firingByTarget map[string]bool, spool
 				evidence = se.Evidence
 			}
 		}
+		// Fail-closed egress: the YouTrack issue body is a registered egress,
+		// so title/evidence are redacted here regardless of source. Spool
+		// evidence is already redacted (emit.WriteSpool), making this a no-op
+		// on that path; the annotation FALLBACK (spool absent — GC'd or no
+		// spool doc for this fingerprint) is raw Alertmanager text and MUST NOT
+		// reach the tracker unredacted. content-fail-closed: a redactor failure
+		// yields the Withheld sentinel, never the raw string.
+		title, _ = contract.EvidenceOrWithheld(title)
+		evidence, _ = contract.EvidenceOrWithheld(evidence)
 		if title != "" || evidence != "" {
 			b.WriteString("\n")
 			if title != "" {
