@@ -55,6 +55,43 @@ func TestNewAuthoritySkipsInvalidRuntimeRows(t *testing.T) {
 	}
 }
 
+func TestAuthorityMatchFields(t *testing.T) {
+	declarative := []suppress.Suppression{validFingerprintRec()}
+	runtime := []suppress.Suppression{validGroupCheckRec()}
+	auth, skipped := suppress.NewAuthority(declarative, runtime)
+	if skipped != 0 {
+		t.Fatalf("skipped = %d, want 0", skipped)
+	}
+
+	// Same scenario as TestNewAuthorityUnionAndFindingSuppression, but
+	// driven off raw fields instead of a contract.Finding — this is the
+	// exact shape internal/bridge calls with (Alertmanager labels), never
+	// having built a contract.Finding at all.
+	got := auth.MatchFields(fixedNow, "irrelevant-fp", "disk", "smart-fail", "192.0.2.30")
+	if got == nil {
+		t.Fatal("MatchFields = nil, want the runtime group_check record")
+	}
+	if got.Key != "gc-1" {
+		t.Errorf("MatchFields key = %q, want gc-1", got.Key)
+	}
+
+	if got := auth.MatchFields(fixedNow, "irrelevant-fp", "other-group", "other-check", "192.0.2.31"); got != nil {
+		t.Errorf("MatchFields = %+v, want nil for an unmatched group/check", got)
+	}
+
+	// The fingerprint-scoped record matches on fingerprint regardless of
+	// group/check/target.
+	if got := auth.MatchFields(fixedNow, "deadbeefcafef00d", "unrelated-group", "unrelated-check", "192.0.2.99"); got == nil {
+		t.Error("MatchFields = nil, want the declarative fingerprint record to match on fingerprint alone")
+	}
+
+	// Expired-time check mirrors FindingSuppression's.
+	farFuture := fixedNow.Add(365 * 24 * time.Hour)
+	if got := auth.MatchFields(farFuture, "irrelevant-fp", "disk", "smart-fail", "192.0.2.30"); got != nil {
+		t.Errorf("MatchFields at an expired time = %+v, want nil", got)
+	}
+}
+
 func TestHypothesisSuppressed(t *testing.T) {
 	auth, _ := suppress.NewAuthority([]suppress.Suppression{validHypothesisRec()}, nil)
 	if !auth.HypothesisSuppressed(fixedNow, "hyp-fp-abc123") {

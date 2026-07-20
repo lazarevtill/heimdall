@@ -203,13 +203,23 @@ func (s Suppression) MatchesFinding(now time.Time, f contract.Finding) bool {
 	if !s.Active(now) {
 		return false
 	}
+	return s.matchesFields(f.Fingerprint, f.Group, f.Check, f.Target)
+}
+
+// matchesFields is the scope-comparison core shared by MatchesFinding
+// (which derives the four fields from a contract.Finding) and
+// Authority.MatchFields (which the bridge calls directly on raw
+// Alertmanager label strings, without ever constructing a contract.Finding
+// — see Authority.MatchFields' doc comment for why). Active is NOT checked
+// here; both callers gate on it themselves before calling in.
+func (s Suppression) matchesFields(fingerprint, group, check, target string) bool {
 	switch s.Scope {
 	case ScopeFingerprint:
-		return s.Matcher.Fingerprint == f.Fingerprint
+		return s.Matcher.Fingerprint == fingerprint
 	case ScopeGroupCheck:
-		return s.Matcher.Group == f.Group && s.Matcher.Check == f.Check
+		return s.Matcher.Group == group && s.Matcher.Check == check
 	case ScopeTarget:
-		return s.Matcher.Target == f.Target
+		return s.Matcher.Target == target
 	default:
 		return false
 	}

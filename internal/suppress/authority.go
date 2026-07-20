@@ -49,6 +49,27 @@ func (a *Authority) FindingSuppression(now time.Time, f contract.Finding) *Suppr
 	return nil
 }
 
+// MatchFields is FindingSuppression's raw-field counterpart: it evaluates
+// the same fingerprint / group_check / target matching WITHOUT requiring a
+// contract.Finding value. internal/bridge mute-gates its recurrence
+// comments from Alertmanager webhook LABELS, not a contract.Finding it
+// mints itself — and ADR-G09's `make lint` gate bans contract.Finding
+// composite literals everywhere outside internal/contract (the whole point
+// being that NewFinding's caps can't be bypassed by literal construction),
+// so bridge has no sanctioned way to build one just to pass it here.
+// MatchFields lets it match directly on the four raw strings instead; the
+// returned FIRST active match is identical in meaning to
+// FindingSuppression's, just reached without the contract dependency.
+func (a *Authority) MatchFields(now time.Time, fingerprint, group, check, target string) *Suppression {
+	for i := range a.records {
+		if a.records[i].Active(now) && a.records[i].matchesFields(fingerprint, group, check, target) {
+			rec := a.records[i]
+			return &rec
+		}
+	}
+	return nil
+}
+
 // HypothesisSuppressed reports whether any active record suppresses hypFP.
 func (a *Authority) HypothesisSuppressed(now time.Time, hypFP string) bool {
 	for i := range a.records {
