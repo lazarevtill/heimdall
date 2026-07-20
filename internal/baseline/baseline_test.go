@@ -287,6 +287,57 @@ func TestPurgeTemplatesOlderThan(t *testing.T) {
 	}
 }
 
+func TestMarkCrossingEarliestWins(t *testing.T) {
+	s, _ := openTest(t)
+	t0 := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
+
+	since, err := s.MarkCrossing(t0, "c6-quantile-creep", "node-a")
+	if err != nil {
+		t.Fatalf("MarkCrossing (first): %v", err)
+	}
+	if !since.Equal(t0) {
+		t.Errorf("first MarkCrossing since = %v, want %v", since, t0)
+	}
+
+	later := t0.Add(time.Hour)
+	since2, err := s.MarkCrossing(later, "c6-quantile-creep", "node-a")
+	if err != nil {
+		t.Fatalf("MarkCrossing (second): %v", err)
+	}
+	if !since2.Equal(t0) {
+		t.Errorf("second MarkCrossing since = %v, want original %v (earliest-wins)", since2, t0)
+	}
+}
+
+func TestClearCrossingThenMarkCrossingStartsFresh(t *testing.T) {
+	s, _ := openTest(t)
+	t0 := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
+
+	if _, err := s.MarkCrossing(t0, "c6-quantile-creep", "node-a"); err != nil {
+		t.Fatalf("MarkCrossing: %v", err)
+	}
+
+	if err := s.ClearCrossing("c6-quantile-creep", "node-a"); err != nil {
+		t.Fatalf("ClearCrossing: %v", err)
+	}
+
+	t1 := t0.Add(24 * time.Hour)
+	since, err := s.MarkCrossing(t1, "c6-quantile-creep", "node-a")
+	if err != nil {
+		t.Fatalf("MarkCrossing (fresh): %v", err)
+	}
+	if !since.Equal(t1) {
+		t.Errorf("MarkCrossing after ClearCrossing since = %v, want fresh %v", since, t1)
+	}
+}
+
+func TestClearCrossingNoRowIsNoop(t *testing.T) {
+	s, _ := openTest(t)
+	if err := s.ClearCrossing("never-crossed", "node-z"); err != nil {
+		t.Fatalf("ClearCrossing on absent row: %v", err)
+	}
+}
+
 func TestSharedFileTwoHandles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s1, err := baseline.Open(path)

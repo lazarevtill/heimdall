@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS template_baseline (
   last_seen     INTEGER NOT NULL,
   ewma          REAL NOT NULL,
   PRIMARY KEY (host, app, template_hash)
+);
+
+CREATE TABLE IF NOT EXISTS crossing (
+  check_id TEXT NOT NULL,
+  target   TEXT NOT NULL,
+  since    INTEGER NOT NULL,
+  PRIMARY KEY (check_id, target)
 );`
 
 // Store is the Tier-2 baseline store.
@@ -196,6 +203,44 @@ func (s *Store) Warming(now time.Time, checkID, target string, warmDur time.Dura
 	}
 	elapsed := now.Sub(time.Unix(enabledAt, 0).UTC())
 	return elapsed < warmDur, nil
+}
+
+// MarkCrossing records that (check_id,target) is in the graduating zone as of
+// now. Idempotent while in-zone: the FIRST entry time is preserved
+// (earliest-wins) via INSERT ... ON CONFLICT DO NOTHING followed by a SELECT,
+// so the caller can measure how long the metric has held in-zone (the
+// min-hold hysteresis) without a later re-evaluation resetting the clock.
+// Returns the preserved `since`.
+func (s *Store) MarkCrossing(now time.Time, checkID, target string) (since time.Time, err error) {
+	if _, err := s.db.Exec(
+		`INSERT INTO crossing (check_id, target, since) VALUES (?, ?, ?)
+ON CONFLICT(check_id, target) DO NOTHING`,
+		checkID, target, now.Unix(),
+	); err != nil {
+		return time.Time{}, fmt.Errorf("baseline: mark crossing %s/%s: %w", checkID, target, err)
+	}
+	var sinceUnix int64
+	if err := s.db.QueryRow(
+		`SELECT since FROM crossing WHERE check_id=? AND target=?`,
+		checkID, target,
+	).Scan(&sinceUnix); err != nil {
+		return time.Time{}, fmt.Errorf("baseline: mark crossing select %s/%s: %w", checkID, target, err)
+	}
+	return time.Unix(sinceUnix, 0).UTC(), nil
+}
+
+// ClearCrossing removes any crossing record for (check_id,target) — called
+// when the metric drops below clear_threshold, so a later re-entry into the
+// graduating zone starts a fresh hold timer rather than reusing a stale
+// since. A no-op (no error) when there is no row.
+func (s *Store) ClearCrossing(checkID, target string) error {
+	if _, err := s.db.Exec(
+		`DELETE FROM crossing WHERE check_id=? AND target=?`,
+		checkID, target,
+	); err != nil {
+		return fmt.Errorf("baseline: clear crossing %s/%s: %w", checkID, target, err)
+	}
+	return nil
 }
 
 // Template is one row of template_baseline.
