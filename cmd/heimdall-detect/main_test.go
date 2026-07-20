@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lazarevtill/heimdall/internal/contract"
+	"github.com/lazarevtill/heimdall/internal/suppress"
 )
 
 // End-to-end: manifest -> engine -> ledger -> spool -> atomic .prom,
@@ -140,5 +142,149 @@ func TestRunEndToEnd(t *testing.T) {
 	// measured, just warming).
 	if len(dg.UnknownMarkers) != 0 {
 		t.Errorf("UnknownMarkers = %v, want none (Tier-2 signal was measured)", dg.UnknownMarkers)
+	}
+}
+
+// suppressionTestEnv stands up the same minimal httptest Prometheus stub +
+// single-expectation manifest, returning the dirs the caller needs to set
+// HEIMDALL_STATE_DB / HEIMDALL_DIGEST_DIR / HEIMDALL_SUPPRESSIONS_FILE
+// around, so each suppression-focused test controls only what it's testing.
+func suppressionTestEnv(t *testing.T) (dir, digestDir string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"0"]}]}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dir = t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(manifestPath, []byte(`{
+	  "generated_at": "2026-07-19T00:00:00Z",
+	  "expectations": [
+	    {"id":"unit-failures-node-a","check":"c4-signature","group":"node-a","target":"node-a","node":"node-a",
+	     "severity_on_miss":"warning",
+	     "verify":{"backend":"prometheus","query":"sum(node_systemd_units)","min_count":1}}
+	  ]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	textfileDir := filepath.Join(dir, "textfile")
+	if err := os.MkdirAll(textfileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digestDir = filepath.Join(dir, "digest")
+	t.Setenv("HEIMDALL_MANIFEST", manifestPath)
+	t.Setenv("HEIMDALL_TEXTFILE_DIR", textfileDir)
+	t.Setenv("HEIMDALL_SPOOL_DIR", filepath.Join(dir, "findings"))
+	t.Setenv("HEIMDALL_STATE_DB", filepath.Join(dir, "state.db"))
+	t.Setenv("HEIMDALL_PROM_URL", srv.URL)
+	t.Setenv("HEIMDALL_DIGEST_DIR", digestDir)
+	return dir, digestDir
+}
+
+func readDigest(t *testing.T, digestDir string) contract.Digest {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(digestDir, "latest.json"))
+	if err != nil {
+		t.Fatalf("digest latest.json missing: %v", err)
+	}
+	var dg contract.Digest
+	if err := json.Unmarshal(data, &dg); err != nil {
+		t.Fatalf("parse digest latest.json: %v", err)
+	}
+	return dg
+}
+
+// TestRunFeedsDeclarativeSuppressionAnnotation proves a configured
+// HEIMDALL_SUPPRESSIONS_FILE's active record reaches the digest's
+// Suppressed[] (the S5-b wiring under test).
+func TestRunFeedsDeclarativeSuppressionAnnotation(t *testing.T) {
+	dir, digestDir := suppressionTestEnv(t)
+
+	suppressionsPath := filepath.Join(dir, "suppressions.json")
+	if err := os.WriteFile(suppressionsPath, []byte(`[
+	  {"key":"target:node-a-maint","scope":"target","matcher":{"target":"node-a"},
+	   "until":"2099-01-01T00:00:00Z","cumulative_days":0,
+	   "reason":"docs test fixture","actor":"docs-tester","source":"declarative"}
+	]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HEIMDALL_SUPPRESSIONS_FILE", suppressionsPath)
+
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	dg := readDigest(t, digestDir)
+	if len(dg.Suppressed) == 0 {
+		t.Fatal("digest Suppressed is empty, want the declarative record's annotation")
+	}
+	want := "target:node-a suppressed until 2099-01-01T00:00:00Z by docs-tester: docs test fixture"
+	found := false
+	for _, a := range dg.Suppressed {
+		if a == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("digest Suppressed = %v, want to contain %q", dg.Suppressed, want)
+	}
+}
+
+// TestRunNoSuppressionsFileMeansEmptySuppressed proves the old (pre-S5-b)
+// behavior is preserved when HEIMDALL_SUPPRESSIONS_FILE is unset: an empty
+// declarative authority is valid (a fresh lab has no mutes), and with no
+// runtime mutes either, the digest's Suppressed[] stays empty/null.
+func TestRunNoSuppressionsFileMeansEmptySuppressed(t *testing.T) {
+	_, digestDir := suppressionTestEnv(t)
+	// HEIMDALL_SUPPRESSIONS_FILE deliberately left unset.
+
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	dg := readDigest(t, digestDir)
+	if len(dg.Suppressed) != 0 {
+		t.Errorf("digest Suppressed = %v, want empty when HEIMDALL_SUPPRESSIONS_FILE is unset", dg.Suppressed)
+	}
+}
+
+// TestRunFeedsRuntimeMuteAnnotation is the belt-and-suspenders case: a
+// runtime mute pre-seeded into the engine state.db (the same file the
+// ledger/baseline use) via suppress.OpenStore/AddMute must reach the digest
+// too, unioned with the (here, absent) declarative side.
+func TestRunFeedsRuntimeMuteAnnotation(t *testing.T) {
+	_, digestDir := suppressionTestEnv(t)
+	stateDBPath := os.Getenv("HEIMDALL_STATE_DB")
+
+	sstore, err := suppress.OpenStore(stateDBPath)
+	if err != nil {
+		t.Fatalf("suppress.OpenStore: %v", err)
+	}
+	// AddMute's until is computed as now+addDays; use the real current time
+	// (not a fixed docs date) so the mute is guaranteed still active whenever
+	// this test actually runs, independent of the detector's own
+	// time.Now()-derived now moments later in run().
+	if _, err := sstore.AddMute(time.Now().UTC(), "group_check:node-a/c4-signature",
+		suppress.ScopeGroupCheck, suppress.Matcher{Group: "node-a", Check: "c4-signature"},
+		7, "", "", "docs test runtime mute", "docs-tester"); err != nil {
+		t.Fatalf("AddMute: %v", err)
+	}
+	if err := sstore.Close(); err != nil {
+		t.Fatalf("close pre-seed store: %v", err)
+	}
+
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	dg := readDigest(t, digestDir)
+	found := false
+	for _, a := range dg.Suppressed {
+		if strings.Contains(a, "group_check:node-a/c4-signature") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("digest Suppressed = %v, want to contain the runtime mute's annotation", dg.Suppressed)
 	}
 }

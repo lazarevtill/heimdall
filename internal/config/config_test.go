@@ -40,6 +40,9 @@ func TestLoadValid(t *testing.T) {
 	if c.VLURL != "" {
 		t.Errorf("VLURL = %q, want empty when unset (optional)", c.VLURL)
 	}
+	if c.SuppressionsFile != "" {
+		t.Errorf("SuppressionsFile = %q, want empty when unset (optional)", c.SuppressionsFile)
+	}
 }
 
 func TestLoadVLURLOptional(t *testing.T) {
@@ -51,6 +54,18 @@ func TestLoadVLURLOptional(t *testing.T) {
 	}
 	if c.VLURL != "http://127.0.0.1:9428" {
 		t.Errorf("VLURL = %q", c.VLURL)
+	}
+}
+
+func TestLoadSuppressionsFileOptional(t *testing.T) {
+	m := fullEnv()
+	m["HEIMDALL_SUPPRESSIONS_FILE"] = "/etc/heimdall/suppressions.json"
+	c, err := config.Load(env(m))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.SuppressionsFile != "/etc/heimdall/suppressions.json" {
+		t.Errorf("SuppressionsFile = %q", c.SuppressionsFile)
 	}
 }
 

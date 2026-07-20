@@ -23,6 +23,7 @@ import (
 	"github.com/lazarevtill/heimdall/internal/ledger"
 	"github.com/lazarevtill/heimdall/internal/manifest"
 	"github.com/lazarevtill/heimdall/internal/source"
+	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/tier2"
 )
 
@@ -127,7 +128,37 @@ func run() error {
 			})
 		}
 	}
-	var suppressed []string // TODO(S5): suppression authority feeds this
+	// Suppression authority: re-read declarative + runtime mutes each run
+	// (design: no cross-run caching) and fold ACTIVE annotations into the
+	// digest's Suppressed[]. This only POPULATES that slice — it must never
+	// filter a digest row or finding; detection stays unblinded.
+	sstore, err := suppress.OpenStore(cfg.StateDBPath)
+	if err != nil {
+		return err
+	}
+	defer sstore.Close()
+	runtimeMutes, err := sstore.ListRuntime()
+	if err != nil {
+		// A store error is a HARD error: a silently-empty authority could
+		// un-mute everything and manufacture a page storm, so fail loud
+		// instead (same fail-closed ordering as everything else here — this
+		// return happens BEFORE digest.Write).
+		return err
+	}
+	var declarative []suppress.Suppression
+	if cfg.SuppressionsFile != "" {
+		declarative, err = suppress.LoadDeclarative(cfg.SuppressionsFile, now)
+		if err != nil {
+			// A configured-but-broken suppressions file is a HARD error: it
+			// must not silently pass.
+			return err
+		}
+	}
+	authority, skipped := suppress.NewAuthority(declarative, runtimeMutes)
+	if skipped > 0 {
+		fmt.Fprintln(os.Stderr, "heimdall-detect: suppression authority skipped", skipped, "invalid runtime row(s)")
+	}
+	suppressed := authority.ActiveAnnotations(now)
 
 	dg := digest.Build(now, m.GeneratedAt, tier2Results, openTier1, suppressed)
 	// The digest is written BEFORE the ledger upsert / spool / .prom: if this

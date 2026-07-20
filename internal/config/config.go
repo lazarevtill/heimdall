@@ -6,6 +6,8 @@
 // specs are configured. Credentials' first consumers are the VictoriaLogs
 // source's basic-auth pair, keyed HEIMDALL_VL_USER / HEIMDALL_VL_PASS in the
 // cred file (both may be absent — no new required env vars for them).
+// SuppressionsFile (HEIMDALL_SUPPRESSIONS_FILE) is optional: empty when a lab
+// has no declarative suppressions yet (an empty authority is valid).
 package config
 
 import (
@@ -17,29 +19,31 @@ import (
 )
 
 type Config struct {
-	ManifestPath string
-	TextfileDir  string
-	SpoolDir     string
-	StateDBPath  string
-	PromURL      string
-	DigestDir    string
-	VLURL        string // optional: empty when no victorialogs tier2 specs are configured
-	QueryLimit   int
-	Credentials  map[string]string
+	ManifestPath     string
+	TextfileDir      string
+	SpoolDir         string
+	StateDBPath      string
+	PromURL          string
+	DigestDir        string
+	VLURL            string // optional: empty when no victorialogs tier2 specs are configured
+	SuppressionsFile string // HEIMDALL_SUPPRESSIONS_FILE — optional
+	QueryLimit       int
+	Credentials      map[string]string
 }
 
 // Load reads config through the supplied getenv (os.Getenv in main;
 // a map lookup in tests).
 func Load(getenv func(string) string) (Config, error) {
 	c := Config{
-		ManifestPath: getenv("HEIMDALL_MANIFEST"),
-		TextfileDir:  getenv("HEIMDALL_TEXTFILE_DIR"),
-		SpoolDir:     getenv("HEIMDALL_SPOOL_DIR"),
-		StateDBPath:  getenv("HEIMDALL_STATE_DB"),
-		PromURL:      getenv("HEIMDALL_PROM_URL"),
-		DigestDir:    getenv("HEIMDALL_DIGEST_DIR"),
-		VLURL:        getenv("HEIMDALL_VL_URL"), // optional
-		QueryLimit:   8,
+		ManifestPath:     getenv("HEIMDALL_MANIFEST"),
+		TextfileDir:      getenv("HEIMDALL_TEXTFILE_DIR"),
+		SpoolDir:         getenv("HEIMDALL_SPOOL_DIR"),
+		StateDBPath:      getenv("HEIMDALL_STATE_DB"),
+		PromURL:          getenv("HEIMDALL_PROM_URL"),
+		DigestDir:        getenv("HEIMDALL_DIGEST_DIR"),
+		VLURL:            getenv("HEIMDALL_VL_URL"),            // optional
+		SuppressionsFile: getenv("HEIMDALL_SUPPRESSIONS_FILE"), // optional
+		QueryLimit:       8,
 	}
 	required := []struct{ name, val string }{
 		{"HEIMDALL_MANIFEST", c.ManifestPath},
