@@ -129,6 +129,21 @@ func TestOpenReturnsServerAssignedID(t *testing.T) {
 	var gotBody map[string]any
 	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
 		assertAuth(t, r)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tags":
+			// Tag resolution: report none exist so Tag creates them.
+			w.Write([]byte(`[]`))
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tags":
+			// Tag creation returns the new tag's id.
+			w.Write([]byte(`{"id":"10-1","name":"heimdall"}`))
+			return
+		case strings.HasSuffix(r.URL.Path, "/tags"):
+			// Attach-tag-by-id call on the issue; not the create we assert on.
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// The create call (POST /api/issues) — the one we capture/assert.
 		gotPath = r.URL.Path
 		gotMethod = r.Method
 		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
@@ -148,7 +163,7 @@ func TestOpenReturnsServerAssignedID(t *testing.T) {
 			"customFields": []map[string]any{
 				{"name": "State", "value": map[string]any{"name": "Open"}},
 			},
-			"tags": []map[string]any{{"name": "heimdall-hypothesis"}},
+			"tags": []map[string]any{},
 		}
 		b, _ := json.Marshal(resp)
 		w.Write(b)
@@ -335,27 +350,41 @@ func TestPriorityNon2xx(t *testing.T) {
 	}
 }
 
-func TestTagIssuesRightMethodAndPath(t *testing.T) {
-	var gotPath, gotMethod string
-	var gotBody map[string]any
+func TestTagResolvesThenAttachesByID(t *testing.T) {
+	var attachPath, attachMethod string
+	var attachBody map[string]any
+	var sawResolve bool
 	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotMethod = r.Method
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &gotBody)
-		w.WriteHeader(http.StatusOK)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tags":
+			// Resolve the tag name -> id (YouTrack attaches by id, not name).
+			sawResolve = true
+			w.Write([]byte(`[{"id":"10-6","name":"heimdall-auto"}]`))
+		case r.URL.Path == "/api/issues/HEIM-1/tags":
+			attachPath = r.URL.Path
+			attachMethod = r.Method
+			raw, _ := io.ReadAll(r.Body)
+			json.Unmarshal(raw, &attachBody)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		}
 	})
 	if err := y.Tag(ctxWithDeadline(t), "HEIM-1", "heimdall-auto"); err != nil {
 		t.Fatalf("Tag: %v", err)
 	}
-	if gotMethod != http.MethodPost {
-		t.Errorf("method = %q, want POST", gotMethod)
+	if !sawResolve {
+		t.Error("Tag did not resolve the tag id via GET /api/tags")
 	}
-	if gotPath != "/api/issues/HEIM-1/tags" {
-		t.Errorf("path = %q, want /api/issues/HEIM-1/tags", gotPath)
+	if attachMethod != http.MethodPost || attachPath != "/api/issues/HEIM-1/tags" {
+		t.Errorf("attach = %s %s, want POST /api/issues/HEIM-1/tags", attachMethod, attachPath)
 	}
-	if gotBody["name"] != "heimdall-auto" {
-		t.Errorf("body name = %v, want heimdall-auto", gotBody["name"])
+	if attachBody["id"] != "10-6" {
+		t.Errorf("attach body id = %v, want 10-6 (attach by id, not name)", attachBody["id"])
+	}
+	if _, hasName := attachBody["name"]; hasName {
+		t.Errorf("attach body should reference the tag by id only, got name too: %v", attachBody)
 	}
 }
 

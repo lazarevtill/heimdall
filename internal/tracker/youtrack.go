@@ -88,6 +88,38 @@ type youtrackCustomFieldValue struct {
 	Login string `json:"login"`
 }
 
+// UnmarshalJSON tolerates the three shapes YouTrack returns for a custom
+// field's value: a single object (single-value fields), an ARRAY of objects
+// (multi-value fields — we take the first, which is all the connector reads),
+// or null (unset). Without this, a multi-value field on any returned issue
+// makes the whole decode fail.
+func (v *youtrackCustomFieldValue) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	type alias struct {
+		Name  string `json:"name"`
+		Login string `json:"login"`
+	}
+	if data[0] == '[' {
+		var arr []alias
+		if err := json.Unmarshal(data, &arr); err != nil {
+			return err
+		}
+		if len(arr) > 0 {
+			v.Name, v.Login = arr[0].Name, arr[0].Login
+		}
+		return nil
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	v.Name, v.Login = a.Name, a.Login
+	return nil
+}
+
 // youtrackCustomField is the read-side shape of one entry in an issue's
 // customFields array.
 type youtrackCustomField struct {
@@ -198,13 +230,15 @@ type youtrackCustomFieldIn struct {
 	Value youtrackCustomFieldValueIn `json:"value"`
 }
 
-// youtrackOpenBody is the POST /api/issues request body.
+// youtrackOpenBody is the POST /api/issues request body. Tags are NOT set
+// here: YouTrack rejects tags-by-name at issue creation ("unable to locate a
+// Tag-type entity unless its ID is also provided"), so the caller applies
+// tags after creation via Tag, which resolves the name to an id first.
 type youtrackOpenBody struct {
 	Project      youtrackProjectRef      `json:"project"`
 	Summary      string                  `json:"summary"`
 	Description  string                  `json:"description"`
 	CustomFields []youtrackCustomFieldIn `json:"customFields,omitempty"`
-	Tags         []youtrackTag           `json:"tags,omitempty"`
 }
 
 // Open creates a new issue via POST /api/issues (project, summary,
@@ -240,9 +274,6 @@ func (y *YouTrack) Open(ctx context.Context, req OpenRequest) (*Issue, error) {
 			Value: youtrackCustomFieldValueIn{Name: req.Priority},
 		})
 	}
-	for _, t := range req.Tags {
-		body.Tags = append(body.Tags, youtrackTag{Name: t})
-	}
 
 	httpReq, err := y.newRequest(ctx, http.MethodPost, "/api/issues?fields="+issueFields, body)
 	if err != nil {
@@ -252,7 +283,19 @@ func (y *YouTrack) Open(ctx context.Context, req OpenRequest) (*Issue, error) {
 	if err := y.do(httpReq, &created); err != nil {
 		return nil, fmt.Errorf("youtrack: open issue: %w", err)
 	}
-	return toIssue(created), nil
+	issue := toIssue(created)
+
+	// Tags are applied post-creation (YouTrack rejects tags-by-name at create
+	// time). A tag failure is not fatal to the Open — the issue exists; return
+	// it with the tags best-effort applied so a transient tag error does not
+	// orphan a freshly-created issue.
+	for _, t := range req.Tags {
+		if err := y.Tag(ctx, issue.ID, t); err != nil {
+			return issue, fmt.Errorf("youtrack: open issue %s: apply tag %q: %w", issue.ID, t, err)
+		}
+		issue.Tags = append(issue.Tags, t)
+	}
+	return issue, nil
 }
 
 // Comment appends a comment via POST /api/issues/{id}/comments {text}.
@@ -312,10 +355,83 @@ func (y *YouTrack) Priority(ctx context.Context, issueID, priority string) error
 	return nil
 }
 
-// Tag adds tag via POST /api/issues/{id}/tags {name}.
+// youtrackTagRef is the write-side {"id":"..."} tag reference: YouTrack
+// locates a tag to attach by its id, not its name.
+type youtrackTagRef struct {
+	ID string `json:"id"`
+}
+
+// resolveOrCreateTag returns the id of the tag named name, creating it if it
+// does not exist. YouTrack requires an existing tag's id to attach it to an
+// issue; a bare name is rejected. It lists the caller's tags and matches by
+// name client-side (YouTrack's tag-search query is unreliable for exact-name
+// lookup), then creates the tag only if truly absent.
+func (y *YouTrack) resolveOrCreateTag(ctx context.Context, name string) (string, error) {
+	listTags := func() ([]struct{ ID, Name string }, error) {
+		req, err := y.newRequest(ctx, http.MethodGet, "/api/tags?fields=id,name&$top=1000", nil)
+		if err != nil {
+			return nil, err
+		}
+		var tags []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		if err := y.do(req, &tags); err != nil {
+			return nil, err
+		}
+		out := make([]struct{ ID, Name string }, len(tags))
+		for i, t := range tags {
+			out[i] = struct{ ID, Name string }{t.ID, t.Name}
+		}
+		return out, nil
+	}
+
+	tags, err := listTags()
+	if err != nil {
+		return "", err
+	}
+	for _, t := range tags {
+		if strings.EqualFold(t.Name, name) {
+			return t.ID, nil
+		}
+	}
+	// Not found: create it.
+	creq, err := y.newRequest(ctx, http.MethodPost, "/api/tags?fields=id,name", youtrackTag{Name: name})
+	if err != nil {
+		return "", err
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := y.do(creq, &created); err != nil {
+		// A concurrent creator (or a name the list missed) can make the create
+		// 400 "already exists"; re-list and match rather than failing.
+		tags2, lerr := listTags()
+		if lerr != nil {
+			return "", err
+		}
+		for _, t := range tags2 {
+			if strings.EqualFold(t.Name, name) {
+				return t.ID, nil
+			}
+		}
+		return "", err
+	}
+	if created.ID == "" {
+		return "", fmt.Errorf("created tag %q returned no id", name)
+	}
+	return created.ID, nil
+}
+
+// Tag attaches the named tag to an issue. It first resolves the tag name to
+// an id (creating the tag if absent), then POSTs the id to
+// /api/issues/{id}/tags — YouTrack cannot attach a tag by name alone.
 func (y *YouTrack) Tag(ctx context.Context, issueID, tag string) error {
-	payload := youtrackTag{Name: tag}
-	req, err := y.newRequest(ctx, http.MethodPost, "/api/issues/"+url.PathEscape(issueID)+"/tags", payload)
+	tagID, err := y.resolveOrCreateTag(ctx, tag)
+	if err != nil {
+		return fmt.Errorf("youtrack: tag %s with %q: resolve tag: %w", issueID, tag, err)
+	}
+	req, err := y.newRequest(ctx, http.MethodPost, "/api/issues/"+url.PathEscape(issueID)+"/tags", youtrackTagRef{ID: tagID})
 	if err != nil {
 		return fmt.Errorf("youtrack: tag %s with %q: %w", issueID, tag, err)
 	}
