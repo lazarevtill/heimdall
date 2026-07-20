@@ -19,6 +19,7 @@ var ErrInvalid = errors.New("manifest: invalid")
 type Manifest struct {
 	GeneratedAt  time.Time     `json:"generated_at"`
 	Expectations []Expectation `json:"expectations"`
+	Tier2        []Tier2Spec   `json:"tier2"`
 }
 
 type Expectation struct {
@@ -42,7 +43,47 @@ func (e Expectation) Grace() time.Duration {
 	return time.Duration(e.GraceSeconds) * time.Second
 }
 
+// Tier2Spec is one declarative soft-signal, IaC/MR-reviewed (thresholds are
+// never code constants). The engine either GRADUATES it (class=trend, capped
+// at warning) or emits it as a digest row — decided in the S2-b check, not
+// here. Graduate-vs-clear ordering is deliberately not validated in this
+// package: the hysteresis direction is per-signal and lives in the S2-b
+// check.
+type Tier2Spec struct {
+	ID                    string            `json:"id"`
+	Signal                string            `json:"signal"` // quantile | flap | slope | template_surprise
+	Check                 string            `json:"check"`  // e.g. c6-quantile-creep (the finding/digest check id)
+	Group                 string            `json:"group"`  // node | service
+	Entity                string            `json:"entity"` // host|ct|vm|unit|app|fs
+	Target                string            `json:"target"`
+	Node                  string            `json:"node"`
+	Feature               string            `json:"feature"`
+	Unit                  string            `json:"unit"`
+	Backend               string            `json:"backend"` // prometheus | victorialogs
+	Query                 string            `json:"query"`
+	WindowSeconds         int64             `json:"window_seconds"`
+	BaselineWindowSeconds int64             `json:"baseline_window_seconds"`
+	GraduateThreshold     float64           `json:"graduate_threshold"`
+	ClearThreshold        float64           `json:"clear_threshold"`
+	MinHoldSeconds        int64             `json:"min_hold_seconds"`
+	Digest                bool              `json:"digest"`
+	Severity              contract.Severity `json:"severity"` // "" means info (default); capped at warning downstream
+}
+
+func (t Tier2Spec) Window() time.Duration {
+	return time.Duration(t.WindowSeconds) * time.Second
+}
+
+func (t Tier2Spec) BaselineWindow() time.Duration {
+	return time.Duration(t.BaselineWindowSeconds) * time.Second
+}
+
 var validBackends = map[string]bool{"prometheus": true, "victorialogs": true, "pbs": true}
+
+// tier2Backends excludes pbs: Tier-2 never reads PBS.
+var tier2Backends = map[string]bool{"prometheus": true, "victorialogs": true}
+
+var validSignals = map[string]bool{"quantile": true, "flap": true, "slope": true, "template_surprise": true}
 
 func Load(path string) (*Manifest, error) {
 	data, err := os.ReadFile(path)
@@ -95,6 +136,41 @@ func Load(path string) (*Manifest, error) {
 		}
 		seenFP[fp] = e.ID
 		seen[e.ID] = true
+	}
+	// Tier-2 soft signals share seenFP with the expectations loop above: the
+	// two planes emit into the SAME .prom series namespace, so a Tier-2
+	// (check,target) equal to a Tier-1 (check,target) would clobber a series
+	// exactly as two expectations would.
+	for i, ts := range m.Tier2 {
+		where := fmt.Sprintf("tier2[%d] (id %q)", i, ts.ID)
+		switch {
+		case ts.ID == "" || ts.Check == "" || ts.Target == "" || ts.Group == "":
+			return nil, fmt.Errorf("%w: %s: id, check, group, target are required", ErrInvalid, where)
+		case strings.Contains(ts.Check, "|"):
+			return nil, fmt.Errorf("%w: %s: check id contains reserved '|'", ErrInvalid, where)
+		case !validSignals[ts.Signal]:
+			return nil, fmt.Errorf("%w: %s: unknown signal %q", ErrInvalid, where, ts.Signal)
+		case !tier2Backends[ts.Backend]:
+			return nil, fmt.Errorf("%w: %s: unknown or unsupported tier2 backend %q", ErrInvalid, where, ts.Backend)
+		case ts.Query == "":
+			return nil, fmt.Errorf("%w: %s: query is required", ErrInvalid, where)
+		case ts.MinHoldSeconds < 0:
+			return nil, fmt.Errorf("%w: %s: min_hold_seconds must be >= 0", ErrInvalid, where)
+		}
+		switch ts.Severity {
+		case "", contract.SeverityInfo, contract.SeverityWarning:
+		case contract.SeverityCritical:
+			// Tier-2 can never page — a manifest asking for a critical soft
+			// signal is a rendering error, fail loud.
+			return nil, fmt.Errorf("%w: %s: severity critical is rejected for tier2 (soft signals can never page)", ErrInvalid, where)
+		default:
+			return nil, fmt.Errorf("%w: %s: invalid severity %q", ErrInvalid, where, ts.Severity)
+		}
+		fp := contract.Fingerprint(ts.Check, ts.Target)
+		if prev, ok := seenFP[fp]; ok {
+			return nil, fmt.Errorf("%w: %s: (check,target) collides with id %q — identical fingerprint %s would emit duplicate .prom series and clobber a spool doc", ErrInvalid, where, prev, fp)
+		}
+		seenFP[fp] = ts.ID
 	}
 	return &m, nil
 }

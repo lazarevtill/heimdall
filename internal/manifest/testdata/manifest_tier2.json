@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-07-19T00:00:00Z",
+  "expectations": [
+    {
+      "id": "backup-vm-100",
+      "check": "c1-deadman",
+      "group": "backup-ds1",
+      "target": "backup:ds1/vm-100",
+      "node": "node-a",
+      "grace_seconds": 3600,
+      "severity_on_miss": "critical",
+      "verify": {
+        "backend": "prometheus",
+        "query": "max(backup_last_success_timestamp_seconds{backup_id=\"vm-100\"})"
+      }
+    }
+  ],
+  "tier2": [
+    {
+      "id": "node-a-cpu-creep",
+      "signal": "quantile",
+      "check": "c6-quantile-creep",
+      "group": "node",
+      "entity": "host",
+      "target": "node-a",
+      "node": "node-a",
+      "feature": "cpu_p95",
+      "unit": "ratio",
+      "backend": "prometheus",
+      "query": "quantile(0.95, node_cpu_seconds_total)",
+      "window_seconds": 3600,
+      "baseline_window_seconds": 604800,
+      "graduate_threshold": 2.5,
+      "clear_threshold": 1.5,
+      "min_hold_seconds": 1800,
+      "digest": false,
+      "severity": "warning"
+    }
+  ]
+}
