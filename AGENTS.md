@@ -4,61 +4,112 @@ Canonical instructions for humans and coding agents in this repo. `CLAUDE.md` po
 
 ## What this is
 A deterministic, IaC-managed log/metric observer. It catches **silent failures** (a backup
-that ran broken with no threshold tripped) and slow **trends**, and takes the right action per
-severity (notify vs ticket vs escalate). Design is in `design/`; the canonical build target is
-`design/2026-07-19-final-design.md`, the growth path is `design/2026-07-19-heimdall-at-scale.md`,
-the language decision is `design/adr-0001-language-go.md`.
+that ran broken with no threshold tripped) and slow **trends**, reasons over the residue with a
+local LLM, and takes the right action per severity (notify vs ticket vs escalate). Design is in
+`design/`; the canonical target is `design/2026-07-19-final-design.md`, the growth path is
+`design/2026-07-19-heimdall-at-scale.md`, the language decision is `design/adr-0001-language-go.md`.
 
-**Status:** the **Tier-1 deterministic detector is built and live-tested** — `cmd/heimdall-detect`
-(oneshot: manifest → sources → ledger → spool → atomic `.prom`) plus the meta-rules in
-`deploy/alerts/`. Tier-2 (soft signals) and Tier-3 (llama.cpp analyst) are designed, not built.
-The three-tier model and every trust invariant are enforced in code + CI.
+**Status:** all three tiers are **built** — four binaries, every connector, the plugin host, and
+the llama.cpp analyst. Every surface with a reachable data source/credential is **live-verified**
+against the real stack. The three-tier model and every trust invariant are enforced in code + CI.
+What remains is deployment/IaC and operator-provisioned credentials.
 
-## Package map (Tier-1)
-- `cmd/heimdall-detect` — the oneshot; **thin** (env + wiring) and the only `time.Now()` in the program.
-- `internal/contract` — `Finding`/`State`, `NewFinding` (refuses `hypothesis`, caps `trend`), `Fingerprint = sha256(check|target)[:16]`, fail-closed `Redact`/`EvidenceOrWithheld`.
-- `internal/manifest` — loads + validates the IaC-rendered expectation manifest (rejects dup id AND dup `(check,target)` fingerprint).
-- `internal/source` — `Source` interface + Prometheus client (jittered backoff, fail-closed failure matrix).
-- `internal/detect` — pure checks (`DeadMan`, `Threshold`) + errgroup-bounded engine (panic boundary, never cancels siblings).
-- `internal/ledger` — SQLite ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
-- `internal/emit` — `.prom` render (frozen label set, no `state` label, no timestamps), atomic replace, redacted spool.
+## Binaries
+- `cmd/heimdall-detect` — Tier-1 + Tier-2 oneshot (timer): manifest → sources → checks →
+  ledger → redacted spool → atomic `.prom` + digest. The **only** `time.Now()` in the program.
+- `cmd/heimdall-analyst` — Tier-3 oneshot: digest → health-gate LLM → analyze → verify/dedup/
+  cap/redact → persist → POST `/hypothesis`.
+- `cmd/heimdall-bridge` — HTTP daemon: `/am` (Alertmanager webhook → YouTrack), `/hypothesis`,
+  `/healthz`; 15-min escalation sweep. `time.Now()` is allowed in `cmd/`.
+- `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain,
+  Alertmanager silence reconcile, weekly digest, own heartbeat.
+
+## Package map
+- `internal/contract` — wire types (`Finding`/`Digest`/`HypothesisFinding`), `NewFinding`
+  (refuses `hypothesis`, caps `trend`), `Fingerprint = sha256(check|target)[:16]`,
+  `HypFingerprint`, fail-closed `Redact`/`EvidenceOrWithheld`.
+- `internal/manifest` — loads + validates the IaC-rendered expectation + Tier-2 manifest
+  (rejects dup id AND dup `(check,target)` fingerprint; Tier-2 severity never `critical`).
+- `internal/source` — `Source` interface + Prometheus, VictoriaLogs (LogsQL), and PBS
+  (pinned-CA, never `InsecureSkipVerify`) clients; every failure → alertable `unknown`.
+- `internal/detect` — pure checks (`DeadMan`, `Threshold`) + errgroup-bounded engine (panic
+  boundary, never cancels siblings).
+- `internal/baseline` — Tier-2 SQLite store (features/warmup/template_baseline/crossing) over the
+  engine `state.db` (own handle, no `PRAGMA user_version`).
+- `internal/tier2` — Tier-2 C6–C9 evaluation (robust-IQR zscore), graduation with hysteresis +
+  7-day warm-up; unknown/warming never graduates.
+- `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
+  `latest.json` + 14-day dated history).
+- `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
+- `internal/emit` — `.prom` render (frozen label set, no `state` label, no timestamps), atomic
+  replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.
-- `deploy/alerts/heimdall-meta.rules.yml` — the alerts that page when the detector goes stale/absent/redaction-fails.
+- `internal/suppress` — the **single suppression authority**: declarative (`suppressions.json`)
+  ∪ runtime (SQLite mutes), five scopes, 30-day rolling cumulative cap, active-silence projection.
+- `internal/plugin` — subprocess plugin host (manifest validate, `plugin_api` version gate,
+  scrubbed-env/deadline/pgroup-kill/output-cap runner, capability-scoped credential injection) +
+  the `source.Source` adapter that drives a source plugin as a data source.
+- `internal/llm` — llama.cpp OpenAI-compatible client: strict `json_schema`, `temperature:0`,
+  health gate, redact-before-send (registered egress).
+- `internal/analyst` — the Tier-3 wrapper: health gate, row-id verification (drops hallucinated
+  citations), wrapper-computed `hyp_fp`, 7-day dedup + per-run cap, persist-before-POST.
+- `internal/tracker` — the tracker seam + YouTrack REST implementation + `[hb:<key>]` marker
+  grammar (`<group>--<check>` / `t3-<hyp_fp>`) + configurable default assignee.
+- `internal/outbox` — channel-typed, idempotent `notify_outbox` (bridge's own db).
+- `internal/bridge` — AM webhook v4 parse, issue ledger, `Reconcile` (one issue per group,
+  per-target checklist, close-on-group-resolved+`heimdall-auto`, mute-gated recurrence, storm
+  fuse), `HandleHypothesis` (G1: structurally never pages), `EscalationSweep`.
+- `internal/telegram` / `internal/silence` — Telegram Bot API and Alertmanager v2 silence clients.
+- `internal/notify` — outbox drainer (per-channel buttons), button-callback dispatcher
+  (allow-listed → suppression writes), silence reconciler, weekly digest, notifier heartbeat.
+- `plugins/source-reference` — a real, stdlib-only reference source plugin.
+- `deploy/alerts/heimdall-meta.rules.yml` — the alerts that page when a component goes
+  stale/absent/redaction-fails.
 
 ## Non-negotiable trust invariants (do not violate in any change)
-1. **Unknown is always alertable.** A failed/timed-out query yields `unknown`, never a silent
-   "nothing happened". A dead detector must **page** (heartbeat staleness).
-2. **The `hypothesis` class can never page, resolve, or silence anything.** The Tier-3 LLM
-   analyst (a local **llama.cpp** server, OpenAI-compatible, off the runtime path) emits
-   `hypothesis` docs only; `internal/contract`'s `NewFinding` refuses that class and `trend` is
-   capped at `warning` (enforced in code + a CI gate banning `contract.Finding{}` literals
-   outside the constructor).
-3. **Fail-closed redaction at every egress.** A redactor error withholds evidence but the
-   finding still fires. Never widen an egress without routing it through the redaction library.
-4. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
-5. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
+1. **Unknown is always alertable.** A failed/timed-out/panicking source or plugin yields
+   `unknown`, never a silent "nothing happened". A dead component **pages** (heartbeat staleness).
+2. **The LLM can never page, resolve, or silence.** `class=hypothesis` is refused by `NewFinding`;
+   the analyst's only egress is POST `/hypothesis`; the bridge's hypothesis handler only enqueues
+   to the analyst channel or opens a `Task` ticket. A `make` gate walks
+   `go list -deps ./cmd/heimdall-detect` and fails if `internal/llm` is reachable — keep it clean.
+   `trend` is capped at `warning`; a CI gate bans `contract.Finding{}` literals outside the
+   constructor.
+3. **Fail-closed redaction at every egress.** Every place evidence leaves the process — spool,
+   digest, the LLM prompt, the bridge `/hypothesis` re-redaction, the YouTrack issue body — runs
+   through the redactor; a failure withholds content, is counted, and pages. Never widen an
+   egress without routing it through the redaction library.
+4. **Suppression silences notification, never detection.** A muted finding keeps its series and is
+   annotated in the digest; the ledger is the authority, Alertmanager silences are a projection.
+5. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
+6. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
    live only in the infra repo + Vault — never commit them here (this repo is public-mirrored).
 
 ## Language & style
 - **Go, stdlib-first.** One static binary per `cmd/`. The **direct-dependency budget is exactly
   three** — `golang.org/x/sync`, `modernc.org/sqlite` (pure-Go, keeps `CGO_ENABLED=0` static),
   `github.com/google/go-cmp` (tests only) — guarded by `policy_test.go`; adding one requires
-  amending ADR-G02 first. `go 1.25.0`.
+  amending ADR-G02 first. `go 1.25.0`, `GOTOOLCHAIN=auto`.
 - Business logic in `internal/`; keep packages small and single-purpose (see `design/repo-layout.md`).
-- Checks are **pure functions** `(now, expectation, signal) → []Finding` — no I/O, no `time.Now()`
-  (the clock is injected), so dead-man window boundaries are table-testable.
+- **No `time.Now()` under `internal/`** (including tests) — the clock is always injected as a
+  `now time.Time`, so window boundaries and dedup cooldowns are table-testable. Only the `cmd/`
+  mains call `time.Now()`.
+- Checks are **pure functions** `(now, expectation, signal) → []Finding` — no I/O.
+- SQLite stores that share the engine `state.db` open their **own** handle with the same WAL
+  config and never touch `PRAGMA user_version` (the ledger's migrator owns it).
 - Tests are **TDD + table-driven**, assert with `go-cmp` (not testify); wire-format and
   fingerprint invariants are locked by **golden vectors** — regenerate deliberately, never blindly.
+  Live tests are env-gated and never committed; connectors are also proven against real services.
 - Plugins are **subprocesses** (JSON over stdin/stdout), capability-scoped and sandboxed; the
   core never `import`s plugin code.
 
 ## Build / test
 ```
-make build     # CGO_ENABLED=0 static, stripped binary → bin/heimdall-detect
+make build     # CGO_ENABLED=0 static, stripped binaries → bin/{heimdall-detect,analyst,bridge,notifier}
 make test      # CGO_ENABLED=1 go test -race ./...   (cgo only for the race detector)
-make lint      # gofmt, go vet, + four policy gates: no time.Now() in internal/,
-               # no contract.Finding{} literals outside the constructor, no real-infra
-               # strings in shipped code/deploy/CI, no secret-shaped tokens
+make lint      # gofmt, go vet, + policy gates: no time.Now() in internal/, no contract.Finding{}
+               # literals outside the constructor, no internal/llm on the detector dep graph,
+               # no real-infra strings in shipped code/deploy/CI, no secret-shaped tokens
 make vuln      # govulncheck (pinned version, never @latest)
 make ci        # lint + test + build + vuln   (this is what GitLab CI runs)
 ```
@@ -66,5 +117,4 @@ make ci        # lint + test + build + vuln   (this is what GitLab CI runs)
 ## Process
 - Change → MR → `/apply` → merge (infra runbook). Never force-push shared history.
 - **Do not commit real IPs, hostnames, Vault paths, or tokens.** This repo is mirrored to a
-  public GitHub; keep it that way.
-- Implementation is gated on design approval — stubs stay stubs until the owner says go.
+  public GitHub via a leak-scanning replay; keep it that way. `design/` is private-only.
