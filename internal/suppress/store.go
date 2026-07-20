@@ -216,3 +216,30 @@ func (s *Store) RecordFeedback(now time.Time, key, event, actor string) error {
 	}
 	return nil
 }
+
+// CountFeedbackSince returns event->count for feedback rows with ts >= since
+// (inclusive), across every key. A row with ts < since is excluded. Feeds
+// the weekly digest's "feedback over the past week" section; the caller
+// picks the window (e.g. since = now.Add(-7*24*time.Hour)).
+func (s *Store) CountFeedbackSince(since time.Time) (map[string]int, error) {
+	rows, err := s.db.Query(
+		`SELECT event, COUNT(*) FROM feedback WHERE ts >= ? GROUP BY event`, since.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("suppress: count feedback since: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var event string
+		var count int
+		if err := rows.Scan(&event, &count); err != nil {
+			return nil, fmt.Errorf("suppress: count feedback since scan: %w", err)
+		}
+		out[event] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("suppress: count feedback since rows: %w", err)
+	}
+	return out, nil
+}

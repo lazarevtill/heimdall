@@ -171,6 +171,49 @@ func TestListRuntimeReturnsWhatWasWritten(t *testing.T) {
 	}
 }
 
+func TestCountFeedbackSinceExcludesOlderRows(t *testing.T) {
+	s := openTestStore(t)
+	old := fixedNow.Add(-14 * 24 * time.Hour)
+	within := fixedNow.Add(-2 * 24 * time.Hour)
+
+	if err := s.RecordFeedback(old, "k1", "ack", "ops"); err != nil {
+		t.Fatalf("RecordFeedback old: %v", err)
+	}
+	if err := s.RecordFeedback(within, "k2", "mute", "ops"); err != nil {
+		t.Fatalf("RecordFeedback within #1: %v", err)
+	}
+	if err := s.RecordFeedback(within, "k3", "mute", "ops"); err != nil {
+		t.Fatalf("RecordFeedback within #2: %v", err)
+	}
+	if err := s.RecordFeedback(within, "k4", "useful", "ops"); err != nil {
+		t.Fatalf("RecordFeedback within #3: %v", err)
+	}
+
+	since := fixedNow.Add(-7 * 24 * time.Hour)
+	counts, err := s.CountFeedbackSince(since)
+	if err != nil {
+		t.Fatalf("CountFeedbackSince: %v", err)
+	}
+	want := map[string]int{"mute": 2, "useful": 1}
+	if diff := cmp.Diff(want, counts); diff != "" {
+		t.Errorf("CountFeedbackSince (-want +got):\n%s", diff)
+	}
+}
+
+func TestCountFeedbackSinceBoundaryIsInclusive(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.RecordFeedback(fixedNow, "k1", "ack", "ops"); err != nil {
+		t.Fatalf("RecordFeedback: %v", err)
+	}
+	counts, err := s.CountFeedbackSince(fixedNow)
+	if err != nil {
+		t.Fatalf("CountFeedbackSince: %v", err)
+	}
+	if counts["ack"] != 1 {
+		t.Errorf("CountFeedbackSince(exact ts) = %v, want ack:1 (boundary is inclusive)", counts)
+	}
+}
+
 func TestRecordFeedbackValidatesVocabulary(t *testing.T) {
 	s := openTestStore(t)
 	for _, event := range []string{"ack", "mute", "noise", "useful", "not_useful", "wontfix", "fixed", "auto_recovered", "extend"} {
