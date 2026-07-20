@@ -1,7 +1,227 @@
-// Command heimdall-notifier — The single Telegram getUpdates poller: lifecycle lines, Ack/Mute/Noise/Explain buttons, suppression writes, /explain dispatch.
+// Command heimdall-notifier is the NOTIFIER's long-running daemon: one
+// Telegram getUpdates long-poll loop that dispatches inline-button presses
+// (internal/notify.Dispatch) into suppression writes, plus per-cycle
+// housekeeping that drains the bridge's notify_outbox (internal/notify.Drain),
+// reconciles Alertmanager silences against the suppression authority
+// (internal/notify.ReconcileSilences), emits the heimdall-notifier.prom
+// heartbeat, and — once a week — sends the Monday-05:00 digest
+// (internal/notify.RenderWeeklyDigest). It wraps S7-a/b/c's
+// internal/telegram, internal/silence, and internal/notify; see those
+// packages' doc comments for the algorithms this file only wires together.
 //
-// See design/2026-07-19-final-design.md and design/repo-layout.md.
-// TODO: implementation gated on design approval (brainstorming HARD-GATE).
+// Reality: Telegram/Alertmanager creds are BLOCKED on the operator (no
+// BotFather token/chat_ids yet). This binary is nonetheless fully wired to
+// the real *telegram.Client/*silence.Client; every test in this package
+// drives a fake TelegramSender/SilenceClient over temp stores instead — see
+// cycle_test.go/loop_test.go. Never a live Telegram in a test.
+//
+// Like heimdall-bridge (and unlike the oneshot heimdall-detect/
+// heimdall-analyst), heimdall-notifier is a persistent daemon: it calls
+// time.Now().UTC() once per loop iteration (loop.go), never inside
+// internal/ (ADR-G10 exempts cmd/ for exactly this reason).
+//
+// main is thin by design: env/flags, wiring, then runLoop. Every piece of
+// actual per-cycle logic lives in testable functions this package's tests
+// call directly (handleUpdates, runCycle, maybeSendDigest,
+// shouldSendDigest, weekKey) — the infinite for loop in loop.go is not
+// itself testable, so it contains no logic beyond calling those functions.
 package main
 
-func main() {}
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/lazarevtill/heimdall/internal/notify"
+	"github.com/lazarevtill/heimdall/internal/outbox"
+	"github.com/lazarevtill/heimdall/internal/silence"
+	"github.com/lazarevtill/heimdall/internal/suppress"
+	"github.com/lazarevtill/heimdall/internal/telegram"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "heimdall-notifier:", err)
+		os.Exit(1)
+	}
+}
+
+// config is the notifier's own small env loader (fail-loud on any missing
+// required var), mirroring heimdall-bridge/heimdall-analyst's loadConfig
+// style — deliberately not internal/config, which is Tier-1/Tier-2's
+// detector config and carries fields this binary has no use for.
+type config struct {
+	TelegramURL        string         // HEIMDALL_TELEGRAM_URL; e.g. "https://api.telegram.org" (injectable for tests)
+	TelegramToken      string         // HEIMDALL_TELEGRAM_TOKEN — read directly from the env (see loadConfig's doc), never hardcoded
+	MainChatID         int64          // HEIMDALL_MAIN_CHAT_ID
+	AnalystChatID      int64          // HEIMDALL_ANALYST_CHAT_ID
+	AllowedUsers       map[int64]bool // HEIMDALL_ALLOWED_USER_IDS, comma-separated
+	AlertmanagerURL    string         // HEIMDALL_ALERTMANAGER_URL; e.g. "http://127.0.0.1:9093"
+	EngineStateDB      string         // HEIMDALL_ENGINE_STATE_DB; suppress store (runtime mutes + feedback)
+	BridgeDB           string         // HEIMDALL_BRIDGE_DB; notify_outbox
+	SuppressionsFile   string         // HEIMDALL_SUPPRESSIONS_FILE; optional — "" means no declarative suppressions configured
+	TextfileDir        string         // HEIMDALL_TEXTFILE_DIR; heimdall-notifier.prom heartbeat written here
+	PollTimeoutSeconds int            // HEIMDALL_POLL_TIMEOUT_SECONDS; optional, default defaultPollTimeoutSeconds
+}
+
+// defaultPollTimeoutSeconds is the pinned default long-poll wait (brief:
+// "default 30").
+const defaultPollTimeoutSeconds = 30
+
+// loadConfig reads through the supplied getenv (os.Getenv in main; a map
+// lookup in tests). HEIMDALL_TELEGRAM_TOKEN is read DIRECTLY from the env
+// (like heimdall-bridge's HEIMDALL_YOUTRACK_TOKEN) rather than via a cred
+// file: this binary already has its own small env loader, and a systemd
+// unit can supply the value via LoadCredential+EnvironmentFile or a
+// secrets-manager sidecar without this program needing to know the
+// difference — either way, the token is never hardcoded and never logged.
+func loadConfig(getenv func(string) string) (config, error) {
+	c := config{
+		TelegramURL:        getenv("HEIMDALL_TELEGRAM_URL"),
+		TelegramToken:      getenv("HEIMDALL_TELEGRAM_TOKEN"),
+		AlertmanagerURL:    getenv("HEIMDALL_ALERTMANAGER_URL"),
+		EngineStateDB:      getenv("HEIMDALL_ENGINE_STATE_DB"),
+		BridgeDB:           getenv("HEIMDALL_BRIDGE_DB"),
+		SuppressionsFile:   getenv("HEIMDALL_SUPPRESSIONS_FILE"), // optional
+		TextfileDir:        getenv("HEIMDALL_TEXTFILE_DIR"),
+		PollTimeoutSeconds: defaultPollTimeoutSeconds,
+	}
+
+	required := []struct{ name, val string }{
+		{"HEIMDALL_TELEGRAM_URL", c.TelegramURL},
+		{"HEIMDALL_TELEGRAM_TOKEN", c.TelegramToken},
+		{"HEIMDALL_ALERTMANAGER_URL", c.AlertmanagerURL},
+		{"HEIMDALL_ENGINE_STATE_DB", c.EngineStateDB},
+		{"HEIMDALL_BRIDGE_DB", c.BridgeDB},
+		{"HEIMDALL_TEXTFILE_DIR", c.TextfileDir},
+	}
+	for _, r := range required {
+		if r.val == "" {
+			return config{}, fmt.Errorf("heimdall-notifier: %s is required", r.name)
+		}
+	}
+
+	mainChatRaw := getenv("HEIMDALL_MAIN_CHAT_ID")
+	if mainChatRaw == "" {
+		return config{}, errors.New("heimdall-notifier: HEIMDALL_MAIN_CHAT_ID is required")
+	}
+	mainChatID, err := strconv.ParseInt(mainChatRaw, 10, 64)
+	if err != nil {
+		return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_MAIN_CHAT_ID %q must be an integer: %w", mainChatRaw, err)
+	}
+	c.MainChatID = mainChatID
+
+	analystChatRaw := getenv("HEIMDALL_ANALYST_CHAT_ID")
+	if analystChatRaw == "" {
+		return config{}, errors.New("heimdall-notifier: HEIMDALL_ANALYST_CHAT_ID is required")
+	}
+	analystChatID, err := strconv.ParseInt(analystChatRaw, 10, 64)
+	if err != nil {
+		return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_ANALYST_CHAT_ID %q must be an integer: %w", analystChatRaw, err)
+	}
+	c.AnalystChatID = analystChatID
+
+	allowedRaw := getenv("HEIMDALL_ALLOWED_USER_IDS")
+	if allowedRaw == "" {
+		return config{}, errors.New("heimdall-notifier: HEIMDALL_ALLOWED_USER_IDS is required")
+	}
+	allowed, err := parseAllowedUserIDs(allowedRaw)
+	if err != nil {
+		return config{}, err
+	}
+	c.AllowedUsers = allowed
+
+	if v := getenv("HEIMDALL_POLL_TIMEOUT_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_POLL_TIMEOUT_SECONDS %q must be a positive integer", v)
+		}
+		c.PollTimeoutSeconds = n
+	}
+
+	return c, nil
+}
+
+// parseAllowedUserIDs parses a comma-separated int64 list into an allow-set.
+// Blank items (e.g. a trailing comma, or surrounding whitespace) are
+// skipped; any non-integer item is a config error (fail-loud — a malformed
+// allow-list must never silently drop an operator or silently admit a typo
+// as some OTHER numeric id).
+func parseAllowedUserIDs(raw string) (map[int64]bool, error) {
+	out := make(map[int64]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("heimdall-notifier: HEIMDALL_ALLOWED_USER_IDS: invalid id %q: %w", part, err)
+		}
+		out[id] = true
+	}
+	return out, nil
+}
+
+func run() error {
+	cfg, err := loadConfig(os.Getenv)
+	if err != nil {
+		return err
+	}
+
+	httpc := &http.Client{}
+	tg := telegram.NewClient(cfg.TelegramURL, cfg.TelegramToken, httpc)
+	sc := silence.NewClient(cfg.AlertmanagerURL, httpc)
+
+	// Opened via suppress.OpenStore against the ENGINE's state.db: the
+	// notifier is the ONLY writer of runtime mutes (Telegram button
+	// presses), and also reads it back every cycle to build a fresh
+	// Authority and to gather the weekly digest's feedback/expiring-mute
+	// data.
+	engineSuppress, err := suppress.OpenStore(cfg.EngineStateDB)
+	if err != nil {
+		return err
+	}
+	defer engineSuppress.Close()
+
+	// Opened via outbox.Open against the BRIDGE's own db file — a
+	// different file from cfg.EngineStateDB (see the brief's NOTE on the
+	// two SQLite files, mirrored from heimdall-bridge's main.go).
+	ob, err := outbox.Open(cfg.BridgeDB)
+	if err != nil {
+		return err
+	}
+	defer ob.Close()
+
+	cd := cycleDeps{
+		Notify: notify.Deps{
+			TG:            tg,
+			Outbox:        ob,
+			Suppress:      engineSuppress,
+			MainChatID:    cfg.MainChatID,
+			AnalystChatID: cfg.AnalystChatID,
+			AllowedUsers:  cfg.AllowedUsers,
+		},
+		Silence:          sc,
+		Suppress:         engineSuppress,
+		SuppressionsFile: cfg.SuppressionsFile,
+		TextfileDir:      cfg.TextfileDir,
+		TG:               tg,
+		MainChatID:       cfg.MainChatID,
+	}
+
+	log.Printf("heimdall-notifier: starting (main_chat=%d analyst_chat=%d allowed_users=%d poll_timeout=%ds)",
+		cfg.MainChatID, cfg.AnalystChatID, len(cfg.AllowedUsers), cfg.PollTimeoutSeconds)
+
+	// runLoop runs for the life of the process (context.Background(): no
+	// signal-driven graceful shutdown in this slice, matching the brief's
+	// scope — a systemd unit's stop/restart is the operational shutdown
+	// path, exactly as for heimdall-bridge's http.ListenAndServe).
+	runLoop(context.Background(), tg, cd, cfg.PollTimeoutSeconds)
+	return nil
+}
