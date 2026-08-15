@@ -44,10 +44,10 @@ Everything here is intended to ship as **IaC** (`apps/log-anomaly` in the infras
 
 ## Adjacent infra fixes — Phase 0 prerequisites (do before detector code)
 
-- **Rotate + mask the leaking GitLab release-bot PAT** — `a leaked CI token-…` in cleartext in central
-  logs via falco CI command lines (recurring). Move to a masked CI variable / credential store.
+- **Rotate + mask the leaking GitLab release-bot PAT** — `glpat-…` in cleartext in central
+  logs via falco CI command lines (~47/24h). Move to a masked CI variable / credential store.
 - **Fix PBS email notifications** — pbs postfix "Network is unreachable" to Cloudflare MX:25
-  (~many/day); failure mails aren't delivered — part of why the 5-day silent outage
+  (~6948 deferred/24h); failure mails aren't delivered — part of why the 5-day silent outage
   stayed invisible.
 - **Prune noisy falco rules** — falco+kernel = 63% of 3M lines/day; shrinking the source cuts
   retention, query time, and redaction blast-radius everywhere downstream.
