@@ -26,7 +26,7 @@ subprocess instead of a harness edit. Go types + enforcement: `internal/plugin`.
 
 ## Capabilities — the plugin's DECLARED, capability-scoped access
 
-`{credential?, endpoints?, egress_id?}`. The host grants **nothing** beyond
+`{credential?, endpoints?}`. The host grants **nothing** beyond
 what is declared here.
 
 - **SOURCE**: may declare **at most one** credential — `credential` names the
@@ -38,8 +38,28 @@ what is declared here.
   and no endpoints; a detector asking for either is rejected by
   `Manifest.Validate` — a detector has no legitimate reason to hold a secret
   or reach a network endpoint.
-- **egress_id** is a sink-registry reference, unused by source/detector
-  plugins; reserved for a future sink kind.
+
+**There is no sink kind, and no plugin-visible sink registry.** Notification
+delivery is IN-PROCESS (`internal/notify.Sink`, with `internal/telegram`,
+`internal/gotify` and `internal/synology` behind it). A `capabilities.egress_id`
+field was once reserved here for a future sink plugin; it has been REMOVED,
+along with the idea. The reasoning is worth keeping, because it is the same
+test any future plugin kind has to pass:
+
+> The entire value of this subprocess host is capability scoping — a scrubbed
+> environment, one declared credential, a deadline, an output cap. A sink
+> *inherently* needs the credential and the network egress that scoping exists
+> to withhold, so a Gotify or Synology sink plugin would hold the same token
+> and reach the same endpoint as ~100 lines of stdlib `net/http` we wrote
+> ourselves. It would buy no isolation and cost a second ABI (delivery-result
+> wire types, partial-batch semantics, per-sink binaries) — while Telegram
+> must stay in-process regardless, because its inline-button → suppression
+> path is stateful and long-polled. Two delivery paths forever, for nothing.
+
+Subprocess isolation is for **untrusted or third-party** code. First-party
+transports belong next to the core. A manifest still declaring `egress_id` is
+now a hard parse error (`LoadManifest` rejects unknown fields), rather than a
+field that is silently ignored while its author believes it is in force.
 
 ## Kinds
 

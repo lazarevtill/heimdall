@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,6 @@ const (
 type Capabilities struct {
 	Credential string   `json:"credential,omitempty"` // env var NAME to inject the one secret into (source only)
 	Endpoints  []string `json:"endpoints,omitempty"`  // advisory allow-list, recorded not enforced at N=1
-	EgressID   *int     `json:"egress_id,omitempty"`  // sink registry entry; unused by source/detector
 }
 
 // Budgets are the hard (deadline, output) and advisory (memory) resource
@@ -66,8 +66,16 @@ func LoadManifest(path string) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, fmt.Errorf("plugin: read manifest %s: %w", path, err)
 	}
+	// Unknown fields are REJECTED. A manifest key the host does not
+	// understand is either a typo or a stale field from an older shape
+	// (`egress_id`, removed when sink delivery was settled as in-process);
+	// either way, silently ignoring it means the plugin author believes a
+	// setting is in force when it is not. Fail loud instead — the same
+	// stance the plugin_api mismatch takes.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var m Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, fmt.Errorf("plugin: parse manifest %s: %w", path, err)
 	}
 	if err := m.Validate(); err != nil {

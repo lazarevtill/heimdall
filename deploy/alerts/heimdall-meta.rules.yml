@@ -29,3 +29,62 @@ groups:
         annotations:
           summary: "Heimdall redaction failed during the last run"
           description: "Evidence was withheld (content-fail-closed). A broken redactor must page — it can never silently withhold forever."
+      # ── Notifier liveness ────────────────────────────────────────────
+      # The notifier is a daemon, so its heartbeat is written once per
+      # cycle. Without these two rules a crashed notifier is silent: the
+      # bridge keeps filling notify_outbox and nothing ever drains it.
+      - alert: HeimdallNotifierStale
+        expr: time() - heimdall_notifier_last_success_timestamp_seconds > 900
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall notifier has not completed a cycle in 15m"
+          description: "The notifier writes its heartbeat only after a successful cycle, so a stalled poll loop, a wedged store, or a crash all present as this gauge failing to advance. Alerts are still being detected and enqueued — they are simply not being delivered."
+      - alert: HeimdallNotifierAbsent
+        expr: absent(heimdall_notifier_last_success_timestamp_seconds)
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall notifier heartbeat series is absent"
+          description: "Bootstrap gap, deleted textfile, or the notifier has never completed a cycle. Absence is never treated as ok."
+
+      # ── Per-sink delivery backlog ────────────────────────────────────
+      # WHY THIS IS SEPARATE FROM THE HEARTBEAT ABOVE. A send failure is
+      # deliberately non-fatal: the entry stays pending and the cycle still
+      # succeeds, so the notifier heartbeat keeps advancing while a
+      # destination is dead. That is correct for liveness and useless for
+      # delivery — before this rule existed, Telegram could refuse every
+      # message for a day with every heartbeat green. With several sinks the
+      # blind spot multiplies, because one healthy sink masks the others.
+      #
+      # Routing through Alertmanager to possibly the very sink that is down
+      # is not a flaw in this rule: with two or more sinks, the surviving
+      # ones carry the page. That is the point of the fanout.
+      - alert: HeimdallSinkBacklogCritical
+        expr: heimdall_notifier_sink_oldest_pending_seconds{channel="main"} > 900
+        for: 5m
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall sink {{ $labels.sink }} has not delivered a main-channel alert in 15m"
+          description: "The oldest undelivered entry for this sink is {{ $value | humanizeDuration }} old. Operator-facing alerts are being detected and enqueued but not delivered by this destination. Other sinks on the channel may still be working — check heimdall_notifier_sink_failed_total{sink=\"{{ $labels.sink }}\"} and the notifier log."
+      - alert: HeimdallSinkBacklogWarning
+        expr: heimdall_notifier_sink_oldest_pending_seconds{channel="analyst"} > 3600
+        for: 15m
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall sink {{ $labels.sink }} has not delivered a hypothesis in 1h"
+          description: "The Tier-3 analyst channel is low-urgency by construction (G1: a hypothesis can never page), so a stuck hypothesis card warns rather than pages. It still means the analyst's output is not reaching anyone."
+      - alert: HeimdallSinkBacklogAbsent
+        expr: absent(heimdall_notifier_sink_oldest_pending_seconds)
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall per-sink backlog series is absent"
+          description: "The notifier renders one sample per routed (sink, channel) pair on every cycle, including zeroes, precisely so this series always exists. Its absence means the notifier is not writing its heartbeat file at all — cross-check HeimdallNotifierAbsent."

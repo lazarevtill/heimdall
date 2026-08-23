@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/lazarevtill/heimdall/internal/emit"
@@ -90,15 +91,40 @@ func buildAuthority(d cycleDeps, now time.Time) (*suppress.Authority, error) {
 // the daemon must keep running (its heartbeat going stale is itself the
 // visible failure signal for anything upstream of the write).
 func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors int) error {
-	var drained int
+	var (
+		drained      int
+		sinkFailures []emit.SinkFailure
+	)
 	drainResult, err := notify.Drain(ctx, now, d.Notify, 0)
 	if err != nil {
 		log.Printf("heimdall-notifier: drain: %v", err)
 	} else {
 		drained = drainResult.Sent
 		if drainResult.Failed > 0 {
-			log.Printf("heimdall-notifier: drain: %d entr(y/ies) failed to send, left pending for retry", drainResult.Failed)
+			log.Printf("heimdall-notifier: drain: %d entr(y/ies) not fully delivered, left pending for retry", drainResult.Failed)
 		}
+		for _, id := range sortedSinkIDs(drainResult.PerSink) {
+			o := drainResult.PerSink[id]
+			sinkFailures = append(sinkFailures, emit.SinkFailure{SinkID: id, Count: o.Failed})
+			if o.Failed > 0 {
+				log.Printf("heimdall-notifier: drain: sink %s refused %d deliver(y/ies)", id, o.Failed)
+			}
+		}
+	}
+
+	// Measured AFTER the drain, so a backlog cleared this cycle reports 0
+	// rather than its pre-drain age. A measurement failure must not wedge
+	// the cycle: the heartbeat still needs writing, and the backlog series
+	// going absent is itself caught by the meta-rules' absent() arm.
+	backlogs, err := notify.Backlogs(now, d.Notify)
+	if err != nil {
+		log.Printf("heimdall-notifier: backlogs: %v", err)
+	}
+	sinkBacklogs := make([]emit.SinkBacklog, 0, len(backlogs))
+	for _, b := range backlogs {
+		sinkBacklogs = append(sinkBacklogs, emit.SinkBacklog{
+			SinkID: b.SinkID, Channel: string(b.Channel), Seconds: b.Seconds,
+		})
 	}
 
 	var silencesCreated, silencesDeleted int
@@ -117,12 +143,30 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 		}
 	}
 
-	data := emit.RenderNotifierProm(now, drained, silencesCreated, silencesDeleted, dispatchErrors)
+	data := emit.RenderNotifierProm(now, emit.NotifierStats{
+		Drained:         drained,
+		SilencesCreated: silencesCreated,
+		SilencesDeleted: silencesDeleted,
+		DispatchErrors:  dispatchErrors,
+		SinkBacklogs:    sinkBacklogs,
+		SinkFailures:    sinkFailures,
+	})
 	path := filepath.Join(d.TextfileDir, heartbeatFilename)
 	if err := emit.WriteFileAtomic(path, data); err != nil {
 		return fmt.Errorf("heimdall-notifier: write heartbeat %s: %w", path, err)
 	}
 	return nil
+}
+
+// sortedSinkIDs returns the sink ids of a per-sink outcome map in a stable
+// order, so log lines and rendered series never depend on map iteration.
+func sortedSinkIDs(m map[string]notify.SinkOutcome) []string {
+	out := make([]string, 0, len(m))
+	for id := range m {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // weekKey returns the ISO-week identifier for now (e.g. "2026-W30", from

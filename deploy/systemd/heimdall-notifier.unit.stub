@@ -1,2 +1,32 @@
 # heimdall-notifier unit — shipped by IaC (apps/log-anomaly). Stub.
 # [Unit]/[Service]/[Timer] to be filled at Phase 2c/3.
+#
+# Environment the binary reads (fail-loud at boot if a required one is unset):
+#
+#   REQUIRED
+#     HEIMDALL_TELEGRAM_URL        e.g. https://api.telegram.org
+#     HEIMDALL_TELEGRAM_TOKEN      bot token — via LoadCredential/EnvironmentFile, never inline
+#     HEIMDALL_MAIN_CHAT_ID        int64
+#     HEIMDALL_ANALYST_CHAT_ID     int64
+#     HEIMDALL_ALLOWED_USER_IDS    comma-separated int64 button allow-list (fail-closed)
+#     HEIMDALL_ALERTMANAGER_URL    e.g. http://127.0.0.1:9093
+#     HEIMDALL_ENGINE_STATE_DB     engine state.db (runtime mutes + feedback)
+#     HEIMDALL_BRIDGE_DB           the bridge's own db (notify_outbox + notify_delivery)
+#     HEIMDALL_TEXTFILE_DIR        heimdall-notifier.prom is written here
+#
+#   OPTIONAL
+#     HEIMDALL_SUPPRESSIONS_FILE   declarative suppressions.json
+#     HEIMDALL_POLL_TIMEOUT_SECONDS  long-poll wait (default 30)
+#     HEIMDALL_SINKS_FILE          multi-sink routing (see deploy/sinks.example.json).
+#                                  UNSET  => Telegram-only, i.e. the pre-multi-sink behaviour.
+#
+#   SINK CREDENTIALS — referenced BY NAME from the sinks file, never written into it.
+#   The names below are the example's; the file decides what it asks for.
+#     HEIMDALL_GOTIFY_TOKEN          Gotify APPLICATION token (not a client token)
+#     HEIMDALL_SYNOLOGY_WEBHOOK_URL  full Synology Chat incoming-webhook URL (the whole URL
+#                                    is a credential — it carries the token)
+#
+# Telegram credentials stay required whatever the routing says: this daemon is a getUpdates
+# poller as well as a drainer, and the button->suppression path has no equivalent on a
+# fire-and-forget transport. Gotify and Synology Chat ADD destinations; they do not replace
+# the interactive one.

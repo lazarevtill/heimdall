@@ -1,0 +1,34 @@
+{
+  "sinks": {
+    "telegram": {
+      "type": "telegram"
+    },
+    "gotify": {
+      "type": "gotify",
+      "url": "https://gotify.example.invalid",
+      "token_env": "HEIMDALL_GOTIFY_TOKEN",
+      "titles": {
+        "main": "Heimdall",
+        "analyst": "Heimdall · hypothesis"
+      },
+      "priority": {
+        "main": 8,
+        "analyst": 2
+      }
+    },
+    "synochat": {
+      "type": "synology",
+      "webhook_url_env": "HEIMDALL_SYNOLOGY_WEBHOOK_URL"
+    }
+  },
+  "routes": {
+    "main": [
+      "telegram",
+      "gotify"
+    ],
+    "analyst": [
+      "telegram",
+      "synochat"
+    ]
+  }
+}

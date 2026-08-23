@@ -59,9 +59,14 @@ What remains is deployment/IaC and operator-provisioned credentials.
 - `internal/bridge` — AM webhook v4 parse, issue ledger, `Reconcile` (one issue per group,
   per-target checklist, close-on-group-resolved+`heimdall-auto`, mute-gated recurrence, storm
   fuse), `HandleHypothesis` (G1: structurally never pages), `EscalationSweep`.
-- `internal/telegram` / `internal/silence` — Telegram Bot API and Alertmanager v2 silence clients.
-- `internal/notify` — outbox drainer (per-channel buttons), button-callback dispatcher
-  (allow-listed → suppression writes), silence reconciler, weekly digest, notifier heartbeat.
+- `internal/telegram` / `internal/gotify` / `internal/synology` — the three delivery transports.
+  Pure transport, no policy, no clock. Each is fail-closed and scrubs its own credential out of
+  any error text it returns (net/http embeds the request URL in errors; Synology's whole webhook
+  URL is a secret, and Synology reports a REJECTED message inside an HTTP 200).
+- `internal/silence` — Alertmanager v2 silence client.
+- `internal/notify` — the `Sink` seam + routing (`sinks.json`), outbox drainer with per-sink
+  fan-out, button-callback dispatcher (allow-listed → suppression writes), silence reconciler,
+  weekly digest, notifier heartbeat.
 - `plugins/source-reference` — a real, stdlib-only reference source plugin.
 - `deploy/alerts/heimdall-meta.rules.yml` — the alerts that page when a component goes
   stale/absent/redaction-fails.
@@ -79,10 +84,19 @@ What remains is deployment/IaC and operator-provisioned credentials.
    digest, the LLM prompt, the bridge `/hypothesis` re-redaction, the YouTrack issue body — runs
    through the redactor; a failure withholds content, is counted, and pages. Never widen an
    egress without routing it through the redaction library.
-4. **Suppression silences notification, never detection.** A muted finding keeps its series and is
+4. **A sink transmits the body VERBATIM.** Redaction happens once, at enqueue time
+   (`outbox.Entry.Body` is post-redaction; the notifier never holds raw evidence). A new sink
+   does not *widen* an egress — it multiplies transports of an already-sealed body. Adding a
+   per-sink redaction pass would create three independently-configured redactors that drift
+   apart; do not. A sink may add only STATIC per-sink fields (Gotify title/priority, a chat id).
+5. **A dead sink must page.** A send failure is deliberately non-fatal — the entry stays pending
+   and the cycle still succeeds — so the notifier heartbeat keeps advancing while a destination
+   is dead. `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` is what closes that
+   blind spot, and it emits an explicit 0 for every routed pair so the series always exists.
+6. **Suppression silences notification, never detection.** A muted finding keeps its series and is
    annotated in the digest; the ledger is the authority, Alertmanager silences are a projection.
-5. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
-6. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
+7. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
+8. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
    live only in the infra repo + Vault — never commit them here (this repo is public-mirrored).
 
 ## Language & style
@@ -101,7 +115,10 @@ What remains is deployment/IaC and operator-provisioned credentials.
   fingerprint invariants are locked by **golden vectors** — regenerate deliberately, never blindly.
   Live tests are env-gated and never committed; connectors are also proven against real services.
 - Plugins are **subprocesses** (JSON over stdin/stdout), capability-scoped and sandboxed; the
-  core never `import`s plugin code.
+  core never `import`s plugin code. There is **no sink plugin kind**: a sink inherently needs the
+  credential and network egress that subprocess scoping exists to withhold, so it would buy no
+  isolation and cost a second ABI. Subprocess isolation is for untrusted/third-party code;
+  first-party transports live in `internal/`. See `contract/PLUGIN_SCHEMA.md`.
 
 ## Build / test
 ```

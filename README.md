@@ -81,9 +81,14 @@ then POSTs to the bridge.
   keyed by an `[hb:…]` marker, maintains a per-target checklist, closes only on group-resolved +
   its own tag, runs a storm fuse (N issues/hour) and a 15-min escalation sweep. `/hypothesis`
   re-redacts and routes to a low-urgency channel + optional ticket; it has no path to a page (G1).
-- **Notifier**: drains a channel-typed outbox to Telegram with inline lifecycle buttons, turns
-  allow-listed button presses into runtime suppressions, and reconciles the suppression authority's
-  active silences into Alertmanager (create/list/delete), with a 30-day rolling cap.
+- **Notifier**: drains a channel-typed outbox to **every sink routed for that channel** —
+  Telegram (with inline lifecycle buttons), Gotify, and Synology Chat — turns allow-listed button
+  presses into runtime suppressions, and reconciles the suppression authority's active silences
+  into Alertmanager (create/list/delete), with a 30-day rolling cap. Delivery is per-sink
+  idempotent: with Telegram up and Gotify down the entry stays pending, and the retry re-sends to
+  Gotify *only* — a healthy channel is never spammed because a sibling is broken. Routing is
+  declared in an IaC-rendered `sinks.json` that names credentials by env var, never inline.
+  Telegram stays the only *interactive* sink; the others are fire-and-forget transports.
 - **Suppression** is a single authority (declarative `suppressions.json` ∪ runtime SQLite mutes,
   five scopes). It silences *notification*, never *detection*: a muted finding keeps its series and
   is annotated in the digest; Alertmanager silences are a downstream projection.
@@ -93,7 +98,8 @@ then POSTs to the bridge.
 - **In**: Prometheus (PromQL), VictoriaLogs (LogsQL), PBS (pinned-CA REST), and source **plugins**
   (subprocess, JSON stdin/stdout, capability-scoped, scrubbed-env). Manifest + suppressions are
   IaC-rendered JSON.
-- **Out**: a Prometheus textfile-collector `.prom` (the emission path for everything that pages),
+- **Out**: Telegram / Gotify / Synology Chat via the `Sink` seam, a Prometheus textfile-collector
+  `.prom` (the emission path for everything that pages),
   redacted `findings/<fp>.json` spool docs, the digest, YouTrack issues, Telegram messages,
   Alertmanager silences. Meta-rules in `deploy/alerts/` page when any component goes stale/absent.
 

@@ -65,6 +65,7 @@ type config struct {
 	EngineStateDB      string         // HEIMDALL_ENGINE_STATE_DB; suppress store (runtime mutes + feedback)
 	BridgeDB           string         // HEIMDALL_BRIDGE_DB; notify_outbox
 	SuppressionsFile   string         // HEIMDALL_SUPPRESSIONS_FILE; optional — "" means no declarative suppressions configured
+	SinksFile          string         // HEIMDALL_SINKS_FILE; optional — "" means Telegram-only routing (the pre-multi-sink default)
 	TextfileDir        string         // HEIMDALL_TEXTFILE_DIR; heimdall-notifier.prom heartbeat written here
 	PollTimeoutSeconds int            // HEIMDALL_POLL_TIMEOUT_SECONDS; optional, default defaultPollTimeoutSeconds
 }
@@ -88,6 +89,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		EngineStateDB:      getenv("HEIMDALL_ENGINE_STATE_DB"),
 		BridgeDB:           getenv("HEIMDALL_BRIDGE_DB"),
 		SuppressionsFile:   getenv("HEIMDALL_SUPPRESSIONS_FILE"), // optional
+		SinksFile:          getenv("HEIMDALL_SINKS_FILE"),        // optional
 		TextfileDir:        getenv("HEIMDALL_TEXTFILE_DIR"),
 		PollTimeoutSeconds: defaultPollTimeoutSeconds,
 	}
@@ -168,6 +170,27 @@ func parseAllowedUserIDs(raw string) (map[int64]bool, error) {
 	return out, nil
 }
 
+// buildRoutes resolves the sink routing: the HEIMDALL_SINKS_FILE document
+// when one is configured, otherwise the Telegram-only default that
+// reproduces the pre-multi-sink behaviour exactly. getenv is injected so
+// tests can drive it without touching the process environment.
+func buildRoutes(cfg config, tg notify.TelegramSender, httpc *http.Client, getenv func(string) string) (notify.Routes, error) {
+	if cfg.SinksFile == "" {
+		return notify.DefaultTelegramRoutes(tg, cfg.MainChatID, cfg.AnalystChatID), nil
+	}
+	f, err := notify.LoadSinksFile(cfg.SinksFile)
+	if err != nil {
+		return nil, err
+	}
+	return f.Build(notify.SinkDeps{
+		Telegram:      tg,
+		MainChatID:    cfg.MainChatID,
+		AnalystChatID: cfg.AnalystChatID,
+		HTTPClient:    httpc,
+		Getenv:        getenv,
+	})
+}
+
 func run() error {
 	cfg, err := loadConfig(os.Getenv)
 	if err != nil {
@@ -177,6 +200,20 @@ func run() error {
 	httpc := &http.Client{}
 	tg := telegram.NewClient(cfg.TelegramURL, cfg.TelegramToken, httpc)
 	sc := silence.NewClient(cfg.AlertmanagerURL, httpc)
+
+	// Sink routing. Telegram credentials stay REQUIRED regardless of what
+	// the routing file says: this daemon is a Telegram getUpdates poller as
+	// well as a drainer, and the button->suppression path has no equivalent
+	// on a fire-and-forget transport. Gotify and Synology Chat add
+	// destinations; they do not replace the interactive one.
+	//
+	// Building the routes is fail-fast (see SinksFile.Build): a bad route,
+	// an unrouted channel or a missing credential env var must stop the
+	// daemon at boot rather than surface on the first real alert.
+	routes, err := buildRoutes(cfg, tg, httpc, os.Getenv)
+	if err != nil {
+		return err
+	}
 
 	// Opened via suppress.OpenStore against the ENGINE's state.db: the
 	// notifier is the ONLY writer of runtime mutes (Telegram button
@@ -206,6 +243,7 @@ func run() error {
 			MainChatID:    cfg.MainChatID,
 			AnalystChatID: cfg.AnalystChatID,
 			AllowedUsers:  cfg.AllowedUsers,
+			Routes:        routes,
 		},
 		Silence:          sc,
 		Suppress:         engineSuppress,
@@ -215,8 +253,13 @@ func run() error {
 		MainChatID:       cfg.MainChatID,
 	}
 
-	log.Printf("heimdall-notifier: starting (main_chat=%d analyst_chat=%d allowed_users=%d poll_timeout=%ds)",
-		cfg.MainChatID, cfg.AnalystChatID, len(cfg.AllowedUsers), cfg.PollTimeoutSeconds)
+	sinkIDs := make([]string, 0, len(routes.All()))
+	for _, s := range routes.All() {
+		sinkIDs = append(sinkIDs, s.ID())
+	}
+	log.Printf("heimdall-notifier: starting (main_chat=%d analyst_chat=%d allowed_users=%d poll_timeout=%ds sinks=%s)",
+		cfg.MainChatID, cfg.AnalystChatID, len(cfg.AllowedUsers), cfg.PollTimeoutSeconds,
+		strings.Join(sinkIDs, ","))
 
 	// runLoop runs for the life of the process (context.Background(): no
 	// signal-driven graceful shutdown in this slice, matching the brief's

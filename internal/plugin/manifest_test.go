@@ -2,7 +2,9 @@ package plugin
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -162,5 +164,26 @@ func TestManifestValidate(t *testing.T) {
 				t.Errorf("error %v does not wrap ErrInvalid", err)
 			}
 		})
+	}
+}
+
+// A manifest carrying a key the host does not understand must FAIL rather
+// than be silently accepted. `egress_id` is the concrete case: it was a
+// reserved sink-registry reference that nothing ever consumed, and it was
+// removed when sink delivery was settled as in-process
+// (internal/notify.Sink). A plugin still declaring it is working from a
+// stale contract and must be told so.
+func TestLoadManifestRejectsUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugin.json")
+	body := `{"plugin_api":` + strconv.Itoa(PluginAPIVersion) + `,
+	          "id":"refsrc","kind":"source","version":"1.0.0",
+	          "capabilities":{"credential":"TOKEN","egress_id":3},
+	          "budgets":{"deadline_seconds":5,"memory_mb":64,"max_output_bytes":65536}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if _, err := LoadManifest(path); err == nil {
+		t.Fatal("LoadManifest: want an error for the removed egress_id field, got nil")
 	}
 }

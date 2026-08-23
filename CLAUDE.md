@@ -13,17 +13,19 @@ Four binaries under `cmd/`:
   docs only, structurally off the pageable path.
 - `heimdall-bridge` — Alertmanager `/am` webhook → YouTrack, `/hypothesis` router, `/healthz`,
   escalation sweep (HTTP daemon).
-- `heimdall-notifier` — Telegram poller + button→suppression dispatch + Alertmanager silence
-  reconciler + weekly digest (daemon).
+- `heimdall-notifier` — Telegram poller + button→suppression dispatch + multi-sink delivery
+  fan-out (Telegram/Gotify/Synology Chat) + Alertmanager silence reconciler + weekly digest
+  (daemon).
 
 Logic lives in `internal/` (contract, manifest, source, detect, baseline, tier2, digest, ledger,
-emit, config, suppress, plugin, llm, analyst, tracker, outbox, bridge, telegram, silence,
-notify); schema docs in `contract/`; a reference plugin in `plugins/`; design records in
+emit, config, suppress, plugin, llm, analyst, tracker, outbox, bridge, telegram, gotify,
+synology, silence, notify); schema docs in `contract/`; a reference plugin in `plugins/`; design records in
 `design/` (private-only, canonical: `design/2026-07-19-final-design.md`).
 
 **Core invariants** (enforced in code + CI, do not break): unknown is always alertable; the LLM
 can never page/resolve/silence (`class=hypothesis` refused, a `make` gate keeps `internal/llm`
 off the detector's dep graph); fail-closed redaction at every egress; suppression silences
-notification not detection; no `time.Now()` under `internal/` (inject the clock).
+notification not detection; no `time.Now()` under `internal/` (inject the clock); a sink
+transmits the outbox body **verbatim** (redaction happens once, at enqueue).
 
 Quickstart: `make ci` (lint + `-race` tests + static build of all four binaries + govulncheck).
