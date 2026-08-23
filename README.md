@@ -45,14 +45,15 @@ flowchart LR
     NO -->|silences| AM
 ```
 
-Four independent binaries, each with its own liveness heartbeat:
+Five independent binaries:
 
 | Binary | Type | Function |
 |--------|------|----------|
 | `heimdall-detect` | oneshot (timer) | Tier-1 hard checks + Tier-2 soft signals → SQLite ledger, redacted spool, atomic `.prom`, Tier-2 digest |
 | `heimdall-analyst` | oneshot (scheduled) | Tier-3: reads the digest, calls a llama.cpp server under strict `json_schema`, emits vetted `hypothesis` docs |
 | `heimdall-bridge` | HTTP daemon | `/am` Alertmanager webhook → YouTrack issues; `/hypothesis` ingress → routing; `/healthz`; escalation sweep |
-| `heimdall-notifier` | daemon | Telegram getUpdates poller, outbox drain, button→suppression writes, Alertmanager silence reconciler, weekly digest |
+| `heimdall-notifier` | daemon | Telegram getUpdates poller, outbox drain fanned out to every routed sink, button→suppression writes, Alertmanager silence reconciler, weekly digest |
+| `heimdall-ui` | HTTP daemon | Operator console: findings and their spool evidence, the Tier-2 digest, Tier-3 hypothesis runs, the ticket ledger, per-sink delivery backlog, suppressions, heartbeats. Access is OIDC / bearer token / none (LAN, read-only by default). One write only — a runtime mute through the suppression authority |
 
 ## Tiers
 
@@ -130,7 +131,7 @@ then POSTs to the bridge.
 ## Build
 
 ```
-make build   # CGO_ENABLED=0 static binaries → bin/{heimdall-detect,analyst,bridge,notifier}
+make build   # CGO_ENABLED=0 static binaries → bin/{heimdall-detect,analyst,bridge,notifier,ui}
 make test    # CGO_ENABLED=1 go test -race ./...
 make lint    # gofmt, go vet, + policy gates (no time.Now() in internal/, no contract.Finding{}
              # literals outside the constructor, no internal/llm on the detector dep graph,
@@ -143,7 +144,8 @@ make ci      # lint + test + build + vuln
 
 | Path | Responsibility |
 |------|----------------|
-| `cmd/heimdall-{detect,analyst,bridge,notifier}` | the four binaries; thin wiring over `internal/` |
+| `cmd/heimdall-{detect,analyst,bridge,notifier}` | the four pipeline binaries; thin wiring over `internal/` |
+| `cmd/heimdall-ui` | the operator console: view model, heartbeat parser, fixed-argv action runner, server-rendered HTML |
 | `internal/contract` | wire types, `NewFinding` (refuses `hypothesis`, caps `trend`), `Fingerprint`, fail-closed `Redact` |
 | `internal/manifest` | loads + validates the expectation + Tier-2 manifest |
 | `internal/source` | `Source` interface + Prometheus / VictoriaLogs / PBS clients (fail-closed tri-state) |
@@ -156,4 +158,13 @@ make ci      # lint + test + build + vuln
 | `plugins/source-reference` | reference source plugin (stdlib-only) |
 | `contract/` · `deploy/alerts/` · `design/` | schema docs; meta-rules; design records (`design/2026-07-19-final-design.md`) |
 
-See **[AGENTS.md](AGENTS.md)** for the full working agreement and **[IDEAS.md](IDEAS.md)** for the backlog.
+## Documentation
+
+| Document | For |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | running all five binaries end to end, with a verification chain |
+| [docs/DEBUGGING.md](docs/DEBUGGING.md) | symptom-first triage — including which surprises are the fail-closed design working |
+| [docs/DEVELOPING.md](docs/DEVELOPING.md) | what each CI gate encodes, how to extend it, and the traps already paid for |
+| [AGENTS.md](AGENTS.md) | the binding working agreement — trust invariants, package map, style budget |
+| [contract/](contract/) | wire schemas (`Finding`, `Digest`, plugin ABI) |
+| [IDEAS.md](IDEAS.md) | backlog |

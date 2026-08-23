@@ -1,0 +1,71 @@
+# heimdall-ui unit — shipped by IaC (apps/log-anomaly). Stub.
+# [Unit]/[Service] to be filled at Phase 2c/3.
+#
+# The operator console. Bind it to loopback and put the cluster's existing TLS
+# terminator + OIDC in front; do NOT expose it directly.
+#
+#   REQUIRED
+#     HEIMDALL_UI_AUTH           oidc | token | none. NO DEFAULT — it must be chosen.
+#                                Defaulting to `none` would let a forgotten variable
+#                                publish the console; defaulting to anything else would
+#                                make a LAN dashboard fail mysteriously.
+#     HEIMDALL_UI_OPERATORS      comma-separated operator ids allowed to WRITE (required
+#                                except in `none` mode). Naming nobody is legal and makes
+#                                the console read-only — but it must be explicit, so a
+#                                forgotten var can never silently grant write access.
+#     HEIMDALL_ENGINE_STATE_DB   engine state.db — finding ledger + suppressions
+#     HEIMDALL_BRIDGE_DB         bridge db — notify_outbox + notify_delivery
+#     HEIMDALL_TEXTFILE_DIR      where the heartbeat .prom files are written
+#
+#   MODE: token — a shared bearer token, for automation or for fronting the console
+#   with something that already authenticates.
+#     HEIMDALL_UI_TOKEN          >= 24 chars, required on EVERY route including reads.
+#                                Via LoadCredential, never inline.
+#
+#   MODE: oidc — humans log in against Pocket-ID / Keycloak / any OIDC provider.
+#   Discovery runs at BOOT, so a bad issuer stops the daemon rather than surfacing
+#   as a broken login later. Operators are matched against sub, email, OR
+#   preferred_username, since providers differ in which they populate.
+#     HEIMDALL_UI_OIDC_ISSUER          e.g. https://id.example/  (discovery base)
+#     HEIMDALL_UI_OIDC_CLIENT_ID
+#     HEIMDALL_UI_OIDC_CLIENT_SECRET   optional for a public client
+#     HEIMDALL_UI_OIDC_REDIRECT_URL    must equal the registered callback, ending /callback
+#     HEIMDALL_UI_SESSION_KEY          >= 24 chars; HMAC key signing the session cookie
+#     HEIMDALL_UI_INSECURE_COOKIES     opt OUT of Secure cookies for a plain-HTTP LAN
+#                                      deployment. Off by default — a session cookie
+#                                      sent over HTTP is a session cookie on the wire.
+#
+#   MODE: none — a LAN dashboard, no login at all. READ-ONLY by default.
+#     HEIMDALL_UI_ANONYMOUS_WRITES  allow writes with no identity. Off by default,
+#                                   because a mute with no actor leaves the suppression
+#                                   ledger with nobody to attribute it to. When on, the
+#                                   ledger records the actor as plainly unauthenticated.
+#
+#   OPTIONAL
+#     HEIMDALL_UI_LISTEN               default 127.0.0.1:9095
+#     HEIMDALL_SUPPRESSIONS_FILE       declarative suppressions.json
+#     HEIMDALL_SINKS_FILE              the SAME file the notifier reads, so the delivery
+#                                      view cannot disagree with what is actually drained
+#     HEIMDALL_DIGEST_DIR              the Tier-2 digest (<dir>/latest.json). Unset means
+#                                      the digest page says so rather than showing nothing.
+#     HEIMDALL_ANALYST_RUN_DIR         the Tier-3 persisted runs (<dir>/<run_id>.json).
+#                                      Same directory the analyst writes; the console only
+#                                      reads it.
+#     HEIMDALL_SPOOL_DIR               the detector's per-finding redacted evidence docs.
+#                                      Unset means the detail page says evidence is
+#                                      unavailable rather than showing an empty box.
+#     HEIMDALL_UI_BRIDGE_HEALTHZ_URL   the bridge renders no heartbeat textfile; without
+#                                      this it is reported ABSENT rather than healthy
+#
+#   OPERATOR ACTIONS — opt-in, per action, as a FIXED argv. Nothing from an HTTP
+#   request ever reaches these command lines and no shell is involved. Unset means
+#   the action does not exist: the endpoint answers 501 and no button is rendered.
+#     HEIMDALL_UI_ACTION_RERUN_DETECT   e.g. /bin/systemctl start heimdall-detect.service
+#     HEIMDALL_UI_ACTION_FORCE_DRAIN    e.g. /bin/systemctl start heimdall-drain.service
+#     HEIMDALL_UI_ACTION_<NAME>_TIMEOUT_SECONDS   optional, default 30
+#
+# The child of an action runs with an EMPTY environment and in its own process
+# group, which is killed on timeout — a `systemctl` that hands off to systemd
+# cannot outlive the deadline. Granting this unit the right to start those units
+# is a PolicyKit/sudoers decision made outside this file; if you do not grant it,
+# leave the action vars unset rather than running the console as root.

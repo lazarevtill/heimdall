@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/emit"
 	"github.com/lazarevtill/heimdall/internal/notify"
 	"github.com/lazarevtill/heimdall/internal/suppress"
@@ -76,7 +77,7 @@ func buildAuthority(d cycleDeps, now time.Time) (*suppress.Authority, error) {
 	}
 	authority, skipped := suppress.NewAuthority(declarative, runtimeMutes)
 	if skipped > 0 {
-		log.Printf("heimdall-notifier: suppression authority skipped %d invalid runtime row(s)", skipped)
+		log.Printf("suppression authority skipped %d invalid runtime row(s)", skipped)
 	}
 	return authority, nil
 }
@@ -97,17 +98,17 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 	)
 	drainResult, err := notify.Drain(ctx, now, d.Notify, 0)
 	if err != nil {
-		log.Printf("heimdall-notifier: drain: %v", err)
+		log.Printf("drain: %v", contract.Safe(err))
 	} else {
 		drained = drainResult.Sent
 		if drainResult.Failed > 0 {
-			log.Printf("heimdall-notifier: drain: %d entr(y/ies) not fully delivered, left pending for retry", drainResult.Failed)
+			log.Printf("drain: %d entr(y/ies) not fully delivered, left pending for retry", drainResult.Failed)
 		}
 		for _, id := range sortedSinkIDs(drainResult.PerSink) {
 			o := drainResult.PerSink[id]
 			sinkFailures = append(sinkFailures, emit.SinkFailure{SinkID: id, Count: o.Failed})
 			if o.Failed > 0 {
-				log.Printf("heimdall-notifier: drain: sink %s refused %d deliver(y/ies)", id, o.Failed)
+				log.Printf("drain: sink %s refused %d deliver(y/ies)", id, o.Failed)
 			}
 		}
 	}
@@ -118,7 +119,7 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 	// going absent is itself caught by the meta-rules' absent() arm.
 	backlogs, err := notify.Backlogs(now, d.Notify)
 	if err != nil {
-		log.Printf("heimdall-notifier: backlogs: %v", err)
+		log.Printf("backlogs: %v", contract.Safe(err))
 	}
 	sinkBacklogs := make([]emit.SinkBacklog, 0, len(backlogs))
 	for _, b := range backlogs {
@@ -130,7 +131,7 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 	var silencesCreated, silencesDeleted int
 	authority, err := buildAuthority(d, now)
 	if err != nil {
-		log.Printf("heimdall-notifier: build authority: %v", err)
+		log.Printf("build authority: %v", contract.Safe(err))
 	} else {
 		reconcileResult, err := notify.ReconcileSilences(ctx, now, d.Silence, authority)
 		// A per-silence failure stops the pass but the RESULT ACCUMULATED
@@ -139,7 +140,7 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 		// ReconcileResult accumulated so far").
 		silencesCreated, silencesDeleted = reconcileResult.Created, reconcileResult.Deleted
 		if err != nil {
-			log.Printf("heimdall-notifier: reconcile silences: %v", err)
+			log.Printf("reconcile silences: %v", contract.Safe(err))
 		}
 	}
 
@@ -153,7 +154,7 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 	})
 	path := filepath.Join(d.TextfileDir, heartbeatFilename)
 	if err := emit.WriteFileAtomic(path, data); err != nil {
-		return fmt.Errorf("heimdall-notifier: write heartbeat %s: %w", path, err)
+		return fmt.Errorf("write heartbeat %s: %w", path, err)
 	}
 	return nil
 }
@@ -211,15 +212,15 @@ func maybeSendDigest(ctx context.Context, now time.Time, d cycleDeps, lastSentWe
 
 	runtimeMutes, err := d.Suppress.ListRuntime()
 	if err != nil {
-		return lastSentWeek, fmt.Errorf("heimdall-notifier: digest: list runtime: %w", err)
+		return lastSentWeek, fmt.Errorf("digest: list runtime: %w", err)
 	}
 	feedbackCounts, err := d.Suppress.CountFeedbackSince(now.Add(-feedbackLookback))
 	if err != nil {
-		return lastSentWeek, fmt.Errorf("heimdall-notifier: digest: count feedback: %w", err)
+		return lastSentWeek, fmt.Errorf("digest: count feedback: %w", err)
 	}
 	authority, err := buildAuthority(d, now)
 	if err != nil {
-		return lastSentWeek, fmt.Errorf("heimdall-notifier: digest: build authority: %w", err)
+		return lastSentWeek, fmt.Errorf("digest: build authority: %w", err)
 	}
 
 	in := notify.DigestInput{
@@ -230,7 +231,7 @@ func maybeSendDigest(ctx context.Context, now time.Time, d cycleDeps, lastSentWe
 	text := notify.RenderWeeklyDigest(now, in)
 
 	if _, err := d.TG.SendMessage(ctx, telegram.SendMessageRequest{ChatID: d.MainChatID, Text: text}); err != nil {
-		return lastSentWeek, fmt.Errorf("heimdall-notifier: digest: send: %w", err)
+		return lastSentWeek, fmt.Errorf("digest: send: %w", err)
 	}
 
 	return weekKey(now), nil

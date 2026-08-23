@@ -128,4 +128,41 @@ FROM findings WHERE fingerprint = ?`, fp).
 	return e, true, nil
 }
 
+// List returns every ledger entry, most-recently-seen first. It is a pure
+// read — the operator UI renders from it and must never mutate finding
+// state (that authority belongs to the detector's Upsert alone).
+//
+// Ordering is (last_seen DESC, fingerprint ASC): the fingerprint tiebreak
+// keeps the result deterministic when several findings share a run's
+// timestamp, which is the normal case since one detector run stamps them
+// all identically.
+func (l *Ledger) List() ([]Entry, error) {
+	rows, err := l.db.Query(`
+SELECT fingerprint, check_id, target, state, severity, first_seen, last_seen, count
+FROM findings
+ORDER BY last_seen DESC, fingerprint ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var (
+			e           Entry
+			first, last int64
+		)
+		if err := rows.Scan(&e.Fingerprint, &e.Check, &e.Target, &e.State, &e.Severity, &first, &last, &e.Count); err != nil {
+			return nil, fmt.Errorf("ledger: list scan: %w", err)
+		}
+		e.FirstSeen = time.Unix(first, 0).UTC()
+		e.LastSeen = time.Unix(last, 0).UTC()
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ledger: list rows: %w", err)
+	}
+	return out, nil
+}
+
 func (l *Ledger) Close() error { return l.db.Close() }

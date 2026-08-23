@@ -9,7 +9,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,9 +27,28 @@ import (
 	"github.com/lazarevtill/heimdall/internal/tier2"
 )
 
+// configureLogging pins this binary's log format ONCE, so no call site has to
+// repeat it.
+//
+// Flags are cleared because every binary runs under systemd, and journald
+// already stamps each line. The stdlib default (LstdFlags) would put a second
+// timestamp inside the message, so a journal line read
+// "Aug 23 22:12:10 host heimdall-detect[123]: 2026/08/23 22:12:10 ...".
+//
+// The prefix is set here rather than written into each call site, which is
+// what made it drift in the first place. It is deliberately kept even though
+// journald supplies the unit name: cross-binary debugging means tailing
+// several units at once ("journalctl -u 'heimdall-*'"), and a stable prefix
+// is what makes that greppable.
+func configureLogging() {
+	log.SetFlags(0)
+	log.SetPrefix("heimdall-detect: ")
+}
+
 func main() {
+	configureLogging()
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "heimdall-detect:", err)
+		log.Print(contract.Safe(err))
 		os.Exit(1)
 	}
 }
@@ -74,6 +93,15 @@ func run() error {
 	defer cancel()
 
 	now := time.Now().UTC() // the only time.Now() in the program
+
+	// A oneshot on a timer logs exactly twice on a clean run: one line
+	// saying what it is about to evaluate, one saying what happened. That is
+	// enough to answer "did it run, over what, and what came out" from the
+	// journal alone, without being the kind of per-item chatter that makes a
+	// timer's log unreadable at a week's depth.
+	log.Printf("run start: manifest=%s expectations=%d tier2_specs=%d",
+		cfg.ManifestPath, len(m.Expectations), len(m.Tier2))
+
 	findings := eng.Run(ctx, now, m)
 
 	// Tier-2: soft-signal evaluation over the manifest's declarative specs.
@@ -109,7 +137,7 @@ func run() error {
 		if everr != nil {
 			// A single spec's store error must not abort the whole run or
 			// the digest: log and continue with whatever partial res holds.
-			fmt.Fprintln(os.Stderr, "heimdall-detect: tier2 eval", spec.ID, "failed:", everr)
+			log.Println("tier2 eval", spec.ID, "failed:", contract.Safe(everr))
 		}
 		tier2Results = append(tier2Results, res)
 		if res.Finding != nil {
@@ -156,7 +184,7 @@ func run() error {
 	}
 	authority, skipped := suppress.NewAuthority(declarative, runtimeMutes)
 	if skipped > 0 {
-		fmt.Fprintln(os.Stderr, "heimdall-detect: suppression authority skipped", skipped, "invalid runtime row(s)")
+		log.Println("suppression authority skipped", skipped, "invalid runtime row(s)")
 	}
 	suppressed := authority.ActiveAnnotations(now)
 
@@ -182,8 +210,52 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return emit.WriteFileAtomic(
+	if err := emit.WriteFileAtomic(
 		filepath.Join(cfg.TextfileDir, "heimdall.prom"),
 		emit.RenderProm(now, findings, redactionFailures+digestFailures, dg.GeneratedAt),
-	)
+	); err != nil {
+		return err
+	}
+
+	logRunSummary(now, findings, dg, redactionFailures+digestFailures)
+	return nil
+}
+
+// logRunSummary is the one line a clean run leaves behind.
+//
+// It reports COUNTS and nothing else. Titles, evidence and source error text
+// are all deliberately absent: a log line is an egress — journald ships to
+// syslog and syslog leaves the host — so putting finding content here would
+// route evidence around the redaction boundary that emit.WriteSpool and
+// digest.Write exist to enforce. Check and target identifiers stay out too;
+// they are already in the .prom and the spool, which are the surfaces meant
+// to carry them.
+func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Digest, redactionFailures int) {
+	var firing, unknown, ok int
+	for _, f := range findings {
+		switch f.State {
+		case contract.StateFiring:
+			firing++
+		case contract.StateUnknown:
+			unknown++
+		default:
+			ok++
+		}
+	}
+	log.Printf("run ok in %s: findings=%d (firing=%d unknown=%d ok=%d) digest_rows=%d unmeasurable=%d truncated=%d",
+		time.Since(now).Round(time.Millisecond), len(findings), firing, unknown, ok,
+		len(dg.Rows), len(dg.UnknownMarkers), dg.RowsTruncated)
+
+	// A redaction failure means content was WITHHELD rather than leaked. The
+	// finding still fires — content fail-closed, signal fail-open — and
+	// heimdall_redaction_failures_total pages on it. Say so in the journal
+	// too, because that metric is easy to miss and the cause is usually
+	// visible only in the run that produced it.
+	if redactionFailures > 0 {
+		log.Printf("WARNING: %d redaction failure(s) this run — evidence was withheld, not leaked; heimdall_redaction_failures_total will page",
+			redactionFailures)
+	}
+	if unknown > 0 {
+		log.Printf("%d check(s) returned unknown — a source failed, timed out or was unreachable; unknown is alertable by design", unknown)
+	}
 }

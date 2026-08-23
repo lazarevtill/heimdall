@@ -56,3 +56,47 @@ func evidenceOrWithheld(s string, redact func(string) string) (out string, faile
 	}
 	return r, false
 }
+
+// Safe wraps err so that its Error() text has every secret-shaped substring
+// replaced with a typed marker. It returns nil for a nil error, and preserves
+// the original for errors.Is / errors.As via Unwrap.
+//
+// WHY THIS EXISTS. A log line is an EGRESS. Heimdall's binaries run under
+// systemd, journald ships to syslog, and syslog ships off the host — so
+// anything written with log.Printf leaves the process exactly as surely as a
+// spool doc or a ticket body does. The redaction patterns above were written
+// because "net/http error strings embed full request URLs" and because
+// bearer/PBS tokens turn up in transport errors; every one of those reaches a
+// log line the moment an error is formatted with %v.
+//
+// So: never format a raw error into a log. Wrap it here first.
+//
+//	log.Printf("drain: %v", contract.Safe(err))
+//
+// This is the same shape internal/gotify and internal/synology already use to
+// scrub their own credentials out of their own errors; Safe is the general
+// case, for errors that arrive from anywhere.
+func Safe(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := Redact(err.Error())
+	if msg == err.Error() {
+		return err
+	}
+	return &safeError{msg: msg, err: err}
+}
+
+// SafeString redacts a free-text string destined for a log line. Prefer Safe
+// for errors; this is for anything else that is not operator-authored.
+func SafeString(s string) string { return Redact(s) }
+
+// safeError carries a redacted message while keeping the original reachable
+// through errors.Is / errors.As.
+type safeError struct {
+	msg string
+	err error
+}
+
+func (e *safeError) Error() string { return e.msg }
+func (e *safeError) Unwrap() error { return e.err }

@@ -32,14 +32,34 @@ import (
 	"time"
 
 	"github.com/lazarevtill/heimdall/internal/bridge"
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/tracker"
 )
 
+// configureLogging pins this binary's log format ONCE, so no call site has to
+// repeat it.
+//
+// Flags are cleared because every binary runs under systemd, and journald
+// already stamps each line. The stdlib default (LstdFlags) would put a second
+// timestamp inside the message, so a journal line read
+// "Aug 23 22:12:10 host heimdall-bridge[123]: 2026/08/23 22:12:10 ...".
+//
+// The prefix is set here rather than written into each call site, which is
+// what made it drift in the first place. It is deliberately kept even though
+// journald supplies the unit name: cross-binary debugging means tailing
+// several units at once ("journalctl -u 'heimdall-*'"), and a stable prefix
+// is what makes that greppable.
+func configureLogging() {
+	log.SetFlags(0)
+	log.SetPrefix("heimdall-bridge: ")
+}
+
 func main() {
+	configureLogging()
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "heimdall-bridge:", err)
+		log.Print(contract.Safe(err))
 		os.Exit(1)
 	}
 }
@@ -103,7 +123,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	for _, r := range required {
 		if r.val == "" {
-			return config{}, fmt.Errorf("heimdall-bridge: %s is required", r.name)
+			return config{}, fmt.Errorf("%s is required", r.name)
 		}
 	}
 
@@ -112,14 +132,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 		case bridge.PolicyTelegramOnly, bridge.PolicyHighConfidence, bridge.PolicyAlways:
 			c.TicketPolicy = bridge.TicketPolicy(v)
 		default:
-			return config{}, fmt.Errorf("heimdall-bridge: HEIMDALL_ANALYST_TICKET_POLICY %q is not a recognized policy", v)
+			return config{}, fmt.Errorf("HEIMDALL_ANALYST_TICKET_POLICY %q is not a recognized policy", v)
 		}
 	}
 
 	if v := getenv("HEIMDALL_STORM_FUSE_PER_HOUR"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
-			return config{}, fmt.Errorf("heimdall-bridge: HEIMDALL_STORM_FUSE_PER_HOUR %q must be a positive integer", v)
+			return config{}, fmt.Errorf("HEIMDALL_STORM_FUSE_PER_HOUR %q must be a positive integer", v)
 		}
 		c.StormFusePerHour = n
 	}
@@ -178,7 +198,7 @@ func run() error {
 	youtrackOK := true
 	if err := trk.VerifyIdentity(verifyCtx); err != nil {
 		youtrackOK = false
-		log.Printf("WARNING: heimdall-bridge: YouTrack VerifyIdentity failed at startup (starting anyway; tracker writes will 500 until this is fixed): %v", err)
+		log.Printf("WARNING: YouTrack VerifyIdentity failed at startup (starting anyway; tracker writes will 500 until this is fixed): %v", contract.Safe(err))
 	}
 	cancel()
 
@@ -187,7 +207,7 @@ func run() error {
 
 	go runEscalationTicker(srv)
 
-	log.Printf("heimdall-bridge: listening on %s (ticket_policy=%s storm_fuse_per_hour=%d youtrack_verified=%v)",
+	log.Printf("listening on %s (ticket_policy=%s storm_fuse_per_hour=%d youtrack_verified=%v)",
 		cfg.Addr, cfg.TicketPolicy, cfg.StormFusePerHour, youtrackOK)
 	return http.ListenAndServe(cfg.Addr, srv.handler())
 }
@@ -206,16 +226,16 @@ func runEscalationTicker(srv *server) {
 		now := time.Now().UTC()
 		authority, err := srv.buildAuthority(now)
 		if err != nil {
-			log.Printf("heimdall-bridge: escalation sweep: build authority: %v", err)
+			log.Printf("escalation sweep: build authority: %v", contract.Safe(err))
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), sweepTimeout)
 		result, err := bridge.EscalationSweep(ctx, now, srv.deps(authority))
 		cancel()
 		if err != nil {
-			log.Printf("heimdall-bridge: escalation sweep: %v", err)
+			log.Printf("escalation sweep: %v", contract.Safe(err))
 			continue
 		}
-		log.Printf("heimdall-bridge: escalation sweep: escalated=%d skipped=%d", result.Escalated, result.Skipped)
+		log.Printf("escalation sweep: escalated=%d skipped=%d", result.Escalated, result.Skipped)
 	}
 }

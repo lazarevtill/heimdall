@@ -1,4 +1,15 @@
 bin/
+
+# Stray binaries from `go build ./cmd/<name>` WITHOUT -o, which writes the
+# binary into the working directory. `make build` always passes -o bin/, so
+# anything matching these names at the repo root is an accident — and two of
+# them (36 MB, unstripped, with debug_info) were committed before this rule
+# existed. The repo is public-mirrored; build artefacts must never ride along.
+/heimdall-detect
+/heimdall-analyst
+/heimdall-bridge
+/heimdall-notifier
+/heimdall-ui
 *.db
 *.db-wal
 *.db-shm

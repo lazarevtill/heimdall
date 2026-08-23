@@ -99,16 +99,16 @@ func (s *server) buildAuthority(now time.Time) (*suppress.Authority, error) {
 		var err error
 		declarative, err = suppress.LoadDeclarative(s.suppressionsFile, now)
 		if err != nil {
-			return nil, fmt.Errorf("heimdall-bridge: load declarative suppressions: %w", err)
+			return nil, fmt.Errorf("load declarative suppressions: %w", err)
 		}
 	}
 	runtimeMutes, err := s.engineSuppress.ListRuntime()
 	if err != nil {
-		return nil, fmt.Errorf("heimdall-bridge: list runtime suppressions: %w", err)
+		return nil, fmt.Errorf("list runtime suppressions: %w", err)
 	}
 	authority, skipped := suppress.NewAuthority(declarative, runtimeMutes)
 	if skipped > 0 {
-		log.Printf("heimdall-bridge: suppression authority skipped %d invalid runtime row(s)", skipped)
+		log.Printf("suppression authority skipped %d invalid runtime row(s)", skipped)
 	}
 	return authority, nil
 }
@@ -175,19 +175,19 @@ func (s *server) handleAM(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	authority, err := s.buildAuthority(now)
 	if err != nil {
-		log.Printf("heimdall-bridge: /am: %v", err)
+		log.Printf("/am: %v", contract.Safe(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	result, err := bridge.Reconcile(r.Context(), now, s.deps(authority), webhook)
 	if err != nil {
-		log.Printf("heimdall-bridge: /am: reconcile: %v", err)
+		log.Printf("/am: reconcile: %v", contract.Safe(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("heimdall-bridge: /am: marker=%s opened=%v closed=%v commented=%v storm_fused=%v suppressed=%v targets=%d/%d",
+	log.Printf("/am: marker=%s opened=%v closed=%v commented=%v storm_fused=%v suppressed=%v targets=%d/%d",
 		result.Marker, result.Opened, result.Closed, result.Commented, result.StormFused,
 		result.Suppressed, result.TargetsFiring, result.TargetsTotal)
 
@@ -291,19 +291,19 @@ func (s *server) handleHypothesis(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	authority, err := s.buildAuthority(now)
 	if err != nil {
-		log.Printf("heimdall-bridge: /hypothesis: %v", err)
+		log.Printf("/hypothesis: %v", contract.Safe(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	result, err := bridge.HandleHypothesis(r.Context(), now, s.deps(authority), post, s.policy)
 	if err != nil {
-		log.Printf("heimdall-bridge: /hypothesis: handle: %v", err)
+		log.Printf("/hypothesis: handle: %v", contract.Safe(err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("heimdall-bridge: /hypothesis: enqueued=%v deduped=%v ticketed=%v redaction_failures=%d",
+	log.Printf("/hypothesis: enqueued=%v deduped=%v ticketed=%v redaction_failures=%d",
 		result.Enqueued, result.Deduped, result.Ticketed, result.RedactionFailures)
 
 	writeJSON(w, http.StatusOK, hypResponse{
@@ -338,7 +338,7 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, _, err := s.store.GetIssue(healthzProbeKey); err != nil {
-		log.Printf("heimdall-bridge: /healthz: db probe failed: %v", err)
+		log.Printf("/healthz: db probe failed: %v", contract.Safe(err))
 		writeJSON(w, http.StatusServiceUnavailable, healthzResponse{Status: "unavailable", YouTrack: youtrack})
 		return
 	}

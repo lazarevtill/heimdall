@@ -9,10 +9,18 @@ local LLM, and takes the right action per severity (notify vs ticket vs escalate
 `design/`; the canonical target is `design/2026-07-19-final-design.md`, the growth path is
 `design/2026-07-19-heimdall-at-scale.md`, the language decision is `design/adr-0001-language-go.md`.
 
-**Status:** all three tiers are **built** — four binaries, every connector, the plugin host, and
+**Status:** all three tiers are **built** — five binaries, every connector, the plugin host, and
 the llama.cpp analyst. Every surface with a reachable data source/credential is **live-verified**
 against the real stack. The three-tier model and every trust invariant are enforced in code + CI.
 What remains is deployment/IaC and operator-provisioned credentials.
+
+## Practical guides
+
+This file is the CONTRACT — what must stay true. The how-to layer lives beside it:
+[`docs/SETUP.md`](docs/SETUP.md) (run it), [`docs/DEBUGGING.md`](docs/DEBUGGING.md) (symptom-first
+triage), [`docs/DEVELOPING.md`](docs/DEVELOPING.md) (what the gates encode, how to add each kind
+of thing, and the traps this codebase has already hit). When they disagree with this file, this
+file wins and the guide is wrong.
 
 ## Binaries
 - `cmd/heimdall-detect` — Tier-1 + Tier-2 oneshot (timer): manifest → sources → checks →
@@ -21,12 +29,31 @@ What remains is deployment/IaC and operator-provisioned credentials.
   cap/redact → persist → POST `/hypothesis`.
 - `cmd/heimdall-bridge` — HTTP daemon: `/am` (Alertmanager webhook → YouTrack), `/hypothesis`,
   `/healthz`; 15-min escalation sweep. `time.Now()` is allowed in `cmd/`.
-- `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain,
-  Alertmanager silence reconcile, weekly digest, own heartbeat.
+- `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain
+  (fanned out to every routed sink), Alertmanager silence reconcile, weekly digest, own heartbeat.
+- `cmd/heimdall-ui` — operator console (HTTP daemon). READS the finding ledger, the suppression
+  authority, the outbox's per-sink backlog, the heartbeat textfiles, and the detector's redacted
+  spool docs (its own read-only DTO: `contract.State` has no `UnmarshalJSON`, and decoding into a
+  `contract.Finding` would mint one outside `NewFinding` — ADR-G09), and the Tier-2 digest (which
+  DOES round-trip: `DigestStatus` has a fail-closed `UnmarshalJSON`, so the real type is reused),
+  the Tier-3 analyst run files, and the bridge's issue ledger. Three things the hypotheses page
+  must never imply, because the data invites all three: the run file holds only SURVIVORS (drops
+  are counters in Prometheus, their text is retained nowhere); presence is not delivery (persist
+  runs before any POST and survives a failed one); and confidence is metadata, never severity.
+  `hyp_fp` shares the fingerprint grammar, so hypotheses get their own route — never `/finding/`.
+  Access mode is explicit — `HEIMDALL_UI_AUTH` ∈ {oidc, token, none}; the OIDC relying party is
+  stdlib-only (PKCE, RS256 pinned, iss/aud/exp/nonce checked) precisely because ADR-G02 fixes the
+  direct-dependency budget at three. WRITES exactly one thing:
+  a runtime mute via `suppress.AddMute`, so the 30-day cap, validation and the feedback ledger
+  apply exactly as for a Telegram button. It cannot resolve, cannot delete a series, cannot mint
+  a hypothesis, and cannot un-mute (no such operation exists — mutes expire). `time.Now()` is
+  allowed in `cmd/`; the clock is injected into the server so every handler test is deterministic.
 
 ## Package map
 - `internal/contract` — wire types (`Finding`/`Digest`/`HypothesisFinding`), `NewFinding`
   (refuses `hypothesis`, caps `trend`), `Fingerprint = sha256(check|target)[:16]`,
+  `ValidFingerprint` (a fingerprint becomes a FILENAME — validate before joining it to a path,
+  it arrives from webhook labels and URL segments),
   `HypFingerprint`, fail-closed `Redact`/`EvidenceOrWithheld`.
 - `internal/manifest` — loads + validates the IaC-rendered expectation + Tier-2 manifest
   (rejects dup id AND dup `(check,target)` fingerprint; Tier-2 severity never `critical`).
@@ -95,8 +122,18 @@ What remains is deployment/IaC and operator-provisioned credentials.
    blind spot, and it emits an explicit 0 for every routed pair so the series always exists.
 6. **Suppression silences notification, never detection.** A muted finding keeps its series and is
    annotated in the digest; the ledger is the authority, Alertmanager silences are a projection.
-7. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
-8. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
+7. **The console may only ever widen what it READS.** `heimdall-ui` is a display over state the
+   other binaries own. Its single write to a DECISION authority goes through `suppress.AddMute`,
+   so adding any other such write means changing an authority rather than adding a handler.
+   (It is not a read-only *process*: opening the stores runs their idempotent schema DDL, and
+   `outbox.Open` runs its `notify_delivery` backfill insert — the same migrations its co-tenant
+   daemons run. Stated because "read-only" is the kind of claim that gets relied on later.) Operator actions run a
+   FIXED argv parsed from config at boot — nothing from a request reaches a command line, no
+   shell is involved, and an unconfigured action answers 501 rather than being a hidden
+   capability. A `make` gate keeps `internal/llm` off its dep graph too: the console displays
+   hypothesis text, it must never be able to call the model.
+8. **One emission path, one suppression authority, one resolve trigger** (`send_resolved`).
+9. **Everything is IaC.** No hand-placed state; config is tofu-rendered. Real addresses/secrets
    live only in the infra repo + Vault — never commit them here (this repo is public-mirrored).
 
 ## Language & style
@@ -122,10 +159,10 @@ What remains is deployment/IaC and operator-provisioned credentials.
 
 ## Build / test
 ```
-make build     # CGO_ENABLED=0 static, stripped binaries → bin/{heimdall-detect,analyst,bridge,notifier}
+make build     # CGO_ENABLED=0 static, stripped → bin/{heimdall-detect,analyst,bridge,notifier,ui}
 make test      # CGO_ENABLED=1 go test -race ./...   (cgo only for the race detector)
 make lint      # gofmt, go vet, + policy gates: no time.Now() in internal/, no contract.Finding{}
-               # literals outside the constructor, no internal/llm on the detector dep graph,
+               # literals outside the constructor, no internal/llm on the detector OR ui dep graph,
                # no real-infra strings in shipped code/deploy/CI, no secret-shaped tokens
 make vuln      # govulncheck (pinned version, never @latest)
 make ci        # lint + test + build + vuln   (this is what GitLab CI runs)

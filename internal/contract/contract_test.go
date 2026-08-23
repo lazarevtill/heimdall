@@ -104,3 +104,35 @@ func TestNewFinding(t *testing.T) {
 		}
 	})
 }
+
+// ValidFingerprint guards a value that becomes a FILENAME: the spool writes
+// <fingerprint>.json and both the bridge and the console read it back from
+// untrusted input (an Alertmanager webhook label, a URL path segment).
+func TestValidFingerprint(t *testing.T) {
+	// Anything Fingerprint itself produces must pass.
+	for _, pair := range [][2]string{
+		{"check", "target"},
+		{"", ""},
+		{"a|b", "c"},
+		{"unicode-∆", "targét"},
+	} {
+		fp := contract.Fingerprint(pair[0], pair[1])
+		if !contract.ValidFingerprint(fp) {
+			t.Errorf("Fingerprint(%q,%q) = %q, which its own validator rejects", pair[0], pair[1], fp)
+		}
+	}
+
+	for _, bad := range []string{
+		"", "..", "../../etc/passwd", "/etc/passwd", "..%2Fx",
+		"ABCDEF0123456789",  // uppercase
+		"abcdef012345678",   // 15 chars
+		"abcdef01234567890", // 17 chars
+		"abcdef012345678g",  // non-hex
+		"abcdef0123456789\n",
+		" abcdef0123456789",
+	} {
+		if contract.ValidFingerprint(bad) {
+			t.Errorf("ValidFingerprint(%q) = true, want false", bad)
+		}
+	}
+}

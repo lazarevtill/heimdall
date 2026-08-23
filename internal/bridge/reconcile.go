@@ -93,8 +93,15 @@ type spoolEvidence struct {
 // or unreadable/undecodable file is NOT an error — it returns ok=false so
 // the caller falls back to the alert's own annotations, exactly as the
 // brief specifies ("annotations are the fallback").
+//
+// The fingerprint is VALIDATED before it is joined to a path. It arrives
+// from the Alertmanager webhook body (AMAlert.Labels is decoded straight
+// from the request JSON, and parse only checks the identity labels are
+// non-empty), so it is untrusted input being used as a filename: without
+// this guard a crafted labels.fingerprint of "../../../../etc/passwd" reads
+// that file and pastes it into the YouTrack issue body.
 func readSpoolEvidence(dir, fingerprint string) (spoolEvidence, bool) {
-	if dir == "" {
+	if dir == "" || !contract.ValidFingerprint(fingerprint) {
 		return spoolEvidence{}, false
 	}
 	data, err := os.ReadFile(filepath.Join(dir, fingerprint+".json"))

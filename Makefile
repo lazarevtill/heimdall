@@ -9,6 +9,7 @@ build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-analyst ./cmd/heimdall-analyst
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-bridge ./cmd/heimdall-bridge
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-notifier ./cmd/heimdall-notifier
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/heimdall-ui ./cmd/heimdall-ui
 
 test:
 	CGO_ENABLED=1 $(GO) test -race ./...
@@ -33,6 +34,8 @@ lint:
 		echo "secret-shaped token outside the defanged test fixtures"; exit 1; fi
 	@if $(GO) list -deps ./cmd/heimdall-detect | grep -q '/internal/llm$$'; then \
 		echo "internal/llm reachable from the heimdall-detect dependency graph: Tier-3 must stay off the trusted detection/emission path (G1)"; exit 1; fi
+	@if $(GO) list -deps ./cmd/heimdall-ui | grep -q '/internal/llm$$'; then \
+		echo "internal/llm reachable from the heimdall-ui dependency graph: the console DISPLAYS hypothesis text, it must never be able to call the model (G1)"; exit 1; fi
 	$(GO) mod verify
 
 # pinned: bump deliberately, never @latest (reproducible CI)

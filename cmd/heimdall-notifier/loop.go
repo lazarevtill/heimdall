@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/notify"
 	"github.com/lazarevtill/heimdall/internal/telegram"
 )
@@ -39,7 +40,7 @@ func handleUpdates(ctx context.Context, now time.Time, nd notify.Deps, updates [
 			continue
 		}
 		if _, err := notify.Dispatch(ctx, now, nd, *u.CallbackQuery); err != nil {
-			log.Printf("heimdall-notifier: dispatch: %v", err)
+			log.Printf("dispatch: %v", contract.Safe(err))
 			dispatchErrors++
 		}
 	}
@@ -66,7 +67,7 @@ func runLoop(ctx context.Context, tg *telegram.Client, cd cycleDeps, pollTimeout
 		updates, err := tg.GetUpdates(pollCtx, offset, pollTimeoutSeconds)
 		cancel()
 		if err != nil {
-			log.Printf("heimdall-notifier: getUpdates: %v", err)
+			log.Printf("getUpdates: %v", contract.Safe(err))
 			select {
 			case <-time.After(pollErrorBackoff):
 			case <-ctx.Done():
@@ -79,12 +80,12 @@ func runLoop(ctx context.Context, tg *telegram.Client, cd cycleDeps, pollTimeout
 		offset, dispatchErrors = handleUpdates(ctx, now, cd.Notify, updates, offset)
 
 		if err := runCycle(ctx, now, cd, dispatchErrors); err != nil {
-			log.Printf("heimdall-notifier: run cycle: %v", err)
+			log.Printf("run cycle: %v", contract.Safe(err))
 		}
 
 		newLastSentWeek, err := maybeSendDigest(ctx, now, cd, lastSentWeek)
 		if err != nil {
-			log.Printf("heimdall-notifier: weekly digest: %v", err)
+			log.Printf("weekly digest: %v", contract.Safe(err))
 		}
 		lastSentWeek = newLastSentWeek
 	}

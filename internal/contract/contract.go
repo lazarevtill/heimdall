@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -97,6 +98,23 @@ func Fingerprint(checkID, target string) string {
 	sum := sha256.Sum256([]byte(checkID + "|" + target))
 	return hex.EncodeToString(sum[:])[:16]
 }
+
+// fingerprintRe is the exact shape Fingerprint produces: 16 lowercase hex
+// characters.
+var fingerprintRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// ValidFingerprint reports whether s is a well-formed fingerprint.
+//
+// This exists because a fingerprint is used as a FILENAME: the spool writes
+// <fingerprint>.json, and both the bridge and the operator console read it
+// back. A fingerprint that arrives from outside the process — an
+// Alertmanager webhook label, a URL path segment — is untrusted input on a
+// path, so it must be validated against this grammar BEFORE being joined to
+// a directory. Without that check, "../../etc/passwd" is a readable file.
+//
+// Anything Fingerprint itself produced passes; anything that does not pass
+// was not produced by Fingerprint and has no business being opened.
+func ValidFingerprint(s string) bool { return fingerprintRe.MatchString(s) }
 
 // NewFinding validates and mints a Finding. It enforces the class-cap table
 // in code: class=trend is capped at warning (Tier-2 can never page) and

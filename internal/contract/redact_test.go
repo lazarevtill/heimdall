@@ -1,6 +1,8 @@
 package contract
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -70,5 +72,91 @@ func TestEvidenceOrWithheldTruncates(t *testing.T) {
 	}
 	if len(got) > 32<<10 {
 		t.Errorf("evidence not truncated: %d bytes", len(got))
+	}
+}
+
+// Safe exists because a log line is an EGRESS: journald ships to syslog and
+// syslog leaves the host, so an error formatted with %v carries whatever it
+// holds off the machine.
+func TestSafeRedactsErrorText(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantGone string
+		wantKept string
+	}{
+		{
+			name:     "basic-auth URL in a transport error",
+			err:      errors.New(`Get "https://user:hunter2@prom.invalid/api": dial tcp: refused`),
+			wantGone: "hunter2",
+			wantKept: "dial tcp",
+		},
+		{
+			name:     "gitlab PAT",
+			err:      errors.New("push failed for glpat-AAAAAAAAAAAAAAAAAAAAAA"),
+			wantGone: "glpat-AAAAAAAAAAAAAAAAAAAAAA",
+			wantKept: "push failed",
+		},
+		{
+			name:     "bearer token",
+			err:      errors.New("401 with Authorization: Bearer abcdefghijklmnopqrstuvwxyz"),
+			wantGone: "abcdefghijklmnopqrstuvwxyz",
+			wantKept: "401",
+		},
+		{
+			name:     "PBS token",
+			err:      errors.New("denied PBSAPIToken=user@pbs!tok:sekritvalue"),
+			wantGone: "sekritvalue",
+			wantKept: "denied",
+		},
+		{
+			name:     "vault token",
+			err:      errors.New("bad hvs.AAAAAAAAAAAAAAAAAAAAAAAA"),
+			wantGone: "hvs.AAAAAAAAAAAAAAAAAAAAAAAA",
+			wantKept: "bad",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Safe(tc.err).Error()
+			if strings.Contains(got, tc.wantGone) {
+				t.Errorf("secret survived into the log-bound text: %q", got)
+			}
+			if !strings.Contains(got, tc.wantKept) {
+				t.Errorf("Safe destroyed the diagnostic: %q, want it to keep %q", got, tc.wantKept)
+			}
+			if !strings.Contains(got, "REDACTED") {
+				t.Errorf("want a redaction marker in %q", got)
+			}
+		})
+	}
+}
+
+// Safe must not get in the way of ordinary error handling.
+func TestSafePreservesNilAndUnwrapping(t *testing.T) {
+	if Safe(nil) != nil {
+		t.Error("Safe(nil) must be nil")
+	}
+
+	sentinel := errors.New("plain failure with no secrets")
+	// Nothing to redact: the original is returned unchanged, so identity and
+	// errors.Is both keep working.
+	if got := Safe(sentinel); got != sentinel {
+		t.Errorf("an error with nothing to redact should be returned as-is, got %v", got)
+	}
+
+	wrapped := fmt.Errorf("context: %w", errors.New("token glpat-AAAAAAAAAAAAAAAAAAAAAA"))
+	safe := Safe(wrapped)
+	if strings.Contains(safe.Error(), "glpat-AAAAAAAAAAAAAAAAAAAAAA") {
+		t.Error("a wrapped secret survived")
+	}
+	if !errors.Is(safe, wrapped) {
+		t.Error("errors.Is must still reach the original error")
+	}
+}
+
+func TestSafeStringRedacts(t *testing.T) {
+	if got := SafeString("glpat-AAAAAAAAAAAAAAAAAAAAAA"); strings.Contains(got, "glpat-A") {
+		t.Errorf("SafeString did not redact: %q", got)
 	}
 }

@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/notify"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/silence"
@@ -44,9 +45,28 @@ import (
 	"github.com/lazarevtill/heimdall/internal/telegram"
 )
 
+// configureLogging pins this binary's log format ONCE, so no call site has to
+// repeat it.
+//
+// Flags are cleared because every binary runs under systemd, and journald
+// already stamps each line. The stdlib default (LstdFlags) would put a second
+// timestamp inside the message, so a journal line read
+// "Aug 23 22:12:10 host heimdall-notifier[123]: 2026/08/23 22:12:10 ...".
+//
+// The prefix is set here rather than written into each call site, which is
+// what made it drift in the first place. It is deliberately kept even though
+// journald supplies the unit name: cross-binary debugging means tailing
+// several units at once ("journalctl -u 'heimdall-*'"), and a stable prefix
+// is what makes that greppable.
+func configureLogging() {
+	log.SetFlags(0)
+	log.SetPrefix("heimdall-notifier: ")
+}
+
 func main() {
+	configureLogging()
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "heimdall-notifier:", err)
+		log.Print(contract.Safe(err))
 		os.Exit(1)
 	}
 }
@@ -104,33 +124,33 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	for _, r := range required {
 		if r.val == "" {
-			return config{}, fmt.Errorf("heimdall-notifier: %s is required", r.name)
+			return config{}, fmt.Errorf("%s is required", r.name)
 		}
 	}
 
 	mainChatRaw := getenv("HEIMDALL_MAIN_CHAT_ID")
 	if mainChatRaw == "" {
-		return config{}, errors.New("heimdall-notifier: HEIMDALL_MAIN_CHAT_ID is required")
+		return config{}, errors.New("HEIMDALL_MAIN_CHAT_ID is required")
 	}
 	mainChatID, err := strconv.ParseInt(mainChatRaw, 10, 64)
 	if err != nil {
-		return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_MAIN_CHAT_ID %q must be an integer: %w", mainChatRaw, err)
+		return config{}, fmt.Errorf("HEIMDALL_MAIN_CHAT_ID %q must be an integer: %w", mainChatRaw, err)
 	}
 	c.MainChatID = mainChatID
 
 	analystChatRaw := getenv("HEIMDALL_ANALYST_CHAT_ID")
 	if analystChatRaw == "" {
-		return config{}, errors.New("heimdall-notifier: HEIMDALL_ANALYST_CHAT_ID is required")
+		return config{}, errors.New("HEIMDALL_ANALYST_CHAT_ID is required")
 	}
 	analystChatID, err := strconv.ParseInt(analystChatRaw, 10, 64)
 	if err != nil {
-		return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_ANALYST_CHAT_ID %q must be an integer: %w", analystChatRaw, err)
+		return config{}, fmt.Errorf("HEIMDALL_ANALYST_CHAT_ID %q must be an integer: %w", analystChatRaw, err)
 	}
 	c.AnalystChatID = analystChatID
 
 	allowedRaw := getenv("HEIMDALL_ALLOWED_USER_IDS")
 	if allowedRaw == "" {
-		return config{}, errors.New("heimdall-notifier: HEIMDALL_ALLOWED_USER_IDS is required")
+		return config{}, errors.New("HEIMDALL_ALLOWED_USER_IDS is required")
 	}
 	allowed, err := parseAllowedUserIDs(allowedRaw)
 	if err != nil {
@@ -141,7 +161,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if v := getenv("HEIMDALL_POLL_TIMEOUT_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
-			return config{}, fmt.Errorf("heimdall-notifier: HEIMDALL_POLL_TIMEOUT_SECONDS %q must be a positive integer", v)
+			return config{}, fmt.Errorf("HEIMDALL_POLL_TIMEOUT_SECONDS %q must be a positive integer", v)
 		}
 		c.PollTimeoutSeconds = n
 	}
@@ -163,7 +183,7 @@ func parseAllowedUserIDs(raw string) (map[int64]bool, error) {
 		}
 		id, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("heimdall-notifier: HEIMDALL_ALLOWED_USER_IDS: invalid id %q: %w", part, err)
+			return nil, fmt.Errorf("HEIMDALL_ALLOWED_USER_IDS: invalid id %q: %w", part, err)
 		}
 		out[id] = true
 	}
@@ -257,7 +277,7 @@ func run() error {
 	for _, s := range routes.All() {
 		sinkIDs = append(sinkIDs, s.ID())
 	}
-	log.Printf("heimdall-notifier: starting (main_chat=%d analyst_chat=%d allowed_users=%d poll_timeout=%ds sinks=%s)",
+	log.Printf("starting (main_chat=%d analyst_chat=%d allowed_users=%d poll_timeout=%ds sinks=%s)",
 		cfg.MainChatID, cfg.AnalystChatID, len(cfg.AllowedUsers), cfg.PollTimeoutSeconds,
 		strings.Join(sinkIDs, ","))
 
