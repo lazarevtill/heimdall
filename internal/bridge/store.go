@@ -264,17 +264,12 @@ func (s *Store) StartEpisode(row IssueRow) error {
 	return nil
 }
 
-// RecordOpened is UpsertIssue for the row of an issue the bridge CREATED in
-// the tracker. It also appends the open to issue_opens, in the same
-// transaction, which is what the storm fuse counts. The issues table has
-// one row per marker and each new episode overwrites its opened_at, so
+// RecordOpened is UpsertIssue for the row of an issue the bridge has just
+// CREATED in the tracker. It also appends the open to issue_opens, in the
+// same transaction, which is what the storm fuse counts. The issues table
+// has one row per marker and each new episode overwrites its opened_at, so
 // counting there saw one flapping group opening a fresh issue every few
-// minutes as a single open, and the fuse never tripped. Rows older than
-// opensRetention are pruned here.
-//
-// It is idempotent per (marker, issue_id): Reconcile also calls it when it
-// completes an open that a crash or failed write left unrecorded, and a
-// creation must count once, never twice.
+// minutes as a single open, and the fuse never tripped.
 func (s *Store) RecordOpened(row IssueRow) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -284,19 +279,47 @@ func (s *Store) RecordOpened(row IssueRow) error {
 	if err := upsertIssue(tx, row, false); err != nil {
 		return fmt.Errorf("bridge: record opened %s: %w", row.Marker, err)
 	}
-	at := row.OpenedAt.Unix()
-	if _, err := tx.Exec(`
-INSERT INTO issue_opens (marker, issue_id, opened_at)
-SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM issue_opens WHERE marker = ? AND issue_id = ?)`,
-		row.Marker, row.IssueID, at, row.Marker, row.IssueID); err != nil {
-		return fmt.Errorf("bridge: record opened %s: append: %w", row.Marker, err)
-	}
-	if _, err := tx.Exec(`DELETE FROM issue_opens WHERE opened_at < ?`,
-		row.OpenedAt.Add(-opensRetention).Unix()); err != nil {
-		return fmt.Errorf("bridge: record opened %s: prune: %w", row.Marker, err)
+	if err := appendOpen(tx, row.Marker, row.IssueID, row.OpenedAt); err != nil {
+		return fmt.Errorf("bridge: record opened %s: %w", row.Marker, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("bridge: record opened %s: commit: %w", row.Marker, err)
+	}
+	return nil
+}
+
+// RecordOpen appends one created issue to issue_opens without touching its
+// ledger row. Reconcile calls it when it adopts an issue whose open a crash
+// or failed write left unrecorded (the row still "opening"), before any of
+// the paths that go on to rewrite that row.
+func (s *Store) RecordOpen(marker, issueID string, openedAt time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("bridge: record open %s: begin: %w", marker, err)
+	}
+	defer tx.Rollback()
+	if err := appendOpen(tx, marker, issueID, openedAt); err != nil {
+		return fmt.Errorf("bridge: record open %s: %w", marker, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("bridge: record open %s: commit: %w", marker, err)
+	}
+	return nil
+}
+
+// appendOpen adds (marker, issueID) to issue_opens unless it is already
+// there, so a creation counts once however many paths record it, then
+// prunes rows older than opensRetention.
+func appendOpen(db execer, marker, issueID string, openedAt time.Time) error {
+	if _, err := db.Exec(`
+INSERT INTO issue_opens (marker, issue_id, opened_at)
+SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM issue_opens WHERE marker = ? AND issue_id = ?)`,
+		marker, issueID, openedAt.Unix(), marker, issueID); err != nil {
+		return fmt.Errorf("append open: %w", err)
+	}
+	if _, err := db.Exec(`DELETE FROM issue_opens WHERE opened_at < ?`,
+		openedAt.Add(-opensRetention).Unix()); err != nil {
+		return fmt.Errorf("prune opens: %w", err)
 	}
 	return nil
 }

@@ -553,6 +553,17 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 	// never sets it, so that choice is never overridden.
 	tagPending := rowFound && row.AutoTagPending
 	completingOpen := rowFound && row.State == StateOpening
+	if completingOpen {
+		// An open that a crash or failed write left unrecorded: the tracker
+		// created this issue, so it counts toward the storm fuse. Recorded
+		// here, before any branch below rewrites the "opening" row (still
+		// firing, recovered, or a partial delivery), so no path can consume
+		// that state without counting it. Idempotent, so a retry that fails
+		// further on does not count it twice.
+		if err := d.Store.RecordOpen(marker, existing.ID, row.OpenedAt); err != nil {
+			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: record adopted open %s: %w", marker, err)
+		}
+	}
 	if tagPending && (row.IssueID == "" || row.IssueID == existing.ID) {
 		for _, tag := range bridgeTags {
 			if hasTag(existing.Tags, tag) {
@@ -599,14 +610,8 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 		// comment) and is mute-gated PER TARGET.
 		ledger.State = StateOpen
 		save := d.Store.UpsertIssue
-		switch {
-		case newEpisode:
+		if newEpisode {
 			save = d.Store.StartEpisode
-		case completingOpen:
-			// The issue was created by an open that never recorded it (a
-			// crash or failed write after the tracker's create). It still
-			// counts toward the storm fuse.
-			save = d.Store.RecordOpened
 		}
 		if err := save(ledger); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
@@ -686,11 +691,7 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 	}
 	if rowFound || isAuto {
 		ledger.State = StateResolved
-		save := d.Store.UpsertIssue
-		if completingOpen {
-			save = d.Store.RecordOpened // created, as above, even if already recovered
-		}
-		if err := save(ledger); err != nil {
+		if err := d.Store.UpsertIssue(ledger); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
 		}
 	}

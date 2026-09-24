@@ -899,22 +899,37 @@ func TestReconcileAdoptsAnIssueCreatedBeforeACrash(t *testing.T) {
 	}
 }
 
-// An open that a crash left unrecorded is counted even when the group has
-// already recovered by the delivery that finds its issue.
-func TestReconcileCountsAnUnrecordedOpenCompletedOnRecovery(t *testing.T) {
-	deps, ft := testDeps(t, 10, nil)
-	marker := "[hb:disk--smart-fail]"
-	if err := deps.Store.StartEpisode(bridge.IssueRow{
-		Marker: marker, Group: "disk", Check: "smart-fail", Severity: "critical",
-		FiringSince: fixedNow, OpenedAt: fixedNow, State: bridge.StateOpening, AutoTagPending: true,
-	}); err != nil {
-		t.Fatalf("seed intent: %v", err)
-	}
-	ft.issues[marker] = &tracker.Issue{ID: "HEIM-7", State: "Open", Marker: marker}
+// An open that a crash left unrecorded is counted whichever path the
+// delivery that finds its issue takes, not only the still-firing one.
+func TestReconcileCountsAnUnrecordedOpenOnEveryCompletionPath(t *testing.T) {
+	resolved := groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", fixedNow))
+	partial := groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", fixedNow))
+	partial.TruncatedAlerts = 2 // every alert shown resolved, but not all were shown
+	for _, tc := range []struct {
+		name string
+		w    bridge.AMWebhook
+	}{
+		{"already recovered", resolved},
+		{"partial delivery", partial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, ft := testDeps(t, 10, nil)
+			marker := "[hb:disk--smart-fail]"
+			if err := deps.Store.StartEpisode(bridge.IssueRow{
+				Marker: marker, Group: "disk", Check: "smart-fail", Severity: "critical",
+				FiringSince: fixedNow, OpenedAt: fixedNow, State: bridge.StateOpening, AutoTagPending: true,
+			}); err != nil {
+				t.Fatalf("seed intent: %v", err)
+			}
+			ft.issues[marker] = &tracker.Issue{ID: "HEIM-7", State: "Open", Marker: marker}
 
-	mustReconcile(t, fixedNow.Add(time.Minute), deps, groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", fixedNow)))
-	if n, err := deps.Store.OpensSince(fixedNow.Add(-time.Hour)); err != nil || n != 1 {
-		t.Errorf("OpensSince = %d, %v; want the created issue counted", n, err)
+			mustReconcile(t, fixedNow.Add(time.Minute), deps, tc.w)
+			// A redelivery must not count it a second time.
+			mustReconcile(t, fixedNow.Add(2*time.Minute), deps, tc.w)
+			if n, err := deps.Store.OpensSince(fixedNow.Add(-time.Hour)); err != nil || n != 1 {
+				t.Errorf("OpensSince = %d, %v; want the created issue counted exactly once", n, err)
+			}
+		})
 	}
 }
 
