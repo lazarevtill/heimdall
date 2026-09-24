@@ -115,7 +115,9 @@ explicit Unknown ("no source wired"). **Plugins** go under
 `plugin:<id>`. A plugin's credential, if it declares one, is the cred-file key
 `HEIMDALL_PLUGIN_CRED_<ID>`, whatever env var name its manifest declares. A
 broken install turns only that plugin's expectations Unknown, with the
-reason, and is logged. See `contract/PLUGIN_SCHEMA.md`, "Installing a plugin".
+reason, and is logged. A plugin runs as the detector's user and can read the
+cred file directly, so install only plugins you trust with every secret in
+it. See `contract/PLUGIN_SCHEMA.md`, "Installing a plugin".
 
 `HEIMDALL_PROM_URL` and `HEIMDALL_VL_URL` must be absolute `http(s)` URLs with
 a host, or the detector refuses to start. The error names the variable, never

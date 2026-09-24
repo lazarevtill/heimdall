@@ -83,6 +83,13 @@ name it declared. The declared name only chooses the variable *inside the
 child*. It never selects which secret is read, so a plugin cannot ask for
 another component's token by naming it.
 
+**That scoping is about what the host hands out. It does not contain the
+plugin.** A plugin runs as the detector's own user, and nothing sandboxes its
+filesystem (see Sandbox status). It can therefore read the cred file itself,
+and with it the PBS token and every other plugin's credential. Until the infra
+layer runs plugins under a separate uid or mount namespace, install only a
+plugin you would trust with every secret the detector holds.
+
 **A broken install never stops the detector.** A plugin can be broken in
 several ways: an invalid manifest, an id that does not match its directory,
 a missing or non-executable binary, a missing credential, or a
