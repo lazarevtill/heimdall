@@ -10,6 +10,7 @@
 package tier2
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -30,17 +31,21 @@ const WarmupWindow = 7 * 24 * time.Hour
 // (near-zero) IQR, so a tight baseline yields ZScore==0 rather than Inf/NaN.
 const zEpsilon = 1e-9
 
-// Result is one Tier-2 spec's evaluation. At most one of Finding is set
-// (graduated); Row is the digest row (always produced when spec.Digest, and
-// ALSO always produced when the status is not StatusOK — StatusUnknown or
-// StatusBaselineWarming — because a blind spot is never dropped just because
-// the manifest didn't ask for that feature's healthy rows in the digest).
-// Marker fields feed the digest's top-level echo arrays so the analyst is
-// always told what was unmeasurable / surprising.
+// Result is one Tier-2 spec's evaluation. Finding is set while the spec is
+// graduated (see Eval for when that holds); Row is the digest row (always
+// produced when spec.Digest, and ALSO always produced when the status is not
+// StatusOK — StatusUnknown or StatusBaselineWarming — because a blind spot is
+// never dropped just because the manifest didn't ask for that feature's
+// healthy rows in the digest). Marker fields feed the digest's top-level echo
+// arrays so the analyst is always told what was unmeasurable / surprising.
+//
+// Every Result Eval returns carries a Row or is a calm, measured, non-digest
+// spec — including when Eval also returns an error: a failed evaluation is an
+// explicit unknown row + marker, never an empty Result.
 type Result struct {
-	Finding       *contract.Finding   // non-nil ONLY when graduated: class=trend, StateFiring
+	Finding       *contract.Finding   // class=trend: StateFiring while graduated, StateUnknown while graduated but unmeasurable
 	Row           *contract.DigestRow // the feature row (nil only when spec.Digest==false AND status==StatusOK)
-	UnknownMarker string              // "<target>/<feature>" when the signal was unknown
+	UnknownMarker string              // "<target>/<feature>" when the evaluation was unmeasurable
 	Flap          string              // C7 only: flap descriptor when flapping
 	NewTemplate   string              // C9 only: new-template descriptor when surprising
 }
@@ -101,13 +106,22 @@ func classify(signal string, metric, graduate, clear float64) zone {
 //
 // A StateUnknown signal, or an OK signal with an empty sample vector, is NOT
 // measured — an empty vector is not an observed value, so a Tier-2 blind
-// spot must never be silently read as 0/calm.
-func reduceMetric(signal string, sig source.Signal) (metric float64, measured bool) {
+// spot must never be silently read as 0/calm. Neither is a vector holding a
+// non-finite sample: NaN loses every comparison (so MAX/MIN would silently
+// skip it or keep it depending on position) and ±Inf can be neither stored
+// as a baseline nor JSON-encoded into the digest. The sources already refuse
+// both; this is the second line. reason says why when measured is false.
+func reduceMetric(signal string, sig source.Signal) (metric float64, measured bool, reason string) {
 	if sig.State == contract.StateUnknown {
-		return 0, false
+		return 0, false, "signal unknown: " + sig.Err
 	}
 	if len(sig.Samples) == 0 {
-		return 0, false
+		return 0, false, "empty sample vector"
+	}
+	for _, s := range sig.Samples {
+		if !finite(s.Value) {
+			return 0, false, fmt.Sprintf("non-finite sample %v", s.Value)
+		}
 	}
 	if signal == "slope" {
 		m := sig.Samples[0].Value
@@ -116,7 +130,7 @@ func reduceMetric(signal string, sig source.Signal) (metric float64, measured bo
 				m = s.Value
 			}
 		}
-		return m, true
+		return m, true, ""
 	}
 	m := sig.Samples[0].Value
 	for _, s := range sig.Samples[1:] {
@@ -124,8 +138,11 @@ func reduceMetric(signal string, sig source.Signal) (metric float64, measured bo
 			m = s.Value
 		}
 	}
-	return m, true
+	return m, true, ""
 }
+
+// finite reports whether v is a real number (not NaN, not ±Inf).
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // sevOrInfo defaults an unset manifest severity to info (contract.NewFinding
 // additionally caps class=trend at warning regardless of what is passed).
@@ -148,20 +165,40 @@ func sevOrInfo(sev contract.Severity) contract.Severity {
 // top, every call, unconditionally. MarkEnabled is idempotent/earliest-wins,
 // so this is what starts the 7-day warm-up window the FIRST time a spec is
 // ever evaluated — the engine (S2-c) does not need to call it separately.
+//
+// Emission is STATE, not an event: the .prom is rewritten whole every run,
+// so a finding Eval does not return is a series that disappears, and
+// Alertmanager resolves it (the bridge then auto-closes its ticket). So once
+// a crossing has served its min_hold, the finding is returned on EVERY
+// evaluation until a measured value reaches the clear zone:
+//
+//   - graduating zone or hold band: StateFiring (the hold band holds the
+//     alert, not just the crossing row — otherwise a metric hovering at the
+//     graduate threshold fires and resolves on alternate runs);
+//   - unmeasured, warming, no trustworthy baseline, or a store failure:
+//     StateUnknown (same fingerprint, so the same series — a backend outage
+//     is never a resolve).
+//
+// Only a measured clear resolves. None of the non-graduating paths above
+// touch the crossing row: they read it (store.Crossing), never mark or clear.
+//
+// On any store error Eval still returns a usable Result — an explicit unknown
+// row + marker, plus the held Unknown finding when the crossing is readable —
+// alongside the error, so the caller can log it and keep the row.
 func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *baseline.Store) (Result, error) {
 	if err := store.MarkEnabled(now, spec.Check, spec.Target); err != nil {
-		return Result{}, fmt.Errorf("tier2: mark enabled %s/%s: %w", spec.Check, spec.Target, err)
+		return blind(now, spec, store, fmt.Errorf("tier2: mark enabled %s/%s: %w", spec.Check, spec.Target, err))
 	}
 	warming, err := store.Warming(now, spec.Check, spec.Target, WarmupWindow)
 	if err != nil {
-		return Result{}, fmt.Errorf("tier2: warming %s/%s: %w", spec.Check, spec.Target, err)
+		return blind(now, spec, store, fmt.Errorf("tier2: warming %s/%s: %w", spec.Check, spec.Target, err))
 	}
 
-	metric, measured := reduceMetric(spec.Signal, sig)
+	metric, measured, unmeasuredWhy := reduceMetric(spec.Signal, sig)
 
 	if measured {
 		if err := store.RecordFeature(now, spec.Entity, spec.Target, spec.Feature, metric); err != nil {
-			return Result{}, fmt.Errorf("tier2: record feature %s/%s: %w", spec.Target, spec.Feature, err)
+			return blind(now, spec, store, fmt.Errorf("tier2: record feature %s/%s: %w", spec.Target, spec.Feature, err))
 		}
 	}
 
@@ -172,34 +209,24 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 	// looks like even on an eval where the current sample is unmeasurable.
 	base, _, baseOK, err := store.Quantile(now, spec.Target, spec.Feature, spec.BaselineWindow(), 0.95)
 	if err != nil {
-		return Result{}, fmt.Errorf("tier2: baseline quantile %s/%s: %w", spec.Target, spec.Feature, err)
+		return blind(now, spec, store, fmt.Errorf("tier2: baseline quantile %s/%s: %w", spec.Target, spec.Feature, err))
 	}
 	var p25, p50, p75 float64
 	if baseOK {
 		var ok25, ok50, ok75 bool
 		if p25, _, ok25, err = store.Quantile(now, spec.Target, spec.Feature, spec.BaselineWindow(), 0.25); err != nil {
-			return Result{}, fmt.Errorf("tier2: p25 quantile %s/%s: %w", spec.Target, spec.Feature, err)
+			return blind(now, spec, store, fmt.Errorf("tier2: p25 quantile %s/%s: %w", spec.Target, spec.Feature, err))
 		}
 		if p50, _, ok50, err = store.Quantile(now, spec.Target, spec.Feature, spec.BaselineWindow(), 0.50); err != nil {
-			return Result{}, fmt.Errorf("tier2: p50 quantile %s/%s: %w", spec.Target, spec.Feature, err)
+			return blind(now, spec, store, fmt.Errorf("tier2: p50 quantile %s/%s: %w", spec.Target, spec.Feature, err))
 		}
 		if p75, _, ok75, err = store.Quantile(now, spec.Target, spec.Feature, spec.BaselineWindow(), 0.75); err != nil {
-			return Result{}, fmt.Errorf("tier2: p75 quantile %s/%s: %w", spec.Target, spec.Feature, err)
+			return blind(now, spec, store, fmt.Errorf("tier2: p75 quantile %s/%s: %w", spec.Target, spec.Feature, err))
 		}
 		// Defensive: p25/p50/p75 query the exact same (target,feature,window)
 		// row set as the p95 call above, so they are expected to agree on ok;
 		// a disagreement is fail-closed (treated as no baseline).
 		baseOK = ok25 && ok50 && ok75
-	}
-
-	var status contract.DigestStatus
-	switch {
-	case !measured:
-		status = contract.StatusUnknown
-	case warming || !baseOK:
-		status = contract.StatusBaselineWarming
-	default:
-		status = contract.StatusOK
 	}
 
 	// Robust (IQR-based) zscore — deterministic, NOT a Gaussian assumption.
@@ -213,6 +240,27 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 			denom = zEpsilon
 		}
 		zscore = (metric - p50) / denom
+	}
+
+	// Non-finite guard. Finite inputs can still produce a non-finite output
+	// (a huge metric over the epsilon floor overflows the zscore; quantile
+	// interpolation between huge values overflows), and a ±Inf/NaN in a row
+	// cannot be JSON-encoded — one used to fail digest.Write and with it the
+	// whole detector run, Tier 1 included. Such an evaluation is unmeasurable:
+	// status unknown, every float zeroed.
+	if !finite(base) || !finite(p25) || !finite(p50) || !finite(p75) || !finite(zscore) {
+		measured, unmeasuredWhy = false, "non-finite baseline or zscore"
+		base, zscore = 0, 0
+	}
+
+	var status contract.DigestStatus
+	switch {
+	case !measured:
+		status = contract.StatusUnknown
+	case warming || !baseOK:
+		status = contract.StatusBaselineWarming
+	default:
+		status = contract.StatusOK
 	}
 
 	rowValue := 0.0
@@ -237,10 +285,14 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 	}
 
 	if !measured {
-		// Fail-closed unknown path: no finding, crossing state untouched (a
-		// blind eval must never advance or reset the hold timer).
+		// Fail-closed unknown path: the crossing state is untouched (a blind
+		// eval must never advance or reset the hold timer), but a trend that
+		// has already graduated stays present as Unknown rather than
+		// resolving on a blind spot.
 		result.UnknownMarker = spec.Target + "/" + spec.Feature
-		return result, nil
+		f, err := held(now, spec, store, contract.StateUnknown, "unmeasurable: "+unmeasuredWhy)
+		result.Finding = f
+		return result, err
 	}
 
 	z := classify(spec.Signal, metric, spec.GraduateThreshold, spec.ClearThreshold)
@@ -260,49 +312,119 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 	if warming || !baseOK {
 		// Warming or missing-baseline: NEVER graduate, and do NOT touch
 		// crossing state either — a warming/blind eval must not accumulate
-		// hold time toward a graduation it is not yet allowed to make.
-		return result, nil
+		// hold time toward a graduation it is not yet allowed to make. A
+		// crossing that already served its hold (e.g. the warmup table was
+		// lost in a restore while the crossing row survived) is held as
+		// Unknown: this baseline cannot confirm it, and cannot clear it.
+		f, err := held(now, spec, store, contract.StateUnknown, "baseline not trustworthy (warming or no baseline in window)")
+		result.Finding = f
+		return result, err
 	}
 
-	minHold := time.Duration(spec.MinHoldSeconds) * time.Second
 	switch z {
 	case zoneClear:
 		if err := store.ClearCrossing(spec.Check, spec.Target); err != nil {
 			return result, fmt.Errorf("tier2: clear crossing %s/%s: %w", spec.Check, spec.Target, err)
 		}
 	case zoneHold:
-		// Leave crossing as-is: neither a fresh entry nor a clear.
+		// Neither a fresh entry nor a clear: the crossing is left as-is, and
+		// a crossing that has served its hold keeps its alert firing.
+		f, err := held(now, spec, store, contract.StateFiring, fmt.Sprintf(
+			"metric=%.4f in hold band (clear_threshold=%.4f graduate_threshold=%.4f) baseline_7d=%.4f",
+			metric, spec.ClearThreshold, spec.GraduateThreshold, base))
+		result.Finding = f
+		return result, err
 	case zoneEnter:
 		since, err := store.MarkCrossing(now, spec.Check, spec.Target)
 		if err != nil {
-			return result, fmt.Errorf("tier2: mark crossing %s/%s: %w", spec.Check, spec.Target, err)
+			// The metric IS in the graduating zone; if the crossing is still
+			// readable and has served its hold, it keeps firing.
+			f, herr := held(now, spec, store, contract.StateFiring, fmt.Sprintf(
+				"metric=%.4f graduate_threshold=%.4f baseline_7d=%.4f", metric, spec.GraduateThreshold, base))
+			result.Finding = f
+			return result, errors.Join(fmt.Errorf("tier2: mark crossing %s/%s: %w", spec.Check, spec.Target, err), herr)
 		}
-		if elapsed := now.Sub(since); elapsed >= minHold {
+		if elapsed := now.Sub(since); elapsed >= minHold(spec) {
 			evidence := fmt.Sprintf(
 				"metric=%.4f graduate_threshold=%.4f baseline_7d=%.4f hold_elapsed=%s (min_hold=%s)",
-				metric, spec.GraduateThreshold, base, elapsed.Round(time.Second), minHold,
+				metric, spec.GraduateThreshold, base, elapsed.Round(time.Second), minHold(spec),
 			)
-			f, ferr := contract.NewFinding(now, contract.FindingSpec{
-				Check:    spec.Check,
-				Group:    spec.Group,
-				Target:   spec.Target,
-				Node:     spec.Node,
-				Severity: sevOrInfo(spec.Severity),
-				Class:    contract.ClassTrend,
-				State:    contract.StateFiring,
-				Title:    spec.ID,
-				Evidence: evidence,
-			})
+			f, ferr := mint(now, spec, contract.StateFiring, evidence)
 			if ferr != nil {
 				// A graduation that can't be minted must not crash the run:
 				// the row (and any markers) are still returned; Finding
 				// stays nil and the wrapped error is surfaced for the
 				// caller (S2-c) to log.
-				return result, fmt.Errorf("tier2: mint graduation finding %s/%s: %w", spec.Check, spec.Target, ferr)
+				return result, ferr
 			}
-			result.Finding = &f
+			result.Finding = f
 		}
 	}
 
 	return result, nil
+}
+
+func minHold(spec manifest.Tier2Spec) time.Duration {
+	return time.Duration(spec.MinHoldSeconds) * time.Second
+}
+
+// mint builds the spec's trend finding via contract.NewFinding (ADR-G09),
+// which additionally caps class=trend at warning.
+func mint(now time.Time, spec manifest.Tier2Spec, state contract.State, evidence string) (*contract.Finding, error) {
+	f, err := contract.NewFinding(now, contract.FindingSpec{
+		Check:    spec.Check,
+		Group:    spec.Group,
+		Target:   spec.Target,
+		Node:     spec.Node,
+		Severity: sevOrInfo(spec.Severity),
+		Class:    contract.ClassTrend,
+		State:    state,
+		Title:    spec.ID,
+		Evidence: evidence,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tier2: mint finding %s/%s: %w", spec.Check, spec.Target, err)
+	}
+	return &f, nil
+}
+
+// held returns the spec's trend finding in the given state IF a crossing
+// exists that has already served its min_hold — i.e. the spec is graduated —
+// and nil otherwise. It READS the crossing (store.Crossing) and never marks
+// or clears it, so calling it cannot move the hold timer.
+func held(now time.Time, spec manifest.Tier2Spec, store *baseline.Store, state contract.State, why string) (*contract.Finding, error) {
+	since, ok, err := store.Crossing(spec.Check, spec.Target)
+	if err != nil {
+		return nil, fmt.Errorf("tier2: read crossing %s/%s: %w", spec.Check, spec.Target, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	elapsed := now.Sub(since)
+	if elapsed < minHold(spec) {
+		return nil, nil // in the zone, but never graduated: nothing to hold
+	}
+	return mint(now, spec, state, fmt.Sprintf("%s; graduated trend held (crossing since %s, hold_elapsed=%s)",
+		why, since.Format(time.RFC3339), elapsed.Round(time.Second)))
+}
+
+// blind is the fail-closed Result for an evaluation the store could not
+// complete: an explicit unknown row (all floats zeroed) and marker — so the
+// spec never silently vanishes from the digest — plus the held Unknown
+// finding when the crossing is still readable, so a graduated trend is not
+// resolved by a store failure either. err is returned (joined with any
+// crossing-read failure) for the caller to log.
+func blind(now time.Time, spec manifest.Tier2Spec, store *baseline.Store, err error) (Result, error) {
+	row := contract.DigestRow{
+		RowID:   contract.Fingerprint(spec.Check, spec.Target),
+		Entity:  spec.Entity,
+		Target:  spec.Target,
+		Feature: spec.Feature,
+		Unit:    spec.Unit,
+		Status:  contract.StatusUnknown,
+	}
+	result := Result{Row: &row, UnknownMarker: spec.Target + "/" + spec.Feature}
+	f, herr := held(now, spec, store, contract.StateUnknown, "unmeasurable: baseline store failure")
+	result.Finding = f
+	return result, errors.Join(err, herr)
 }

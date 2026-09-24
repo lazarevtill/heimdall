@@ -13,6 +13,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -58,6 +59,14 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("config: %s is required", r.name)
 		}
 	}
+	if err := checkBackendURL("HEIMDALL_PROM_URL", c.PromURL); err != nil {
+		return Config{}, err
+	}
+	if c.VLURL != "" {
+		if err := checkBackendURL("HEIMDALL_VL_URL", c.VLURL); err != nil {
+			return Config{}, err
+		}
+	}
 	if v := getenv("HEIMDALL_QUERY_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -75,6 +84,21 @@ func Load(getenv func(string) string) (Config, error) {
 	return c, nil
 }
 
+// checkBackendURL fails fast on a backend URL that is not an absolute
+// http(s) URL with a host. The error names the variable and NEVER the value:
+// these URLs may carry basic-auth credentials, and url.Parse's own error
+// quotes the raw URL whole (and its reason quotes part of it) — which, left
+// to run time, used to reach every Unknown finding's evidence via the query
+// error. net/http masks a parsed URL's password in its errors; it cannot
+// mask one that never parsed.
+func checkBackendURL(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("config: %s is not a valid absolute http(s) URL with a host (value withheld: it may carry credentials)", name)
+	}
+	return nil
+}
+
 func loadEnvFile(path string) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -83,14 +107,16 @@ func loadEnvFile(path string) (map[string]string, error) {
 	defer f.Close()
 	out := make(map[string]string)
 	sc := bufio.NewScanner(f)
-	for sc.Scan() {
+	for n := 1; sc.Scan(); n++ {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("malformed line %q in %s", line, path)
+			// The line NUMBER only: a malformed line may be the secret itself
+			// (a bare token, or "KEY: value"), and this error gets logged.
+			return nil, fmt.Errorf("malformed line %d in %s (content withheld: expected KEY=VALUE)", n, path)
 		}
 		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
 	}

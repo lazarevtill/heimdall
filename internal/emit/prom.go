@@ -98,6 +98,21 @@ func RenderProm(now time.Time, fs []contract.Finding, redactionFailures int, dig
 	return b.Bytes()
 }
 
+const helpDigestRowsTruncated = "# HELP heimdall_digest_rows_truncated_total Tier-2 digest rows dropped by the 200-row and 32 KB caps during the last run.\n" +
+	"# TYPE heimdall_digest_rows_truncated_total counter\n"
+
+// RenderDigestProm renders the detector's digest-truncation series
+// (contract/DIGEST_SCHEMA.md): rows the last run's digest dropped to its row
+// and byte caps, per-run like heimdall_redaction_failures_total. Persistent
+// nonzero means the digest is a subset and the cap needs raising by MR. The
+// detector appends it to RenderProm's body only on a run that wrote a
+// digest; it is a separate function so RenderProm's signature (and golden)
+// stay put.
+func RenderDigestProm(rowsTruncated int) []byte {
+	return []byte(helpDigestRowsTruncated +
+		"heimdall_digest_rows_truncated_total " + strconv.Itoa(rowsTruncated) + "\n")
+}
+
 // RenderAnalystProm renders heimdall-analyst's heartbeat + per-run drop
 // counters. The caller (cmd/heimdall-analyst) must call this ONLY after a
 // successful analyst.Run: this function has no fail-closed path of its own

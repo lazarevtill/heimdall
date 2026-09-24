@@ -77,8 +77,18 @@ func run() error {
 	}
 	defer bstore.Close()
 
+	// ONE sources map, keyed by manifest backend, serves both tiers. The
+	// VictoriaLogs client used to be wired for Tier 2 only, so a Tier-1
+	// expectation on victorialogs (which the manifest accepts) was a
+	// permanent "no source wired" Unknown. A backend with no client here —
+	// pbs today — still resolves to an explicit, alertable Unknown per
+	// expectation (engine) and per spec (Tier-2 loop), never a silent skip.
 	sources := map[string]source.Source{
 		"prometheus": source.NewProm(cfg.PromURL, nil),
+	}
+	if cfg.VLURL != "" {
+		sources["victorialogs"] = source.NewVictoriaLogs(
+			cfg.VLURL, cfg.Credentials["HEIMDALL_VL_USER"], cfg.Credentials["HEIMDALL_VL_PASS"], nil)
 	}
 	checks := map[string]detect.Check{
 		"c1-deadman":   detect.DeadMan,
@@ -109,17 +119,10 @@ func run() error {
 	// marker, and/or a graduated finding); graduated trend findings are
 	// appended into the SAME findings slice so they ride the one ledger +
 	// spool + .prom emission path — there is no second emission path.
-	tier2Sources := map[string]source.Source{
-		"prometheus": source.NewProm(cfg.PromURL, nil),
-	}
-	if cfg.VLURL != "" {
-		tier2Sources["victorialogs"] = source.NewVictoriaLogs(
-			cfg.VLURL, cfg.Credentials["HEIMDALL_VL_USER"], cfg.Credentials["HEIMDALL_VL_PASS"], nil)
-	}
 	tier2Results := make([]tier2.Result, 0, len(m.Tier2))
 	for _, spec := range m.Tier2 {
 		var sig source.Signal
-		if src, ok := tier2Sources[spec.Backend]; ok {
+		if src, ok := sources[spec.Backend]; ok {
 			var qerr error
 			sig, qerr = src.Query(ctx, source.Query{ID: spec.ID, Expr: spec.Query})
 			if qerr != nil {
@@ -136,7 +139,10 @@ func run() error {
 		res, everr := tier2.Eval(now, spec, sig, bstore)
 		if everr != nil {
 			// A single spec's store error must not abort the whole run or
-			// the digest: log and continue with whatever partial res holds.
+			// the digest. Eval still returns a usable res on error — an
+			// explicit unknown row + marker, plus the held Unknown finding
+			// when the spec had graduated — so the spec never vanishes from
+			// the digest and its trend never resolves on a store failure.
 			log.Println("tier2 eval", spec.ID, "failed:", contract.Safe(everr))
 		}
 		tier2Results = append(tier2Results, res)
@@ -193,10 +199,11 @@ func run() error {
 	// fails we return here WITHOUT touching the old .prom, so the heartbeat
 	// stays withheld and the staleness meta-rule reports us — a failed
 	// digest write can never look like a clean run.
-	digestFailures, err := digest.Write(cfg.DigestDir, dg, now)
+	digestReport, err := digest.WriteAndReport(cfg.DigestDir, dg, now)
 	if err != nil {
 		return err
 	}
+	digestFailures := digestReport.RedactionFailures
 
 	if err := led.Upsert(now, findings); err != nil {
 		return err
@@ -210,14 +217,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := emit.WriteFileAtomic(
-		filepath.Join(cfg.TextfileDir, "heimdall.prom"),
-		emit.RenderProm(now, findings, redactionFailures+digestFailures, dg.GeneratedAt),
-	); err != nil {
+	// The digest-truncation series rides the same file (every run that gets
+	// here wrote a digest) and carries the FINAL count: Build's 200-row cap
+	// plus the rows Write's byte cap dropped.
+	body := append(emit.RenderProm(now, findings, redactionFailures+digestFailures, dg.GeneratedAt),
+		emit.RenderDigestProm(digestReport.RowsTruncated)...)
+	if err := emit.WriteFileAtomic(filepath.Join(cfg.TextfileDir, "heimdall.prom"), body); err != nil {
 		return err
 	}
 
-	logRunSummary(now, findings, dg, redactionFailures+digestFailures)
+	logRunSummary(now, findings, dg, digestReport.RowsTruncated, redactionFailures+digestFailures)
 	return nil
 }
 
@@ -230,7 +239,7 @@ func run() error {
 // digest.Write exist to enforce. Check and target identifiers stay out too;
 // they are already in the .prom and the spool, which are the surfaces meant
 // to carry them.
-func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Digest, redactionFailures int) {
+func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Digest, rowsTruncated, redactionFailures int) {
 	var firing, unknown, ok int
 	for _, f := range findings {
 		switch f.State {
@@ -244,7 +253,7 @@ func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Diges
 	}
 	log.Printf("run ok in %s: findings=%d (firing=%d unknown=%d ok=%d) digest_rows=%d unmeasurable=%d truncated=%d",
 		time.Since(now).Round(time.Millisecond), len(findings), firing, unknown, ok,
-		len(dg.Rows), len(dg.UnknownMarkers), dg.RowsTruncated)
+		len(dg.Rows), len(dg.UnknownMarkers), rowsTruncated)
 
 	// A redaction failure means content was WITHHELD rather than leaked. The
 	// finding still fires — content fail-closed, signal fail-open — and

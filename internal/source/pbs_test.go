@@ -96,6 +96,34 @@ func TestPBSSnapshotsNewestBackupTime(t *testing.T) {
 	}
 }
 
+// The datastore name is interpolated into a URL PATH, so it is escaped as one
+// segment: a "/" or "?" in it must not walk the request to another API
+// endpoint or smuggle in a query string.
+func TestPBSDatastoreIsPathEscaped(t *testing.T) {
+	cases := []struct {
+		name, datastore, wantPath string
+	}{
+		{"plain name unchanged", "store1", "/api2/json/admin/datastore/store1/snapshots"},
+		{"slashes stay inside one segment", "../../access/users", "/api2/json/admin/datastore/..%2F..%2Faccess%2Fusers/snapshots"},
+		{"query delimiter escaped", "store1?x", "/api2/json/admin/datastore/store1%3Fx/snapshots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath, gotQuery string
+			s, _ := newTestPBS(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotQuery = r.URL.EscapedPath(), r.URL.RawQuery
+				w.Write([]byte(snapshotsBody))
+			})
+			if _, err := s.Query(context.Background(), Query{ID: "q1", Expr: "datastore=" + tc.datastore}); err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if gotPath != tc.wantPath || gotQuery != "" {
+				t.Errorf("request = %q?%q, want %q with no query", gotPath, gotQuery, tc.wantPath)
+			}
+		})
+	}
+}
+
 func TestPBSSnapshotsFilteredByTypeAndID(t *testing.T) {
 	s, _ := newTestPBS(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(snapshotsBody))

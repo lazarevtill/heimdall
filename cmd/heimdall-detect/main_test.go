@@ -100,6 +100,11 @@ func TestRunEndToEnd(t *testing.T) {
 	if !strings.Contains(string(prom), "heimdall_digest_generated_timestamp_seconds") {
 		t.Errorf("digest freshness metric missing from .prom:\n%s", prom)
 	}
+	// ...and the truncation series contract/DIGEST_SCHEMA.md promises,
+	// explicitly 0: an absent series cannot alert.
+	if !strings.Contains(string(prom), "heimdall_digest_rows_truncated_total 0\n") {
+		t.Errorf("heimdall_digest_rows_truncated_total 0 missing from .prom:\n%s", prom)
+	}
 	// A fresh state.db means the warm-up gate holds: no trend finding, even
 	// though the Tier-2 sample (0.95) is well past graduate_threshold (0.9).
 	if strings.Contains(string(prom), `check="c6-quantile-creep"`) {
@@ -286,5 +291,70 @@ func TestRunFeedsRuntimeMuteAnnotation(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("digest Suppressed = %v, want to contain the runtime mute's annotation", dg.Suppressed)
+	}
+}
+
+// One sources map serves both tiers. A Tier-1 expectation on victorialogs
+// used to be a permanent "no source wired" Unknown (the VictoriaLogs client
+// was wired for Tier 2 only); it now evaluates for real. A backend that is
+// still unwired (pbs) stays an explicit, alertable Unknown — never dropped.
+func TestRunTier1ExpectationOnVictoriaLogs(t *testing.T) {
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	defer prom.Close()
+	vl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/select/logsql/query" {
+			t.Errorf("VL path = %q", r.URL.Path)
+		}
+		w.Write([]byte(`{"_hv":"3","hostname":"node-a"}` + "\n"))
+	}))
+	defer vl.Close()
+
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(manifestPath, []byte(`{
+	  "generated_at": "2026-07-19T00:00:00Z",
+	  "expectations": [
+	    {"id":"oom-kills-node-a","check":"c4-signature","group":"node-a","target":"node-a","node":"node-a",
+	     "severity_on_miss":"warning",
+	     "verify":{"backend":"victorialogs","query":"_time:1h oom-kill | stats count() as _hv","min_count":1}},
+	    {"id":"backup-vm-100","check":"c1-deadman","group":"backup-ds1","target":"backup:ds1/vm-100","node":"node-a",
+	     "grace_seconds":3600,"severity_on_miss":"critical",
+	     "verify":{"backend":"pbs","query":"datastore=ds1;id=100"}}
+	  ]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	textfileDir := filepath.Join(dir, "textfile")
+	t.Setenv("HEIMDALL_MANIFEST", manifestPath)
+	t.Setenv("HEIMDALL_TEXTFILE_DIR", textfileDir)
+	t.Setenv("HEIMDALL_SPOOL_DIR", filepath.Join(dir, "findings"))
+	t.Setenv("HEIMDALL_STATE_DB", filepath.Join(dir, "state.db"))
+	t.Setenv("HEIMDALL_PROM_URL", prom.URL)
+	t.Setenv("HEIMDALL_VL_URL", vl.URL)
+	t.Setenv("HEIMDALL_DIGEST_DIR", filepath.Join(dir, "digest"))
+
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	states := map[string]string{}
+	for _, fp := range []string{contract.Fingerprint("c4-signature", "node-a"), contract.Fingerprint("c1-deadman", "backup:ds1/vm-100")} {
+		data, err := os.ReadFile(filepath.Join(dir, "findings", fp+".json"))
+		if err != nil {
+			t.Fatalf("spool doc %s missing: %v", fp, err)
+		}
+		var doc struct {
+			Check, State, Evidence string
+		}
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		states[doc.Check] = doc.State + ": " + doc.Evidence
+	}
+	if got := states["c4-signature"]; !strings.HasPrefix(got, "firing: count 3") {
+		t.Errorf("victorialogs Tier-1 finding = %q, want it evaluated (firing: count 3 ...)", got)
+	}
+	if got := states["c1-deadman"]; !strings.HasPrefix(got, "unknown: ") || !strings.Contains(got, "no source wired for backend pbs") {
+		t.Errorf("pbs Tier-1 finding = %q, want an explicit Unknown (no source wired)", got)
 	}
 }

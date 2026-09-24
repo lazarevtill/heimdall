@@ -46,9 +46,10 @@ func (e Expectation) Grace() time.Duration {
 // Tier2Spec is one declarative soft-signal, IaC/MR-reviewed (thresholds are
 // never code constants). The engine either GRADUATES it (class=trend, capped
 // at warning) or emits it as a digest row — decided in the S2-b check, not
-// here. Graduate-vs-clear ordering is deliberately not validated in this
-// package: the hysteresis direction is per-signal and lives in the S2-b
-// check.
+// here. Load does validate the graduate/clear ORDERING against the signal's
+// direction (see lowerIsWorse): the check classifies but cannot tell an
+// inverted or omitted pair from an intended one, and either silently removes
+// the hysteresis band.
 type Tier2Spec struct {
 	ID                    string            `json:"id"`
 	Signal                string            `json:"signal"` // quantile | flap | slope | template_surprise
@@ -84,6 +85,11 @@ var validBackends = map[string]bool{"prometheus": true, "victorialogs": true, "p
 var tier2Backends = map[string]bool{"prometheus": true, "victorialogs": true}
 
 var validSignals = map[string]bool{"quantile": true, "flap": true, "slope": true, "template_surprise": true}
+
+// lowerIsWorse names the signals whose metric gets WORSE as it falls (slope:
+// a shorter exhaustion horizon), mirroring tier2.classify. Every other
+// signal is higher-is-worse.
+var lowerIsWorse = map[string]bool{"slope": true}
 
 func Load(path string) (*Manifest, error) {
 	data, err := os.ReadFile(path)
@@ -141,6 +147,11 @@ func Load(path string) (*Manifest, error) {
 	// two planes emit into the SAME .prom series namespace, so a Tier-2
 	// (check,target) equal to a Tier-1 (check,target) would clobber a series
 	// exactly as two expectations would.
+	//
+	// seenFeature guards the baseline store's key: feature history is keyed
+	// by (target, feature) alone, so two specs sharing that pair would read
+	// each other's observations as their own baseline.
+	seenFeature := make(map[string]string, len(m.Tier2))
 	for i, ts := range m.Tier2 {
 		where := fmt.Sprintf("tier2[%d] (id %q)", i, ts.ID)
 		switch {
@@ -156,6 +167,19 @@ func Load(path string) (*Manifest, error) {
 			return nil, fmt.Errorf("%w: %s: query is required", ErrInvalid, where)
 		case ts.MinHoldSeconds < 0:
 			return nil, fmt.Errorf("%w: %s: min_hold_seconds must be >= 0", ErrInvalid, where)
+		case ts.BaselineWindowSeconds <= 0:
+			// BaselineWindow() has no default: 0 means the window holds only
+			// the sample just recorded, so p25=p50=p75=metric and every row
+			// reads zscore 0 / status ok forever — a permanent false calm.
+			return nil, fmt.Errorf("%w: %s: baseline_window_seconds must be > 0", ErrInvalid, where)
+		case lowerIsWorse[ts.Signal] && !(ts.ClearThreshold > ts.GraduateThreshold):
+			return nil, fmt.Errorf("%w: %s: signal %q is lower-is-worse: clear_threshold (%v) must be > graduate_threshold (%v) to leave a hysteresis band",
+				ErrInvalid, where, ts.Signal, ts.ClearThreshold, ts.GraduateThreshold)
+		case !lowerIsWorse[ts.Signal] && !(ts.ClearThreshold < ts.GraduateThreshold):
+			// Also catches omitted thresholds (0/0): no band, and the spec
+			// would graduate on every non-negative value once warm.
+			return nil, fmt.Errorf("%w: %s: signal %q is higher-is-worse: clear_threshold (%v) must be < graduate_threshold (%v) to leave a hysteresis band",
+				ErrInvalid, where, ts.Signal, ts.ClearThreshold, ts.GraduateThreshold)
 		}
 		switch ts.Severity {
 		case "", contract.SeverityInfo, contract.SeverityWarning:
@@ -171,6 +195,12 @@ func Load(path string) (*Manifest, error) {
 			return nil, fmt.Errorf("%w: %s: (check,target) collides with id %q — identical fingerprint %s would emit duplicate .prom series and clobber a spool doc", ErrInvalid, where, prev, fp)
 		}
 		seenFP[fp] = ts.ID
+		fk := ts.Target + "\x00" + ts.Feature
+		if prev, ok := seenFeature[fk]; ok {
+			return nil, fmt.Errorf("%w: %s: (target,feature) (%q,%q) is already used by id %q — the baseline store keys feature history by that pair, so the two specs would share one baseline",
+				ErrInvalid, where, ts.Target, ts.Feature, prev)
+		}
+		seenFeature[fk] = ts.ID
 	}
 	return &m, nil
 }

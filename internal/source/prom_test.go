@@ -91,6 +91,19 @@ func TestPromFailureMatrixIsNeverSilentOK(t *testing.T) {
 		{"prometheus error status fails fast", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`{"status":"error","error":"bad query"}`))
 		}, 1},
+		// Non-finite samples are unmeasurable, not values: NaN makes every
+		// comparison false (a Threshold sum silently reads as ok) and ±Inf
+		// cannot be JSON-encoded into the digest. histogram_quantile over an
+		// idle service and a ratio over a zero denominator both produce them.
+		{"NaN sample fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"NaN"]}]}}`))
+		}, 1},
+		{"+Inf sample fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752900000,"+Inf"]}]}}`))
+		}, 1},
+		{"-Inf sample fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"a":"1"},"value":[1752900000,"5"]},{"metric":{"a":"2"},"value":[1752900000,"-Inf"]}]}}`))
+		}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

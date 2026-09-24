@@ -184,3 +184,20 @@ func TestRenderAnalystPromRedactionPlaneLabelAvoidsCollision(t *testing.T) {
 		t.Errorf("tier3 redaction series must not also render the unlabeled Tier-1 shape:\n%s", tier3)
 	}
 }
+
+// heimdall_digest_rows_truncated_total is promised by contract/DIGEST_SCHEMA.md
+// and was never emitted. It renders as its own block so the detector can
+// append it to RenderProm's body, and the combined file keeps exactly one
+// HELP/TYPE pair per metric.
+func TestRenderDigestProm(t *testing.T) {
+	want := "# HELP heimdall_digest_rows_truncated_total Tier-2 digest rows dropped by the 200-row and 32 KB caps during the last run.\n" +
+		"# TYPE heimdall_digest_rows_truncated_total counter\n" +
+		"heimdall_digest_rows_truncated_total 7\n"
+	if diff := cmp.Diff(want, string(emit.RenderDigestProm(7))); diff != "" {
+		t.Errorf("RenderDigestProm mismatch (-want +got):\n%s", diff)
+	}
+	body := string(append(emit.RenderProm(time.Unix(1752900000, 0).UTC(), fixture(t), 0, time.Unix(1752900000, 0)), emit.RenderDigestProm(0)...))
+	if n := strings.Count(body, "# TYPE heimdall_digest_rows_truncated_total "); n != 1 {
+		t.Errorf("combined body has %d TYPE lines for the truncation metric, want 1", n)
+	}
+}

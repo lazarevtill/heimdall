@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -123,6 +124,18 @@ func TestVLFailureMatrixIsNeverSilentOK(t *testing.T) {
 		{"unparseable _hv field fails fast", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`{"_hv":"not-a-number","hostname":"host-a"}` + "\n"))
 		}, 1},
+		// json.Unmarshal(null, &float64) is a silent no-op, which used to
+		// coerce a null _hv to 0 — exactly the "calm" reading this source
+		// promises never to invent.
+		{"null _hv fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"_hv":null,"hostname":"host-a"}` + "\n"))
+		}, 1},
+		{"NaN string _hv fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"_hv":"NaN","hostname":"host-a"}` + "\n"))
+		}, 1},
+		{"Inf string _hv fails fast", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"_hv":"+Inf","hostname":"host-a"}` + "\n"))
+		}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +156,42 @@ func TestVLFailureMatrixIsNeverSilentOK(t *testing.T) {
 			}
 			if calls.Load() != tc.wantCalls {
 				t.Errorf("calls = %d, want %d", calls.Load(), tc.wantCalls)
+			}
+		})
+	}
+}
+
+// A body larger than the read cap must fail closed even when the cap lands
+// exactly on a row boundary. A bare LimitReader returns a clean EOF there, so
+// every row before the cut parses and the query used to read as a complete,
+// OK answer with rows silently missing (and a missing row can be the max).
+func TestVLOversizedBodyIsUnknownEvenOnRowBoundary(t *testing.T) {
+	const row = `{"_hv":1,"a":1}` + "\n" // 16 bytes
+	cases := []struct {
+		name    string
+		rows    int
+		maxBody int64
+		wantErr bool
+	}{
+		{"exactly at cap is complete", 4, 64, false},
+		{"one row over, cut on a row boundary", 5, 64, true},
+		{"cut mid-row", 5, 70, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestVL(t, "", "", func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(strings.Repeat(row, tc.rows)))
+			})
+			s.maxBody = tc.maxBody
+			sig, err := s.Query(context.Background(), Query{ID: "q1", Expr: "*"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && sig.State != contract.StateUnknown {
+				t.Errorf("State = %v, want StateUnknown (a truncated answer is not an answer)", sig.State)
+			}
+			if !tc.wantErr && len(sig.Samples) != tc.rows {
+				t.Errorf("samples = %d, want %d", len(sig.Samples), tc.rows)
 			}
 		})
 	}

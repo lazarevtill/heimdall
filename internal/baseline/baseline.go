@@ -18,6 +18,7 @@ package baseline
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -87,8 +88,15 @@ func Open(path string) (*Store, error) {
 // Close closes the underlying handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-// RecordFeature appends one observed feature value at now.
+// RecordFeature appends one observed feature value at now. A non-finite
+// value is refused: it is not an observation. NaN cannot be stored at all
+// (SQLite binds NaN as NULL, which the NOT NULL column rejects with an opaque
+// constraint error), and ±Inf would sit inside every quantile over the
+// baseline window, pinning p95 at +Inf until it ages out.
 func (s *Store) RecordFeature(now time.Time, entity, target, feature string, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("baseline: record feature %s/%s: non-finite value %v refused", target, feature, value)
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO features (ts, entity, target, feature, value) VALUES (?, ?, ?, ?, ?)`,
 		now.Unix(), entity, target, feature, value,
@@ -103,6 +111,9 @@ func (s *Store) RecordFeature(now time.Time, entity, target, feature string, val
 // (target,feature) observed within [now-window, now]. ok is false when there
 // are zero rows in range (the caller must treat "no baseline" as
 // baseline_warming / unknown, never as calm). n is the sample count used.
+// Non-finite rows are skipped: RecordFeature refuses them now, but a state.db
+// written before it did may still hold a ±Inf, and one such row would
+// otherwise poison every quantile for a whole baseline window.
 // Algorithm: type-7 linear interpolation between closest ranks (the
 // numpy/Go-stdlib-conventional default) over the ascending-sorted values.
 func (s *Store) Quantile(now time.Time, target, feature string, window time.Duration, q float64) (value float64, n int, ok bool, err error) {
@@ -121,6 +132,9 @@ func (s *Store) Quantile(now time.Time, target, feature string, window time.Dura
 		var v float64
 		if err := rows.Scan(&v); err != nil {
 			return 0, 0, false, fmt.Errorf("baseline: quantile scan %s/%s: %w", target, feature, err)
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
 		}
 		values = append(values, v)
 	}
@@ -227,6 +241,26 @@ ON CONFLICT(check_id, target) DO NOTHING`,
 		return time.Time{}, fmt.Errorf("baseline: mark crossing select %s/%s: %w", checkID, target, err)
 	}
 	return time.Unix(sinceUnix, 0).UTC(), nil
+}
+
+// Crossing is the READ-ONLY view of the crossing state: when (check_id,target)
+// entered the graduating zone, and whether it is in it at all. It never
+// creates, advances or resets a row, which is what lets tier2 consult it on
+// evaluations that must leave the hold timer untouched (the hold band, an
+// unmeasured signal, a warming baseline) — MarkCrossing would start a timer.
+func (s *Store) Crossing(checkID, target string) (since time.Time, ok bool, err error) {
+	var sinceUnix int64
+	err = s.db.QueryRow(
+		`SELECT since FROM crossing WHERE check_id=? AND target=?`,
+		checkID, target,
+	).Scan(&sinceUnix)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("baseline: crossing %s/%s: %w", checkID, target, err)
+	}
+	return time.Unix(sinceUnix, 0).UTC(), true, nil
 }
 
 // ClearCrossing removes any crossing record for (check_id,target) — called
