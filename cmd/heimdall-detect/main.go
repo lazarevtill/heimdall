@@ -197,7 +197,9 @@ func run() error {
 	}
 	digestFailures := digestReport.RedactionFailures
 
-	if err := led.RecordRun(now, findings); err != nil {
+	// Upsert only: this run's findings are recorded now, but nothing is
+	// resolved until the .prom below is written (see ResolveAbsent).
+	if err := led.Upsert(now, findings); err != nil {
 		return err
 	}
 	// Spool docs first, then the atomic .prom (docs must exist before the
@@ -215,6 +217,12 @@ func run() error {
 	body := append(emit.RenderProm(now, findings, redactionFailures+digestFailures, dg.GeneratedAt),
 		emit.RenderDigestProm(digestReport.RowsTruncated)...)
 	if err := emit.WriteFileAtomic(filepath.Join(cfg.TextfileDir, "heimdall.prom"), body); err != nil {
+		return err
+	}
+	// Only now, with this run's series out, is a finding it no longer
+	// produces resolved. Resolving earlier let a run that then failed its
+	// .prom write report a recovery while the old .prom still said firing.
+	if err := led.ResolveAbsent(findings); err != nil {
 		return err
 	}
 

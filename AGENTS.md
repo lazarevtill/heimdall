@@ -76,8 +76,8 @@ file wins and the guide is wrong.
 - `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
   `latest.json` + 14-day dated history).
 - `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
-  The detector records each complete run with `RecordRun`, which also resolves to `ok` every
-  row the run did not produce (an OK evaluation emits no finding).
+  After a run's `.prom` is written, the detector's `ResolveAbsent` marks `ok` every row that run
+  did not produce (an OK evaluation emits no finding); a failed run resolves nothing.
 - `internal/emit` — `.prom` render (frozen label set, no `state` label, no timestamps), atomic
   replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.

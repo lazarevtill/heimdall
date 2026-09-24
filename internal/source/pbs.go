@@ -51,9 +51,12 @@ func NewPBS(baseURL, tokenID, tokenSecret string, caPEM []byte, client *http.Cli
 			},
 		}
 	}
+	// The header is "PBSAPIToken=<id>:<secret>". PBS's auth layer accepts
+	// either a space or "=" after the scheme name; "=" is the form most PBS
+	// clients and examples send, so it is the one used here.
 	return &PBSSource{
 		base:       strings.TrimRight(baseURL, "/"),
-		authHeader: "PBSAPIToken " + tokenID + ":" + tokenSecret,
+		authHeader: "PBSAPIToken=" + tokenID + ":" + tokenSecret,
 		client:     client,
 		timeout:    15 * time.Second,
 		baseDelay:  250 * time.Millisecond,

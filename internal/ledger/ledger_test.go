@@ -121,10 +121,11 @@ func TestConcurrentUpserts(t *testing.T) {
 	}
 }
 
-// A check that evaluates OK emits no finding, so RecordRun resolves every
-// row a complete run did not produce, and only those. Unknown stays open
-// (fail-closed), a re-fire reopens, and lifetime figures survive a resolve.
-func TestRecordRunResolvesWhatARunNoLongerProduces(t *testing.T) {
+// A check that evaluates OK emits no finding, so ResolveAbsent resolves
+// every row a complete run did not produce, and only those. Unknown stays
+// open (fail-closed), a re-fire reopens, and lifetime figures survive a
+// resolve.
+func TestResolveAbsentResolvesWhatARunNoLongerProduces(t *testing.T) {
 	l, err := ledger.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -171,8 +172,11 @@ func TestRecordRunResolvesWhatARunNoLongerProduces(t *testing.T) {
 			map[string]string{"backup:ds1/vm-100": "firing", "backup:ds1/vm-101": "ok"}},
 	}
 	for i, st := range steps {
-		if err := l.RecordRun(t0.Add(time.Duration(i)*5*time.Minute), st.run); err != nil {
-			t.Fatalf("%s: RecordRun: %v", st.name, err)
+		if err := l.Upsert(t0.Add(time.Duration(i)*5*time.Minute), st.run); err != nil {
+			t.Fatalf("%s: Upsert: %v", st.name, err)
+		}
+		if err := l.ResolveAbsent(st.run); err != nil {
+			t.Fatalf("%s: ResolveAbsent: %v", st.name, err)
 		}
 		if diff := cmp.Diff(st.want, states()); diff != "" {
 			t.Errorf("%s: states (-want +got):\n%s", st.name, diff)

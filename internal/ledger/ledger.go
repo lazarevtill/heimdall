@@ -3,14 +3,16 @@
 // guarantee; see ADR-G03). One writer connection; pragmas ride the DSN so
 // every lazily opened connection is configured identically.
 //
-// The detector is the ledger's only writer. Each run records its complete
-// result with RecordRun, which is also how a finding resolves: an OK
-// evaluation emits no finding, so a fingerprint that a complete run did not
-// produce has recovered. Findings are never deleted (no GC yet).
+// The detector is the ledger's only writer. Each run upserts its findings
+// with Upsert before it emits anything, and once its heimdall.prom is
+// written, resolves with ResolveAbsent every row the run did not produce:
+// an OK evaluation emits no finding, so absence from a complete run is the
+// recovery. Findings are never deleted (no GC yet).
 package ledger
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -72,31 +74,12 @@ CREATE TABLE IF NOT EXISTS findings (
 	return nil
 }
 
-// Upsert records findings without resolving anything: new fingerprints
-// insert with count 1; recurring ones bump count and last_seen, preserving
-// first_seen. It suits a partial write (a test seeding one finding); the
-// detector records a complete run with RecordRun instead.
+// Upsert records the run's findings: new fingerprints insert with count 1;
+// recurring ones bump count and last_seen, preserving first_seen. It never
+// resolves anything; that is ResolveAbsent's job, once the run's output is
+// out. Transactions stay short: one quick tx.
 func (l *Ledger) Upsert(now time.Time, fs []contract.Finding) error {
-	return l.write(now, fs, false)
-}
-
-// RecordRun records one complete detector run. Every finding the run
-// produced is upserted exactly as Upsert does, and every other row still
-// firing or unknown is resolved to "ok": a check that evaluated OK emits no
-// finding, so leaving a complete run's output IS the recovery. Without it a
-// recovered finding read "firing" in the console forever, long after its
-// series left heimdall.prom and Alertmanager resolved it. An empty run
-// resolves everything. Both happen in one transaction, so a reader never
-// sees a half-resolved ledger. first_seen and count are lifetime figures
-// and survive a resolve; last_seen stays the last run that saw it non-ok.
-func (l *Ledger) RecordRun(now time.Time, fs []contract.Finding) error {
-	return l.write(now, fs, true)
-}
-
-// write runs the upsert, and with resolveAbsent the resolve, in one short
-// transaction; diffing happens in SQL, not in Go.
-func (l *Ledger) write(now time.Time, fs []contract.Finding, resolveAbsent bool) error {
-	if len(fs) == 0 && !resolveAbsent {
+	if len(fs) == 0 {
 		return nil
 	}
 	tx, err := l.db.Begin()
@@ -104,15 +87,6 @@ func (l *Ledger) write(now time.Time, fs []contract.Finding, resolveAbsent bool)
 		return fmt.Errorf("ledger: begin: %w", err)
 	}
 	defer tx.Rollback()
-	if resolveAbsent {
-		// Resolve every open row, then let the upsert below set this run's
-		// findings back to their real state. Inside one transaction that
-		// is exactly "resolve what this run did not produce".
-		ok := contract.StateOK.String()
-		if _, err := tx.Exec(`UPDATE findings SET state = ? WHERE state <> ?`, ok, ok); err != nil {
-			return fmt.Errorf("ledger: resolve: %w", err)
-		}
-	}
 	stmt, err := tx.Prepare(`
 INSERT INTO findings (fingerprint, check_id, target, state, severity, first_seen, last_seen, count)
 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -131,6 +105,36 @@ ON CONFLICT(fingerprint) DO UPDATE SET
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("ledger: commit: %w", err)
+	}
+	return nil
+}
+
+// ResolveAbsent marks "ok" every row still firing or unknown whose
+// fingerprint is not among fs, one complete run's findings. A check that
+// evaluated OK emits no finding, so leaving a complete run's output IS the
+// recovery; without this a recovered finding read "firing" in the console
+// forever. An empty fs resolves everything.
+//
+// The detector calls it only AFTER that run's heimdall.prom is written. A
+// run that fails before then keeps the old .prom, whose series still say
+// firing, and the ledger must not report a recovery the alerting path has
+// not seen. first_seen and count are lifetime figures and survive a
+// resolve; last_seen stays the last run that saw the finding non-ok.
+func (l *Ledger) ResolveAbsent(fs []contract.Finding) error {
+	fps := make([]string, len(fs))
+	for i, f := range fs {
+		fps[i] = f.Fingerprint
+	}
+	keep, err := json.Marshal(fps)
+	if err != nil {
+		return fmt.Errorf("ledger: resolve: %w", err)
+	}
+	ok := contract.StateOK.String()
+	if _, err := l.db.Exec(`
+UPDATE findings SET state = ?
+WHERE state <> ? AND fingerprint NOT IN (SELECT value FROM json_each(?))`,
+		ok, ok, string(keep)); err != nil {
+		return fmt.Errorf("ledger: resolve: %w", err)
 	}
 	return nil
 }
@@ -160,7 +164,7 @@ FROM findings WHERE fingerprint = ?`, fp).
 
 // List returns every ledger entry, most-recently-seen first. It is a pure
 // read — the operator UI renders from it and must never mutate finding
-// state (that authority belongs to the detector's RecordRun alone).
+// state (that authority belongs to the detector alone).
 //
 // Ordering is (last_seen DESC, fingerprint ASC): the fingerprint tiebreak
 // keeps the result deterministic when several findings share a run's

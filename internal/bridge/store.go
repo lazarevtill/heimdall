@@ -114,7 +114,34 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("bridge: migrate schema: %w", err)
 	}
+	if err := backfillIssueOpens(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bridge: migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// backfillIssueOpens copies into issue_opens the issues a bridge created
+// before issue_opens existed. Without it an upgrade forgot every issue opened
+// in the hour before the restart, and a storm in progress got a fresh full
+// MaxPerHour batch. It takes every created issue (issue_id set; an
+// "opening" intent row created nothing) opened within opensRetention of the
+// newest open, which is the same window RecordOpened keeps, so a row it has
+// pruned is never copied back. A (marker, issue_id) already present is
+// skipped, which makes it idempotent: the bridge and the console both run it
+// on every open, and it is one statement, so two openers cannot both insert.
+func backfillIssueOpens(db *sql.DB) error {
+	_, err := db.Exec(`
+INSERT INTO issue_opens (marker, issue_id, opened_at)
+SELECT i.marker, i.issue_id, i.opened_at FROM issues i
+WHERE i.issue_id <> ''
+  AND i.opened_at >= (SELECT MAX(opened_at) FROM issues) - ?
+  AND NOT EXISTS (SELECT 1 FROM issue_opens o WHERE o.marker = i.marker AND o.issue_id = i.issue_id)`,
+		int64(opensRetention/time.Second))
+	if err != nil {
+		return fmt.Errorf("backfill issue_opens: %w", err)
+	}
+	return nil
 }
 
 // ensureColumn adds column to table if it is not already there. Two

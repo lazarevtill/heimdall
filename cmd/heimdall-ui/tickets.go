@@ -23,7 +23,8 @@ import (
 //
 //  1. bridge.OpenStore runs CREATE TABLE IF NOT EXISTS on open, so the
 //     console may create empty tables on a database the bridge has not yet
-//     initialised.
+//     initialised. It also backfills issue_opens from issues (an INSERT of
+//     rows not yet there), the storm fuse's history across an upgrade.
 //  2. The outbox handle opened beside it (outbox.Open, cmd/heimdall-ui/main.go)
 //     runs backfillLegacyDeliveries — an INSERT OR IGNORE into
 //     notify_delivery — on EVERY open. That is a data-row write, not just
