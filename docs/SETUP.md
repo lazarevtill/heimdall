@@ -108,7 +108,7 @@ HEIMDALL_YOUTRACK_PROJECT=HEIM
 HEIMDALL_SPOOL_DIR=/var/lib/heimdall/findings   # richer ticket bodies; falls back to annotations
 HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_STORM_FUSE_PER_HOUR=10                 # default 10
-HEIMDALL_ANALYST_TICKET_POLICY=telegram-only    # default
+HEIMDALL_ANALYST_TICKET_POLICY=telegram_only    # default
 HEIMDALL_YOUTRACK_ASSIGNEE=someone
 ```
 
