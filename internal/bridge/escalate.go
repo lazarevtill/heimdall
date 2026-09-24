@@ -132,32 +132,25 @@ func EscalationSweep(ctx context.Context, now time.Time, d Deps) (SweepResult, e
 			continue
 		}
 
-		issue, err := d.Tracker.FindByMarker(ctx, row.Marker)
-		if err != nil {
-			fail("find by marker", row.Marker, err)
+		// Re-read and re-qualify UNDER the lock: ListOpen's snapshot may be
+		// stale by now (a resolve + re-fire starts a new episode, with a new
+		// issue and a fresh firing_since), and acting on it would escalate
+		// the new episode at once.
+		var outcome escalationOutcome
+		if err := d.serialize(ctx, func() error {
+			var err error
+			outcome, err = escalateOne(ctx, now, d, row)
+			return err
+		}); err != nil {
+			step := outcome.step
+			if step == "" {
+				step = "lock" // Serialize could not take the lock in time
+			}
+			fail(step, row.Marker, err)
 			continue
 		}
-		if issue == nil || humanAssigned(issue.Assignee, d.DefaultAssignee) {
+		if outcome.skipped {
 			result.Skipped++
-			continue
-		}
-
-		if err := d.Tracker.Priority(ctx, issue.ID, "Show-stopper"); err != nil {
-			fail("priority", row.Marker, err)
-			continue
-		}
-		if err := d.Tracker.Comment(ctx, issue.ID, escalationNote(EscalationGrace)); err != nil {
-			fail("comment", row.Marker, err)
-			continue
-		}
-		idem := "escalate-" + row.Marker // parsed by the notifier; never change its shape
-		body := escalationRePing(row.Group, row.Check, issue.ID, EscalationGrace)
-		if _, err := d.Outbox.EnqueueOrRearm(now, outbox.ChannelMain, body, idem, row.FiringSince); err != nil {
-			fail("enqueue re-ping", row.Marker, err)
-			continue
-		}
-		if err := d.Store.MarkEscalated(row.Marker); err != nil {
-			fail("mark escalated", row.Marker, err)
 			continue
 		}
 		result.Escalated++
@@ -166,4 +159,47 @@ func EscalationSweep(ctx context.Context, now time.Time, d Deps) (SweepResult, e
 		return result, fmt.Errorf("bridge: escalation sweep: %w", errors.Join(errs...))
 	}
 	return result, nil
+}
+
+// escalationOutcome is escalateOne's result: skipped, or which step failed.
+type escalationOutcome struct {
+	skipped bool
+	step    string // the failing step's name, for the sweep's error text
+}
+
+// escalateOne escalates one candidate. It runs under Deps.Serialize, so it
+// first re-reads the ledger row: if the episode changed since ListOpen (a
+// new firing_since), was resolved, or no longer qualifies, it skips.
+func escalateOne(ctx context.Context, now time.Time, d Deps, snap IssueRow) (escalationOutcome, error) {
+	row, found, err := d.Store.GetIssue(snap.Marker)
+	if err != nil {
+		return escalationOutcome{step: "re-read"}, err
+	}
+	if !found || row.State != StateOpen || !row.FiringSince.Equal(snap.FiringSince) || !qualifies(now, d, row) {
+		return escalationOutcome{skipped: true}, nil
+	}
+
+	issue, err := d.Tracker.FindByMarker(ctx, row.Marker)
+	if err != nil {
+		return escalationOutcome{step: "find by marker"}, err
+	}
+	if issue == nil || humanAssigned(issue.Assignee, d.DefaultAssignee) {
+		return escalationOutcome{skipped: true}, nil
+	}
+
+	if err := d.Tracker.Priority(ctx, issue.ID, "Show-stopper"); err != nil {
+		return escalationOutcome{step: "priority"}, err
+	}
+	if err := d.Tracker.Comment(ctx, issue.ID, escalationNote(EscalationGrace)); err != nil {
+		return escalationOutcome{step: "comment"}, err
+	}
+	idem := "escalate-" + row.Marker // parsed by the notifier; never change its shape
+	body := escalationRePing(row.Group, row.Check, issue.ID, EscalationGrace)
+	if _, err := d.Outbox.EnqueueOrRearm(now, outbox.ChannelMain, body, idem, row.FiringSince); err != nil {
+		return escalationOutcome{step: "enqueue re-ping"}, err
+	}
+	if err := d.Store.MarkEscalated(row.Marker); err != nil {
+		return escalationOutcome{step: "mark escalated"}, err
+	}
+	return escalationOutcome{}, nil
 }

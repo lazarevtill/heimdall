@@ -46,6 +46,22 @@ type Deps struct {
 	// issue (findings and hypothesis tickets) is assigned to. "" leaves new
 	// issues unassigned.
 	DefaultAssignee string
+	// Serialize, if set, runs fn holding the same lock the caller uses to
+	// serialise Reconcile/HandleHypothesis, or returns an error if the lock
+	// cannot be had before ctx is done. EscalationSweep takes it PER
+	// CANDIDATE (never for the whole sweep, which would stall /am), so a
+	// resolve + re-fire landing mid-sweep cannot have the sweep escalate the
+	// new, young episode's issue on the strength of the old episode's row.
+	// nil runs fn directly (single-threaded callers, tests).
+	Serialize func(ctx context.Context, fn func() error) error
+}
+
+// serialize runs fn under d.Serialize when one is set.
+func (d Deps) serialize(ctx context.Context, fn func() error) error {
+	if d.Serialize == nil {
+		return fn()
+	}
+	return d.Serialize(ctx, fn)
 }
 
 // ReconcileResult reports what one Reconcile call did, for metrics/logging.
@@ -321,7 +337,8 @@ func stormBucket(now time.Time) string {
 // UNRESOLVED issue carries that marker, and then either open (subject to
 // the storm fuse), reconcile the checklist (+ a per-target mute-gated
 // recurrence comment), or close (ONLY when the issue is heimdall-auto AND
-// every target has recovered AND the payload was not truncated).
+// every target has recovered AND the delivery is the whole group: not
+// truncated, and grouped by exactly [group, check]).
 //
 // Episodes. The ledger row's state tracks the GROUP, not the ticket: it is
 // set "resolved" whenever the group recovers, including on an issue a human
@@ -381,7 +398,14 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 			alertFor[target] = a
 		}
 	}
-	partial := w.TruncatedAlerts > 0
+	// partial: this delivery may not carry the whole (group, check) target
+	// set, so an absent target is unknown (not gone) and "everything shown
+	// is resolved" does not prove the group resolved. Two ways: Alertmanager
+	// truncated the alert list, or the route groups by MORE labels than
+	// [group, check] (a severity label, or '...'), which splits one ticket's
+	// targets across several Alertmanager groups — a resolved subgroup would
+	// otherwise close a ticket whose sibling targets are still firing.
+	partial := w.TruncatedAlerts > 0 || len(w.GroupLabels) != 2
 
 	var firingSince time.Time
 	for _, a := range firingAlerts {

@@ -163,6 +163,16 @@ func (s *server) deps(authority *suppress.Authority) bridge.Deps {
 		SpoolDir:        s.spoolDir,
 		Fuse:            s.fuse,
 		DefaultAssignee: s.assignee,
+		// EscalationSweep takes the request lock per candidate. Reconcile
+		// and HandleHypothesis never call it (their handler already holds
+		// the lock), so this cannot self-deadlock.
+		Serialize: func(ctx context.Context, fn func() error) error {
+			if !s.lockTracker(ctx) {
+				return fmt.Errorf("tracker lock not available: %w", ctx.Err())
+			}
+			defer s.unlockTracker()
+			return fn()
+		},
 	}
 }
 

@@ -75,10 +75,39 @@ func TestReadHeartbeatsAcrossFiles(t *testing.T) {
 			t.Errorf("%s = %v, want %v", name, got[name], want)
 		}
 	}
-	// The bridge writes no textfile at all — it must NOT appear here, so
-	// BuildComponents renders it as absent rather than healthy.
+	// No bridge file was written in this fixture, so the bridge must NOT
+	// appear here, and BuildComponents renders it as absent, not healthy.
 	if _, ok := got["bridge"]; ok {
-		t.Error("bridge must not be sourced from a textfile — it renders no heartbeat")
+		t.Error("bridge appeared with no heimdall-bridge.prom on disk")
+	}
+}
+
+// The bridge's heartbeat is its sweep's last CLEAN pass, 0 until the first.
+// A 0 is "no success yet" — never a sighting dated 1970 (or, worse, one the
+// strip would render as present).
+func TestReadHeartbeatsBridgeSweepGauge(t *testing.T) {
+	swept := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		value    string
+		want     time.Time
+		wantSeen bool
+	}{
+		{"a clean sweep is a sighting", strconv.FormatInt(swept.Unix(), 10), swept, true},
+		{"0 until the first clean sweep is not", "0", time.Time{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeProm(t, dir, "heimdall-bridge.prom", "heimdall_bridge_sweep_last_success_timestamp_seconds "+tc.value+"\n")
+			got, err := ReadHeartbeats(dir)
+			if err != nil {
+				t.Fatalf("ReadHeartbeats: %v", err)
+			}
+			ts, seen := got["bridge"]
+			if seen != tc.wantSeen || !ts.Equal(tc.want) {
+				t.Errorf("bridge = (%v, %v), want (%v, %v)", ts, seen, tc.want, tc.wantSeen)
+			}
+		})
 	}
 }
 

@@ -311,3 +311,47 @@ func TestEscalationSweepSkipsAnIssueAHumanResolved(t *testing.T) {
 		t.Errorf("result mismatch (-want +got):\n%s", diff)
 	}
 }
+
+// The sweep acts on ListOpen's snapshot, but a resolve + re-fire can land
+// between that read and the escalation, starting a NEW episode (a fresh
+// firing_since, and in production a new issue). Each candidate is therefore
+// re-read and re-qualified under Deps.Serialize — the lock Reconcile runs
+// under — and a changed episode is skipped, never escalated on the old
+// episode's age.
+func TestEscalationSweepSkipsACandidateWhoseEpisodeChangedMidSweep(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	marker := "[hb:disk--smart-fail]"
+	seedEscalationCandidate(t, deps, ft, marker, "HEIM-1", "disk", "smart-fail", fixedNow.Add(-5*time.Hour), "", false, false)
+
+	locked := 0
+	deps.Serialize = func(ctx context.Context, fn func() error) error {
+		locked++
+		// What a Reconcile holding the lock just before us did: the group
+		// recovered and fired again a minute ago — a new, young episode.
+		if err := deps.Store.StartEpisode(bridge.IssueRow{
+			Marker: marker, IssueID: "HEIM-2", Group: "disk", Check: "smart-fail",
+			Severity: "critical", FiringSince: fixedNow.Add(-time.Minute), OpenedAt: fixedNow.Add(-time.Minute),
+			State: "open",
+		}); err != nil {
+			t.Fatalf("StartEpisode: %v", err)
+		}
+		return fn()
+	}
+
+	result, err := bridge.EscalationSweep(context.Background(), fixedNow, deps)
+	if err != nil {
+		t.Fatalf("EscalationSweep: %v", err)
+	}
+	if locked != 1 {
+		t.Errorf("Serialize called %d times, want once per qualifying candidate", locked)
+	}
+	if result.Escalated != 0 || result.Skipped != 1 {
+		t.Errorf("result = %+v, want the stale candidate skipped", result)
+	}
+	if len(ft.priorities) != 0 || len(ft.comments) != 0 {
+		t.Errorf("priorities = %v, comments = %v; want nothing done to either issue", ft.priorities, ft.comments)
+	}
+	if row := ledgerOf(t, deps, marker); row.Escalated {
+		t.Error("the new episode was marked escalated; its own re-ping would be lost")
+	}
+}

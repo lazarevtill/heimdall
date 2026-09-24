@@ -139,9 +139,26 @@ sub-field tells you whether the tracker credential works. `/healthz` never
 fails on YouTrack being down — it asserts the bridge and its own db, so read
 the sub-field rather than the status code.
 
-Then point Alertmanager at `POST /am`, sending the bearer token:
+Then point Alertmanager at `POST /am`, sending the bearer token. Route **only**
+`source="heimdall"` alerts to it, grouped by **exactly** `[group, check]`: the
+bridge keeps one ticket per `(group, check)`.
+- A delivery grouped by more labels (a `severity`, or `'...'`) splits one
+  ticket's targets across several Alertmanager groups. The bridge treats each
+  such delivery as a partial view: it merges the targets but never closes the
+  ticket, so the ticket will not auto-close.
+- Anything else routed to it (the `source="heimdall-meta"` alerts, other
+  apps' alerts) is refused with a `400`, which Alertmanager does not retry.
+  Those alerts must reach a native receiver.
 
 ```yaml
+route:
+  receiver: operators              # your native receiver: meta-rules and everything else
+  routes:
+    - matchers: [source="heimdall"]
+      receiver: heimdall-bridge
+      group_by: [group, check]
+      # how a finding's first page reaches people alongside its ticket
+      # (e.g. `continue: true` plus a native route) is your routing choice
 receivers:
   - name: heimdall-bridge
     webhook_configs:
@@ -251,9 +268,10 @@ before anything reaches a channel — and it writes the heartbeat, which is
 what clears `HeimdallAnalystAbsent` after a fresh deploy.
 
 A POST the bridge refuses (down, or a wrong `HEIMDALL_BRIDGE_TOKEN`) does not
-fail the run: the hypothesis stays in the run file, is retried next run, and
-is counted in `heimdall_analyst_hypotheses_post_failed_total`, which
-`HeimdallAnalystPostFailing` watches.
+fail the run. The hypothesis stays in the run file and is counted in
+`heimdall_analyst_hypotheses_post_failed_total`, which
+`HeimdallAnalystPostFailing` watches. It is not re-sent from the file, but no
+cooldown starts for it, so it posts again if a later run produces it again.
 
 ### 6. `heimdall-ui` — the console (optional)
 
@@ -347,12 +365,14 @@ crashed detector, a dead notifier, a stuck delivery channel, a dead analyst
 and a bridge Alertmanager cannot reach are all silent — the alerts that watch
 the watcher live in that file.
 
-`HeimdallBridgeUnreachable` needs two things the rest do not. This Prometheus
-must scrape Alertmanager's own metrics (it reads
-`alertmanager_notifications_failed_total`), and the alert must be **routed to
-an Alertmanager receiver that does not go through the bridge** — a native
-Telegram or email receiver. Routed like everything else, the one alert that
-says "the bridge is down" would be handed to the bridge.
+Every `source="heimdall-meta"` alert must be **routed to a native Alertmanager
+receiver** (Telegram, email), never to the bridge. The bridge accepts only
+`source="heimdall"` findings and refuses the rest with a `400`, which is
+never retried. So a meta-alert routed there is simply lost, and the alert that
+says "the bridge is down" could not arrive through the bridge anyway.
+`HeimdallBridgeUnreachable` also needs this Prometheus to scrape
+Alertmanager's own metrics (it reads
+`alertmanager_notifications_failed_total`).
 
 Confirm the rules actually loaded:
 

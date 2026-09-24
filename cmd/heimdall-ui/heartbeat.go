@@ -10,20 +10,22 @@ import (
 	"time"
 )
 
-// Heartbeat sources. Three of the four binaries publish their liveness as a
-// Prometheus textfile gauge; the console reads those files directly rather
+// Heartbeat sources. Every binary but the console publishes its liveness as
+// a Prometheus textfile gauge; the console reads those files directly rather
 // than querying Prometheus, so it keeps working when Prometheus is the thing
 // that is broken.
 //
-// The BRIDGE is deliberately absent from this list: it renders no .prom at
-// all, its liveness surface is its own /healthz endpoint. main probes that
-// separately when a URL is configured. It is reported as "absent" rather
-// than quietly omitted — a component with no evidence of life must never
-// render as healthy.
+// The bridge's gauge is its escalation sweep's last CLEAN pass, 0 until the
+// first one; a 0 is read as "not seen", never as a 1970 timestamp. When
+// HEIMDALL_UI_BRIDGE_HEALTHZ_URL is configured, main's live /healthz probe
+// also counts as a sighting. A component with no evidence of life is
+// reported as "absent" rather than quietly omitted — it must never render as
+// healthy.
 var heartbeatMetrics = map[string]string{
 	"detect":   "heimdall_last_run_timestamp_seconds",
 	"analyst":  "heimdall_analyst_last_success_timestamp_seconds",
 	"notifier": "heimdall_notifier_last_success_timestamp_seconds",
+	"bridge":   "heimdall_bridge_sweep_last_success_timestamp_seconds",
 }
 
 // ReadHeartbeats scans every .prom file in dir and returns the newest
@@ -83,8 +85,8 @@ func scanPromFile(path string) (map[string]time.Time, error) {
 				continue
 			}
 			secs, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				continue
+			if err != nil || secs <= 0 {
+				continue // unparseable, or 0 = "no success yet": not a sighting
 			}
 			ts := time.Unix(int64(secs), 0).UTC()
 			if cur, exists := out[component]; !exists || ts.After(cur) {

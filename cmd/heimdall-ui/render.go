@@ -400,7 +400,7 @@ const digestTmpl = `{{define "subtitle"}}{{if .Digest.Present}}{{.Digest.Counts.
 {{if .Digest.UnknownMarkers}}
 <div class="card t1">
   <div class="row"><span class="badge b1">Blind spots</span>
-    <span class="name" style="font-size:15px">{{len .Digest.UnknownMarkers}} feature(s) could not be measured</span></div>
+    <span class="name" style="font-size:15px">{{.Digest.UnknownCount}} feature(s) could not be measured</span></div>
   <p style="font-size:13px;line-height:1.55;color:var(--ink-700);margin:10px 0 0">
     These are not calm — they are unmeasured. The digest carries them explicitly so a blind spot is never
     mistaken for a quiet one.

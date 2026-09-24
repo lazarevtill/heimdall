@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 )
 
@@ -190,6 +191,38 @@ func TestActiveSilencesProjection(t *testing.T) {
 		t.Error("missing target silence")
 	} else if diff := cmp.Diff(map[string]string{"target": tgt.Matcher.Target}, s.Matchers); diff != "" {
 		t.Errorf("target silence matchers (-want +got):\n%s", diff)
+	}
+}
+
+// A target carrying userinfo is written to the .prom REDACTED (every label
+// value goes through contract.Redact), so both the Alertmanager projection
+// and the matcher must speak that form too: otherwise a target mute is shown
+// as active while its silence never matches the series, and the bridge —
+// which only ever sees the redacted label — keeps commenting on it.
+func TestTargetScopeSpeaksTheRedactedLabel(t *testing.T) {
+	const raw = "postgres://monitor@db.example.invalid:5432/app"
+	redacted := contract.Redact(raw)
+	if redacted == raw {
+		t.Fatalf("fixture %q is not redacted; the test proves nothing", raw)
+	}
+	rec := validTargetRec()
+	rec.Matcher.Target = raw
+	auth, _ := suppress.NewAuthority([]suppress.Suppression{rec}, nil)
+
+	silences := auth.ActiveSilences(fixedNow)
+	if len(silences) != 1 {
+		t.Fatalf("ActiveSilences = %d, want 1", len(silences))
+	}
+	if diff := cmp.Diff(map[string]string{"target": redacted}, silences[0].Matchers); diff != "" {
+		t.Errorf("silence matchers must name the label as the series carries it (-want +got):\n%s", diff)
+	}
+	for _, target := range []string{raw, redacted} {
+		if auth.MatchFields(fixedNow, "0000000000000001", "g", "c", target) == nil {
+			t.Errorf("MatchFields(target=%q) = nil, want the target mute (raw and redacted name the same target)", target)
+		}
+	}
+	if auth.MatchFields(fixedNow, "0000000000000001", "g", "c", "192.0.2.99") != nil {
+		t.Error("MatchFields matched an unrelated target")
 	}
 }
 

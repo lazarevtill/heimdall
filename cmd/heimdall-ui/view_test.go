@@ -325,6 +325,19 @@ func TestBuildComponentsReportsAbsentRatherThanOmitting(t *testing.T) {
 	if !byName["notifier"].Stale {
 		t.Error("40m without a heartbeat must read as stale (15m window)")
 	}
+
+	// Each component is judged by the window its own meta-rule pages on: a
+	// daily analyst 20h after its run, or the bridge between two 15-minute
+	// sweeps, is on schedule.
+	onSchedule := BuildComponents(fixedNow, map[string]time.Time{
+		"analyst": fixedNow.Add(-20 * time.Hour),
+		"bridge":  fixedNow.Add(-20 * time.Minute),
+	})
+	for _, c := range onSchedule {
+		if (c.Name == "analyst" || c.Name == "bridge") && c.Stale {
+			t.Errorf("%s: Stale = true on its normal cadence (age %s)", c.Name, c.Age)
+		}
+	}
 	for _, missing := range []string{"analyst", "bridge"} {
 		c := byName[missing]
 		if c.Present {

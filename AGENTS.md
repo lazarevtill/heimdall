@@ -31,7 +31,8 @@ file wins and the guide is wrong.
   `/healthz`; 15-min escalation sweep. Both POST routes require a bearer token
   (`HEIMDALL_BRIDGE_TOKEN`) unless `HEIMDALL_BRIDGE_AUTH=none` is chosen explicitly; every
   `Reconcile`/`HandleHypothesis` call is serialised (they are check-then-act, not
-  concurrency-safe); sweep heartbeat + counters go to `heimdall-bridge.prom`. `time.Now()` is
+  concurrency-safe), and the escalation sweep takes the same lock per candidate, re-reading it
+  first; sweep heartbeat + counters go to `heimdall-bridge.prom`. `time.Now()` is
   allowed in `cmd/`.
 - `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain
   (fanned out to every routed sink), Alertmanager silence reconcile, weekly digest, own heartbeat.

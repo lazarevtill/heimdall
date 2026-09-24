@@ -45,6 +45,17 @@ const (
 // inside the window (an analyst retry of the same run) stays a no-op.
 const HypothesisCooldown = 7 * 24 * time.Hour
 
+// hypothesisRearmSlack shortens the bridge's side of that window. The two
+// cooldowns are equal but read different clocks: the analyst measures from
+// its run START (before the LLM call), the bridge from when the previous
+// post ARRIVED (after it). With a daily timer the analyst's 7-day re-post
+// can therefore land a few minutes short of the bridge's 7 days — deduped,
+// and the analyst then starts another 7-day cooldown on a hypothesis nobody
+// was re-told about. The slack only has to exceed the analyst's run timeout
+// (300s); an hour also absorbs timer drift. A genuine retry of the same run
+// arrives minutes after the first post, far inside the window either way.
+const hypothesisRearmSlack = time.Hour
+
 // HypResult reports what one HandleHypothesis call did, for metrics/logging.
 type HypResult struct {
 	Enqueued          bool // routed to the analyst channel (a new entry, or Rearmed)
@@ -279,7 +290,7 @@ func HandleHypothesis(ctx context.Context, now time.Time, d Deps, post Hypothesi
 
 	body := buildHypothesisBody(clean)
 
-	outcome, err := d.Outbox.EnqueueOrRearm(now, outbox.ChannelAnalyst, body, idem, now.Add(-HypothesisCooldown))
+	outcome, err := d.Outbox.EnqueueOrRearm(now, outbox.ChannelAnalyst, body, idem, now.Add(-(HypothesisCooldown - hypothesisRearmSlack)))
 	if err != nil {
 		return result, fmt.Errorf("bridge: hypothesis: enqueue %s: %w", idem, err)
 	}

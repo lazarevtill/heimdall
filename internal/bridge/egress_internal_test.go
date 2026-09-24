@@ -44,6 +44,20 @@ func TestNeutralizeMentions(t *testing.T) {
 // egress path: when the redactor fails, the field is WITHHELD (never the raw
 // text) and every failure is counted, across every free-text field of the
 // issue body and of a hypothesis.
+// Free text must never carry a live ticket marker: the marker is a ticket's
+// identity, so a quoted one would make FindByMarker answer another group
+// with this ticket.
+func TestRedactorNeutralizesTicketMarkers(t *testing.T) {
+	var r redactor
+	got := r.text("see [hb:disk--smart-fail] and [hb:t3-deadbeefcafef00d]")
+	if want := "see [\u2060hb:disk--smart-fail] and [\u2060hb:t3-deadbeefcafef00d]"; got != want {
+		t.Errorf("text() = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "[hb:") {
+		t.Errorf("text() = %q still carries a live marker", got)
+	}
+}
+
 func TestRedactorCountsAndWithholdsFailures(t *testing.T) {
 	orig := evidenceOrWithheld
 	t.Cleanup(func() { evidenceOrWithheld = orig })

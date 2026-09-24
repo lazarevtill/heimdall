@@ -215,7 +215,9 @@ Find-by-marker-then-open and the storm fuse's count-then-open are
 check-then-act. Two concurrent Alertmanager deliveries for one group (an HA
 peer, or a retry overlapping a slow first attempt) opened two issues. The
 bridge's HTTP server serialises every call behind one lock. A new caller must
-do the same.
+do the same. `EscalationSweep` takes that lock per candidate
+(`Deps.Serialize`) and re-reads the row under it, so it never escalates a new
+episode using the old episode's age.
 
 **SQLite stores that share a file open their own handle** with the same WAL
 config and **never touch `PRAGMA user_version`** — that counter belongs to

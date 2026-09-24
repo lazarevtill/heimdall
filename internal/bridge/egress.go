@@ -16,7 +16,10 @@ import (
 //     the caller can export it as heimdall_redaction_failures_total
 //     {plane="bridge"}, which pages (invariant 3);
 //  2. neutralise @-mentions (neutralizeMentions). This must come second:
-//     the url-credentials pattern needs the raw "user:pass@" to match.
+//     the url-credentials pattern needs the raw "user:pass@" to match;
+//  3. neutralise ticket markers (neutralizeMarkers): a "[hb:<key>]" token
+//     is a ticket's IDENTITY — FindByMarker accepts any issue whose text
+//     carries it — so free text must never carry a live one.
 //
 // Fields that are not free text never come through here, because they are
 // grammar-constrained before use: group/check (tracker.FindingKey's
@@ -40,7 +43,19 @@ func (r *redactor) text(s string) string {
 	if failed {
 		r.failures++
 	}
-	return neutralizeMentions(out)
+	return neutralizeMarkers(neutralizeMentions(out))
+}
+
+// neutralizeMarkers inserts a word joiner inside every "[hb:" so the text
+// still reads the same but no longer matches the marker grammar. Without
+// it, model-written hypothesis text (or a log line that became evidence)
+// quoting "[hb:disk--smart-fail]" would give that ticket the identity of
+// another group's: FindByMarker would return it, and that group would be
+// commented on, escalated and closed THERE — LLM text choosing which ticket
+// a page lands on (invariant 2). The real marker is appended by
+// tracker.Open itself and never passes through this path.
+func neutralizeMarkers(s string) string {
+	return strings.ReplaceAll(s, "[hb:", "["+wordJoiner+"hb:")
 }
 
 // wordJoiner is U+2060 WORD JOINER: zero-width, invisible, and not a

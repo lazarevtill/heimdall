@@ -2,6 +2,7 @@ package contract_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -93,5 +94,30 @@ func TestCapRowsDeterministicTieBreak(t *testing.T) {
 	got := []string{kept[0].RowID, kept[1].RowID, kept[2].RowID}
 	if diff := cmp.Diff([]string{"a", "m", "z"}, got); diff != "" {
 		t.Errorf("tie-break order (-want +got):\n%s", diff)
+	}
+}
+
+// An echo list the digest writer capped ends in a "[truncated: N more]"
+// entry; EchoLen is what the list stands for, so a reader never reports the
+// cap (51) as the count during the wide outage it exists to describe.
+func TestEchoLen(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want int
+	}{
+		{"nil", nil, 0},
+		{"real entries only", []string{"a/f1", "b/f2"}, 2},
+		{"capped list", []string{"a/f1", "b/f2", fmt.Sprintf(contract.EchoTruncatedFmt, 948)}, 950},
+		{"only a truncation entry", []string{fmt.Sprintf(contract.EchoTruncatedFmt, 3)}, 3},
+		{"lookalike is a real entry", []string{"[truncated: 3 more] "}, 1},
+		{"truncation entry not last is a real entry", []string{fmt.Sprintf(contract.EchoTruncatedFmt, 3), "a/f1"}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := contract.EchoLen(tt.in); got != tt.want {
+				t.Errorf("EchoLen(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
 	}
 }

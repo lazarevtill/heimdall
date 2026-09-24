@@ -455,6 +455,11 @@ func TestHandleHypothesisRedeliversAfterTheCooldown(t *testing.T) {
 	}{
 		{"retry inside the cooldown", true, 24 * time.Hour, bridge.HypResult{Deduped: true}},
 		{"recurrence after the cooldown", true, 8 * 24 * time.Hour, bridge.HypResult{Enqueued: true, Rearmed: true}},
+		// The analyst's own 7 days run from its run START, so its re-post of
+		// a hypothesis whose first post landed after a slow LLM call can
+		// arrive minutes short of 7 days by the bridge's clock. That is
+		// still the recurrence, not a retry.
+		{"analyst re-post a few minutes short of 7 days", true, bridge.HypothesisCooldown - 5*time.Minute, bridge.HypResult{Enqueued: true, Rearmed: true}},
 		{"first delivery still pending", false, 8 * 24 * time.Hour, bridge.HypResult{Deduped: true}},
 	}
 	for _, tc := range cases {

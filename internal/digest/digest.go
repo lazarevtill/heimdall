@@ -44,8 +44,9 @@ const maxDigestBytes = 32 << 10
 const MaxEchoItems = 50
 
 // truncatedFmt is the entry that closes a partial echo list: "[truncated: N
-// more]". Never a real marker (those are "<target>/<feature>"-shaped).
-const truncatedFmt = "[truncated: %d more]"
+// more]" (contract.EchoTruncatedFmt, which readers parse with
+// contract.EchoLen). Never a real marker (those are "<target>/<feature>"-shaped).
+const truncatedFmt = contract.EchoTruncatedFmt
 
 // historyRetention is how long dated history files under <dir>/history/ are
 // kept; Write GCs anything older on every call.
@@ -107,13 +108,7 @@ func capEcho(in []string) []string {
 }
 
 // truncatedCount parses a truncatedFmt entry.
-func truncatedCount(s string) (int, bool) {
-	var n int
-	if _, err := fmt.Sscanf(s, truncatedFmt, &n); err != nil {
-		return 0, false
-	}
-	return n, fmt.Sprintf(truncatedFmt, n) == s
-}
+func truncatedCount(s string) (int, bool) { return contract.EchoTruncated(s) }
 
 // dropEcho removes the last REAL entry of an echo list, keeping (or adding)
 // the closing truncatedFmt entry with its count bumped. ok is false when the

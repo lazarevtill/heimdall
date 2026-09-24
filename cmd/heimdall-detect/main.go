@@ -253,7 +253,7 @@ func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Diges
 	}
 	log.Printf("run ok in %s: findings=%d (firing=%d unknown=%d ok=%d) digest_rows=%d unmeasurable=%d truncated=%d",
 		time.Since(now).Round(time.Millisecond), len(findings), firing, unknown, ok,
-		len(dg.Rows), len(dg.UnknownMarkers), rowsTruncated)
+		len(dg.Rows), contract.EchoLen(dg.UnknownMarkers), rowsTruncated)
 
 	// A redaction failure means content was WITHHELD rather than leaked. The
 	// finding still fires — content fail-closed, signal fail-open — and

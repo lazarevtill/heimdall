@@ -21,8 +21,12 @@ groups:
         annotations:
           summary: "Heimdall heartbeat series is absent"
           description: "Bootstrap gap, deleted textfile, or node_exporter rejected the .prom file (e.g. stray line timestamp). Absence is never treated as ok."
+      # The oneshots (detector, analyst) re-render this series per run, so
+      # "> 0" means "the last run withheld something". The bridge is a daemon
+      # and its plane="bridge" series counts since the process started, so
+      # there "> 0" would page until a restart; its rate is what matters.
       - alert: HeimdallRedactionFailure
-        expr: heimdall_redaction_failures_total > 0
+        expr: heimdall_redaction_failures_total{plane!="bridge"} > 0 or increase(heimdall_redaction_failures_total{plane="bridge"}[1h]) > 0
         labels:
           severity: critical
           source: heimdall-meta
@@ -107,16 +111,20 @@ groups:
           description: "The notifier renders one sample per routed (sink, channel) pair on every cycle, including zeroes, precisely so this series always exists. Its absence means the notifier is not writing its heartbeat file at all — cross-check HeimdallNotifierAbsent."
 
       # ── Bridge reachability ──────────────────────────────────────────
-      # heimdall-bridge renders no heartbeat of its own, yet it is the ONLY
-      # path from Alertmanager to every sink: a dead bridge loses every page
-      # while the notifier's heartbeat stays green (it drains an empty
-      # outbox, so its backlog reads 0). Watch it from the sending side
-      # instead — Alertmanager counts every webhook delivery that failed.
+      # heimdall-bridge is Alertmanager's path to YouTrack tickets and to
+      # the escalation re-pings. Its sweep heartbeat (HeimdallBridgeSweepStale
+      # below) proves the process is alive, not that Alertmanager can reach
+      # it: a wrong token, URL or firewall shows only on the sending side,
+      # where Alertmanager counts every webhook delivery that failed. The
+      # notifier's heartbeat stays green through all of it (it drains an
+      # empty outbox, so its backlog reads 0).
       #
-      # ROUTING: this alert MUST go to an Alertmanager receiver that does
-      # NOT go through the bridge (a native telegram/email/pushover
-      # receiver). Routed like every other alert, it would be handed to the
-      # very component it reports dead, and nobody would ever see it.
+      # ROUTING: this alert — like every source="heimdall-meta" alert —
+      # MUST go to a native Alertmanager receiver (telegram/email/pushover),
+      # never to the bridge. The bridge accepts only source="heimdall"
+      # alerts grouped by [group, check] and answers anything else 400,
+      # which Alertmanager does not retry; and routed to the bridge, the
+      # alert saying the bridge is unreachable could never arrive anyway.
       #
       # Scope: integration="webhook" counts every webhook receiver this
       # Alertmanager has; if the bridge is not the only one, narrow it with
@@ -133,7 +141,7 @@ groups:
           source: heimdall-meta
         annotations:
           summary: "Alertmanager cannot deliver to the heimdall-bridge webhook"
-          description: "Alertmanager's webhook deliveries have been failing for 10m. heimdall-bridge is down, unreachable, or refusing the requests (check its bearer token), so alerts are being detected and NOT reaching any sink or tracker. Check `curl <bridge>/healthz` and journalctl -u heimdall-bridge."
+          description: "Alertmanager's webhook deliveries have been failing for 10m. heimdall-bridge is down, unreachable, or refusing the requests (a 401 means the bearer token; a 400 usually means a non-heimdall alert was routed to it), so findings are NOT being ticketed or escalated. Check `curl <bridge>/healthz` and journalctl -u heimdall-bridge."
 
       # heimdall-bridge's own heartbeat: its escalation sweep runs at start
       # and every 15m, and advances this gauge only on a pass with no
@@ -194,4 +202,4 @@ groups:
           source: heimdall-meta
         annotations:
           summary: "The bridge refused {{ $value }} hypothesis POST(s) in the last analyst run"
-          description: "The analyst ran, but the bridge did not accept what it posted (down, or rejecting HEIMDALL_BRIDGE_TOKEN). The hypotheses are persisted in the analyst run directory and stay eligible to post next run; journalctl -u heimdall-analyst has the WARNING lines."
+          description: "The analyst ran, but the bridge did not accept what it posted (down, or rejecting HEIMDALL_BRIDGE_TOKEN). The hypotheses are persisted in the analyst run directory (not re-sent from there; they post again only if a later run produces them again); journalctl -u heimdall-analyst has the WARNING lines."

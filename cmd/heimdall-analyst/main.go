@@ -152,7 +152,7 @@ func run() error {
 	// bridge_auth says only WHETHER a token is configured — a 401 from the
 	// bridge is then one line away from its cause — never the token.
 	log.Printf("run start: run_id=%s digest_rows=%d digest_age=%s unmeasurable=%d dry_run=%t bridge_auth=%t",
-		runID, len(dg.Rows), digestAge, len(dg.UnknownMarkers), cfg.DryRun, cfg.BridgeToken != "")
+		runID, len(dg.Rows), digestAge, contract.EchoLen(dg.UnknownMarkers), cfg.DryRun, cfg.BridgeToken != "")
 
 	// persist is called by analyst.Run BEFORE any POST (invariant 7): the
 	// full AnalystRun is atomically written to <run_dir>/<run_id>.json.

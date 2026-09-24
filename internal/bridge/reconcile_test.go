@@ -932,6 +932,38 @@ func TestReconcileTruncatedPayloadNeverClosesOrDropsTargets(t *testing.T) {
 	}
 }
 
+// TestReconcileExtraGroupByLabelsNeverCloseOnASubgroup: a route that groups
+// by more than [group, check] (here severity) splits one ticket's targets
+// across several Alertmanager groups. Each delivery is then only part of
+// the group: the warning subgroup resolving must not close the ticket while
+// the critical target still fires.
+func TestReconcileExtraGroupByLabelsNeverCloseOnASubgroup(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	marker := "[hb:disk--smart-fail]"
+	bySeverity := func(sev string, alerts ...bridge.AMAlert) bridge.AMWebhook {
+		w := groupWebhook(alerts...)
+		w.GroupLabels = map[string]string{"group": "disk", "check": "smart-fail", "severity": sev}
+		return w
+	}
+	mustReconcile(t, fixedNow, deps, bySeverity("critical", alert("firing", "192.0.2.10", "critical", "fp-a", fixedNow)))
+	mustReconcile(t, fixedNow.Add(time.Minute), deps, bySeverity("warning", alert("firing", "192.0.2.11", "warning", "fp-b", fixedNow)))
+
+	res := mustReconcile(t, fixedNow.Add(2*time.Minute), deps, bySeverity("warning", alert("resolved", "192.0.2.11", "warning", "fp-b", fixedNow)))
+	if res.Closed || len(ft.transitions) != 0 {
+		t.Fatalf("Closed = %v, transitions = %v; want the ticket left open (192.0.2.10 still fires)", res.Closed, ft.transitions)
+	}
+	if got := ledgerOf(t, deps, marker).State; got != bridge.StateOpen {
+		t.Errorf("ledger state = %q, want open", got)
+	}
+	targets, err := deps.Store.GetTargets(marker)
+	if err != nil {
+		t.Fatalf("GetTargets: %v", err)
+	}
+	if diff := cmp.Diff(map[string]bool{"192.0.2.10": true, "192.0.2.11": false}, targets); diff != "" {
+		t.Errorf("checklist merges the subgroups (-want +got):\n%s", diff)
+	}
+}
+
 // TestReconcileNeverPostsAnEmptyComment: Alertmanager drops an alert once
 // its resolution was notified; the target leaving the set is not news.
 func TestReconcileNeverPostsAnEmptyComment(t *testing.T) {

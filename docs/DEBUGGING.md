@@ -214,9 +214,11 @@ jq '{generated_at, rows: (.rows|length), unknown_markers, rows_truncated}' \
   biting (`heimdall_digest_rows_truncated_total`). The caps keep non-ok rows
   preferentially, so what was dropped was calm, but sustained truncation is
   worth raising.
-- **An echo list ends in `"[truncated: N more]"`** → more than 50 entries.
-  During a wide outage that is expected for `open_tier1_findings` and
-  `unknown_markers`.
+- **An echo list ends in `"[truncated: N more]"`** → more than 50 entries;
+  the entry counts the rest, and the console and run logs include it in their
+  totals. During a wide outage that is expected for `unknown_markers`.
+  `open_tier1_findings` is capped at 50 too, but cut without a marker (it is
+  only a cross-link aid; the findings themselves page from the `.prom`).
 
 Dated history lives in `digest/history/` and is GC'd after 14 days.
 
@@ -240,9 +242,11 @@ Four things that look like bugs and are not:
 - **A hypothesis is in the file but nobody received it.** `persist` runs
   *before* any POST, runs under dry-run with zero posts, and survives a POST
   failure. The file is a strict superset of what was delivered. A POST the
-  bridge refused is counted in `heimdall_analyst_hypotheses_post_failed_total`
-  (and retried next run); one the bridge already held is logged as
-  `bridge_deduped`, not counted as posted.
+  bridge refused is counted in `heimdall_analyst_hypotheses_post_failed_total`.
+  It is not re-sent from the run file, but no cooldown starts for it, so it is
+  posted again if a later run produces the same `hyp_fp`. One the bridge
+  already held is logged as `bridge_deduped`, and one an operator muted as
+  `bridge_suppressed`. Neither is counted as posted.
 - **A citation vanished.** Every `evidence_row` is verified against the digest
   the analyst read; a row id that did not exist is dropped as a hallucination
   and counted. That is the wrapper working.

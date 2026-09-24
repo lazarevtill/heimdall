@@ -234,10 +234,11 @@ func (s *server) basePage(r *http.Request, title, nav string) (Page, error) {
 	return p, nil
 }
 
-// probeBridge asks the bridge's /healthz whether it is alive. The bridge is
-// the one binary that renders no heartbeat textfile, so this is the only
-// liveness signal available for it. An unconfigured URL reports "not seen",
-// which BuildComponents renders as absent rather than healthy.
+// probeBridge asks the bridge's /healthz whether it is alive right now. Its
+// textfile heartbeat only advances on a CLEAN escalation sweep (every 15
+// minutes), so a live probe is the fresher signal and counts as a sighting
+// too. An unconfigured URL reports "not seen"; the textfile then decides,
+// and with neither BuildComponents renders the bridge absent, never healthy.
 //
 // It runs on every page render, so it is bound to the REQUEST's context as
 // well as the client timeout: a browser that gives up on a slow page stops

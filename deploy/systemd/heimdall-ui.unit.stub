@@ -54,8 +54,8 @@
 #     HEIMDALL_SPOOL_DIR               the detector's per-finding redacted evidence docs.
 #                                      Unset means the detail page says evidence is
 #                                      unavailable rather than showing an empty box.
-#     HEIMDALL_UI_BRIDGE_HEALTHZ_URL   the bridge renders no heartbeat textfile; without
-#                                      this it is reported ABSENT rather than healthy
+#     HEIMDALL_UI_BRIDGE_HEALTHZ_URL   a live /healthz probe; without it the bridge's
+#                                      liveness comes from its sweep heartbeat textfile only
 #
 #   OPERATOR ACTIONS — opt-in, per action, as a FIXED argv. Nothing from an HTTP
 #   request ever reaches these command lines and no shell is involved. Unset means

@@ -331,8 +331,16 @@ type ComponentView struct {
 	Present bool
 }
 
-// heartbeatStaleAfter matches the meta-rules' 15-minute staleness window.
-const heartbeatStaleAfter = 15 * time.Minute
+// heartbeatStaleAfter is each component's staleness window, matching the
+// meta-rule that pages on it (deploy/alerts/heimdall-meta.rules.yml): a
+// single 15-minute window read the daily analyst as stale nearly all day,
+// and the bridge's 15-minute sweep as stale between two sweeps.
+var heartbeatStaleAfter = map[string]time.Duration{
+	"detect":   15 * time.Minute,               // HeimdallDetectorStale
+	"notifier": 15 * time.Minute,               // HeimdallNotifierStale
+	"bridge":   45 * time.Minute,               // HeimdallBridgeSweepStale
+	"analyst":  2*24*time.Hour + 5*time.Minute, // HeimdallAnalystStale
+}
 
 // BuildComponents renders the component liveness strip from parsed
 // heartbeat timestamps. A component with no entry in `seen` is reported
@@ -350,7 +358,7 @@ func BuildComponents(now time.Time, seen map[string]time.Time) []ComponentView {
 		out = append(out, ComponentView{
 			Name:    n,
 			Age:     HumanDuration(age),
-			Stale:   age > heartbeatStaleAfter,
+			Stale:   age > heartbeatStaleAfter[n],
 			Present: true,
 		})
 	}

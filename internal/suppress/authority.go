@@ -152,14 +152,20 @@ func (a *Authority) ActiveSilences(now time.Time) []Silence {
 		if r.Until == "never" {
 			continue
 		}
+		// Matcher values are projected through contract.Redact because that
+		// is what the series carry: internal/emit writes every .prom label
+		// value redacted, so a target with userinfo in it
+		// ("postgres://monitor@db:5432/app") is labelled
+		// "postgres://[REDACTED:url-credentials]@db:5432/app", and a silence
+		// on the raw value would never match its own series.
 		var matchers map[string]string
 		switch r.Scope {
 		case ScopeFingerprint:
-			matchers = map[string]string{"fingerprint": r.Matcher.Fingerprint}
+			matchers = map[string]string{"fingerprint": contract.Redact(r.Matcher.Fingerprint)}
 		case ScopeGroupCheck:
-			matchers = map[string]string{"group": r.Matcher.Group, "check": r.Matcher.Check}
+			matchers = map[string]string{"group": contract.Redact(r.Matcher.Group), "check": contract.Redact(r.Matcher.Check)}
 		case ScopeTarget:
-			matchers = map[string]string{"target": r.Matcher.Target}
+			matchers = map[string]string{"target": contract.Redact(r.Matcher.Target)}
 		default:
 			continue // analyst / hypothesis: no wire representation
 		}
