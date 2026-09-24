@@ -161,8 +161,12 @@ undeclared sink, a declared-but-never-routed sink, a missing credential.
 
 ### 5. `heimdall-analyst` — Tier 3 (optional)
 
-A oneshot, scheduled. Skip this entirely if you do not want an LLM tier;
-nothing else depends on it.
+A oneshot, scheduled **at least once a day** — the `HeimdallAnalystStale`
+meta-rule fires after two days plus the 5-minute run timeout without a
+successful run (so one failed daily run is tolerated), and should be tightened
+if you run it more often. Skip this entirely if you do not want an
+LLM tier; nothing else depends on it — but then drop the three
+`HeimdallAnalyst*` rules from the meta-rules rather than silencing them.
 
 ```
 HEIMDALL_DIGEST_DIR=/var/lib/heimdall/digest          # written by the detector
@@ -173,11 +177,18 @@ HEIMDALL_ANALYST_RUN_DIR=/var/lib/heimdall/analyst
 HEIMDALL_TEXTFILE_DIR=/var/lib/node_exporter
 # optional
 HEIMDALL_ANALYST_DRY_RUN=true    # analyse and persist, post nothing — use this first
+HEIMDALL_BRIDGE_TOKEN=...        # the bridge's bearer token, via LoadCredential, never inline
 ```
 
 Run it with `HEIMDALL_ANALYST_DRY_RUN=true` first and read a run file. It
 still writes the full run, so you can see exactly what the model produced
-before anything reaches a channel.
+before anything reaches a channel — and it writes the heartbeat, which is
+what clears `HeimdallAnalystAbsent` after a fresh deploy.
+
+A POST the bridge refuses (down, or a wrong `HEIMDALL_BRIDGE_TOKEN`) does not
+fail the run: the hypothesis stays in the run file, is retried next run, and
+is counted in `heimdall_analyst_hypotheses_post_failed_total`, which
+`HeimdallAnalystPostFailing` watches.
 
 ### 6. `heimdall-ui` — the console (optional)
 
@@ -267,8 +278,16 @@ unset — do not run the console as root to work around it.
 
 Load [`../deploy/alerts/heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml)
 into Prometheus. **This is not optional polish.** Until it is loaded, a
-crashed detector, a dead notifier and a stuck delivery channel are all
-silent — the alerts that watch the watcher live in that file.
+crashed detector, a dead notifier, a stuck delivery channel, a dead analyst
+and a bridge Alertmanager cannot reach are all silent — the alerts that watch
+the watcher live in that file.
+
+`HeimdallBridgeUnreachable` needs two things the rest do not. This Prometheus
+must scrape Alertmanager's own metrics (it reads
+`alertmanager_notifications_failed_total`), and the alert must be **routed to
+an Alertmanager receiver that does not go through the bridge** — a native
+Telegram or email receiver. Routed like everything else, the one alert that
+says "the bridge is down" would be handed to the bridge.
 
 Confirm the rules actually loaded:
 

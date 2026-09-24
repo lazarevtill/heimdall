@@ -88,3 +88,70 @@ groups:
         annotations:
           summary: "Heimdall per-sink backlog series is absent"
           description: "The notifier renders one sample per routed (sink, channel) pair on every cycle, including zeroes, precisely so this series always exists. Its absence means the notifier is not writing its heartbeat file at all — cross-check HeimdallNotifierAbsent."
+
+      # ── Bridge reachability ──────────────────────────────────────────
+      # heimdall-bridge renders no heartbeat of its own, yet it is the ONLY
+      # path from Alertmanager to every sink: a dead bridge loses every page
+      # while the notifier's heartbeat stays green (it drains an empty
+      # outbox, so its backlog reads 0). Watch it from the sending side
+      # instead — Alertmanager counts every webhook delivery that failed.
+      #
+      # ROUTING: this alert MUST go to an Alertmanager receiver that does
+      # NOT go through the bridge (a native telegram/email/pushover
+      # receiver). Routed like every other alert, it would be handed to the
+      # very component it reports dead, and nobody would ever see it.
+      #
+      # Scope: integration="webhook" counts every webhook receiver this
+      # Alertmanager has; if the bridge is not the only one, narrow it with
+      # the receiver label where your Alertmanager exposes it. It fires only
+      # while something is being sent (a dead bridge with nothing to carry
+      # has lost nothing yet), and only if this Prometheus scrapes
+      # Alertmanager's own metrics. The `for` rides out a bridge restart:
+      # Alertmanager retries, and a retry that lands lost nothing.
+      - alert: HeimdallBridgeUnreachable
+        expr: rate(alertmanager_notifications_failed_total{integration="webhook"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Alertmanager cannot deliver to the heimdall-bridge webhook"
+          description: "Alertmanager's webhook deliveries have been failing for 10m. heimdall-bridge is down, unreachable, or refusing the requests (check its bearer token), so alerts are being detected and NOT reaching any sink or tracker. Check `curl <bridge>/healthz` and journalctl -u heimdall-bridge."
+
+      # ── Analyst liveness ─────────────────────────────────────────────
+      # heimdall-analyst is a oneshot on a timer, and it writes its
+      # heartbeat ONLY after a successful run: a dead or unhealthy LLM, an
+      # unreadable digest, a model reply outside the schema — every hard
+      # failure — withholds it. The threshold assumes the timer fires at
+      # least once a day (docs/SETUP.md): two periods plus the 300s run
+      # timeout, so one failed run is tolerated and two in a row are not.
+      # Run more often and it can be tightened to 2 x period + 300s.
+      #
+      # Tier 3 is optional. If it is deliberately not deployed, drop these
+      # rules rather than silencing them. They warn rather than page for the
+      # same reason HeimdallSinkBacklogWarning does: the analyst channel is
+      # low-urgency by construction (G1: a hypothesis can never page).
+      - alert: HeimdallAnalystStale
+        expr: time() - heimdall_analyst_last_success_timestamp_seconds > 2 * 86400 + 300
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall analyst has not completed a run in 2 days"
+          description: "The analyst heartbeat stopped advancing: the LLM health gate is failing, the model call or its reply is failing, or the timer is not firing. Nothing is being analysed. journalctl -u heimdall-analyst names the failure."
+      - alert: HeimdallAnalystAbsent
+        expr: absent(heimdall_analyst_last_success_timestamp_seconds)
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall analyst heartbeat series is absent"
+          description: "The analyst has never completed a run here, its textfile was deleted, or node_exporter is not serving it. Absence is never treated as ok. Right after deploying, run it once by hand (HEIMDALL_ANALYST_DRY_RUN=true is enough) to create the series."
+      - alert: HeimdallAnalystPostFailing
+        expr: heimdall_analyst_hypotheses_post_failed_total > 0
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "The bridge refused {{ $value }} hypothesis POST(s) in the last analyst run"
+          description: "The analyst ran, but the bridge did not accept what it posted (down, or rejecting HEIMDALL_BRIDGE_TOKEN). The hypotheses are persisted in the analyst run directory and stay eligible to post next run; journalctl -u heimdall-analyst has the WARNING lines."

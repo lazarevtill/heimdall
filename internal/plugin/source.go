@@ -165,14 +165,19 @@ func (s *SourcePlugin) Query(ctx context.Context, q source.Query) (source.Signal
 	for i, sm := range ws.Samples {
 		samples[i] = source.Sample{Labels: sm.Labels, Value: sm.Value}
 	}
-	sigErr := ws.Err
+	// Err is plugin-authored text on its way to finding evidence, so the
+	// injected credential's exact value is scrubbed out of it here, the same
+	// as Run does for stderr (see scrubbedSecret).
+	sigErr := scrubSecret(ws.Err, s.secret)
 	if state := parseState(ws.State); state == contract.StateUnknown && ws.State != "unknown" {
 		// The plugin sent something other than "ok"/"firing"/"unknown" for
 		// this query — the fail-closed state decode (rule 6): degrade this
 		// one signal to Unknown and carry the raw wire string in Err so the
 		// garbled value is visible for diagnosis, rather than losing it
 		// behind whatever (possibly empty) Err the plugin itself set.
-		sigErr = fmt.Sprintf("unrecognized state %q from plugin", ws.State)
+		// Scrubbed BEFORE %q: quoting escapes characters, and an escaped
+		// credential would no longer match its own value.
+		sigErr = fmt.Sprintf("unrecognized state %q from plugin", scrubSecret(ws.State, s.secret))
 	}
 	return source.Signal{
 		QueryID: q.ID,

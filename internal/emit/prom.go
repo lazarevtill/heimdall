@@ -32,8 +32,10 @@ const (
 
 	helpAnalystLastSuccess = "# HELP heimdall_analyst_last_success_timestamp_seconds Unix time of the last successful Tier-3 analyst run.\n" +
 		"# TYPE heimdall_analyst_last_success_timestamp_seconds gauge\n"
-	helpAnalystPosted = "# HELP heimdall_analyst_hypotheses_posted_total Hypotheses POSTed to the bridge during the last analyst run.\n" +
+	helpAnalystPosted = "# HELP heimdall_analyst_hypotheses_posted_total Hypotheses the bridge enqueued as new messages during the last analyst run.\n" +
 		"# TYPE heimdall_analyst_hypotheses_posted_total counter\n"
+	helpAnalystPostFailed = "# HELP heimdall_analyst_hypotheses_post_failed_total Hypotheses the bridge did not accept during the last analyst run; each stays eligible to post next run.\n" +
+		"# TYPE heimdall_analyst_hypotheses_post_failed_total counter\n"
 	helpAnalystHallucinated = "# HELP heimdall_analyst_hypotheses_hallucinated_total Hypotheses dropped for citing an empty or nonexistent evidence row_id.\n" +
 		"# TYPE heimdall_analyst_hypotheses_hallucinated_total counter\n"
 	helpAnalystDeduped = "# HELP heimdall_analyst_hypotheses_deduped_total Hypotheses dropped: the same hyp_fp was posted within the cooldown window.\n" +
@@ -135,12 +137,19 @@ func RenderDigestProm(rowsTruncated int) []byte {
 // plane's series independently. HELP/TYPE text is reused byte-identical
 // from helpRedaction (see the package doc: inconsistent HELP across files
 // poisons the scrape).
-func RenderAnalystProm(now time.Time, posted, hallucinated, deduped, capped, invalidDropped, redactionFailures int) []byte {
+//
+// posted counts only hypotheses the bridge enqueued as NEW messages;
+// postFailed counts those it did not accept at all. Without the second
+// series a bridge refusing every POST (down, or rejecting the analyst's
+// token) was indistinguishable from a model with nothing to say.
+func RenderAnalystProm(now time.Time, posted, postFailed, hallucinated, deduped, capped, invalidDropped, redactionFailures int) []byte {
 	var b bytes.Buffer
 	b.WriteString(helpAnalystLastSuccess)
 	b.WriteString("heimdall_analyst_last_success_timestamp_seconds " + strconv.FormatInt(now.Unix(), 10) + "\n")
 	b.WriteString(helpAnalystPosted)
 	b.WriteString("heimdall_analyst_hypotheses_posted_total " + strconv.Itoa(posted) + "\n")
+	b.WriteString(helpAnalystPostFailed)
+	b.WriteString("heimdall_analyst_hypotheses_post_failed_total " + strconv.Itoa(postFailed) + "\n")
 	b.WriteString(helpAnalystHallucinated)
 	b.WriteString("heimdall_analyst_hypotheses_hallucinated_total " + strconv.Itoa(hallucinated) + "\n")
 	b.WriteString(helpAnalystDeduped)

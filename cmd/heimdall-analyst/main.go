@@ -64,6 +64,7 @@ type config struct {
 	RunDir      string // HEIMDALL_ANALYST_RUN_DIR; <run_id>.json persisted here
 	TextfileDir string // HEIMDALL_TEXTFILE_DIR; heimdall-analyst.prom written here
 	DryRun      bool   // HEIMDALL_ANALYST_DRY_RUN=1|true (optional)
+	BridgeToken string // HEIMDALL_BRIDGE_TOKEN (optional): bearer for /hypothesis. NEVER logged.
 }
 
 // loadConfig reads through the supplied getenv (os.Getenv in main; a map
@@ -78,6 +79,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		StateDB:     getenv("HEIMDALL_ANALYST_STATE_DB"),
 		RunDir:      getenv("HEIMDALL_ANALYST_RUN_DIR"),
 		TextfileDir: getenv("HEIMDALL_TEXTFILE_DIR"),
+		BridgeToken: getenv("HEIMDALL_BRIDGE_TOKEN"),
 	}
 	required := []struct{ name, val string }{
 		{"HEIMDALL_DIGEST_DIR", c.DigestDir},
@@ -134,7 +136,7 @@ func run() error {
 	defer store.Close()
 
 	a := llm.NewClient(cfg.LLMURL, &http.Client{})
-	poster := analyst.NewHTTPPoster(cfg.BridgeURL, &http.Client{})
+	poster := analyst.NewHTTPPoster(cfg.BridgeURL, &http.Client{}, cfg.BridgeToken)
 
 	now := time.Now().UTC() // the only time.Now() in the program
 	runID := now.Format("20060102T150405Z")
@@ -147,8 +149,10 @@ func run() error {
 	if !dg.GeneratedAt.IsZero() {
 		digestAge = now.Sub(dg.GeneratedAt).Round(time.Second).String()
 	}
-	log.Printf("run start: run_id=%s digest_rows=%d digest_age=%s unmeasurable=%d dry_run=%t",
-		runID, len(dg.Rows), digestAge, len(dg.UnknownMarkers), cfg.DryRun)
+	// bridge_auth says only WHETHER a token is configured — a 401 from the
+	// bridge is then one line away from its cause — never the token.
+	log.Printf("run start: run_id=%s digest_rows=%d digest_age=%s unmeasurable=%d dry_run=%t bridge_auth=%t",
+		runID, len(dg.Rows), digestAge, len(dg.UnknownMarkers), cfg.DryRun, cfg.BridgeToken != "")
 
 	// persist is called by analyst.Run BEFORE any POST (invariant 7): the
 	// full AnalystRun is atomically written to <run_dir>/<run_id>.json.
@@ -191,7 +195,7 @@ func run() error {
 	// Success: atomically write the heartbeat + per-run drop counters.
 	return emit.WriteFileAtomic(
 		filepath.Join(cfg.TextfileDir, "heimdall-analyst.prom"),
-		emit.RenderAnalystProm(now, outcome.Posted, outcome.Hallucinated,
+		emit.RenderAnalystProm(now, outcome.Posted, outcome.PostFailed, outcome.Hallucinated,
 			outcome.Deduped, outcome.CapDropped, outcome.InvalidDropped, outcome.RedactionFailures),
 	)
 }
@@ -202,6 +206,8 @@ func run() error {
 // output is untrusted free text; it is redacted at the analyst egress and
 // again at the bridge. Writing any of it to a log would put unvetted,
 // LLM-authored prose on the syslog path, around both of those boundaries.
+// The WARNING lines for POST-stage failures are no exception: they carry a
+// wrapper-computed hyp_fp and a transport error, never the model's text.
 //
 // The drop counters matter more here than anywhere else in the system,
 // because the run FILE keeps only survivors: a hypothesis dropped as
@@ -211,10 +217,19 @@ func run() error {
 // nobody thought to graph.
 func logAnalystOutcome(now time.Time, runID string, dryRun bool, o analyst.Outcome) {
 	dropped := o.Hallucinated + o.InvalidDropped + o.Deduped + o.CapDropped
-	log.Printf("run ok in %s: run_id=%s posted=%d dropped=%d (hallucinated=%d invalid=%d deduped=%d capped=%d) nothing_notable=%t tokens=%d/%d",
-		time.Since(now).Round(time.Millisecond), runID, o.Posted, dropped,
+	log.Printf("run ok in %s: run_id=%s posted=%d bridge_deduped=%d bridge_suppressed=%d post_failed=%d dropped=%d (hallucinated=%d invalid=%d deduped=%d capped=%d) nothing_notable=%t tokens=%d/%d",
+		time.Since(now).Round(time.Millisecond), runID, o.Posted, o.BridgeDeduped, o.BridgeSuppressed, o.PostFailed, dropped,
 		o.Hallucinated, o.InvalidDropped, o.Deduped, o.CapDropped,
 		o.Run.NothingNotable, o.PromptTokens, o.CompletionTokens)
+
+	// The run's non-fatal failures (a POST the bridge refused, a cooldown
+	// write that failed). internal/analyst returns them rather than logging
+	// them itself; they pass through contract.Safe like every error that
+	// reaches a log line, because net/http puts the request URL in its
+	// error text.
+	for _, err := range o.Errors {
+		log.Printf("WARNING: %v", contract.Safe(err))
+	}
 
 	if dryRun && len(o.Run.Findings) > 0 {
 		log.Printf("dry run: %d hypothesis(es) were persisted to the run directory and POSTED NOWHERE", len(o.Run.Findings))

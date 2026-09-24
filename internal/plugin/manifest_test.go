@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -131,6 +132,21 @@ func TestManifestValidate(t *testing.T) {
 		{"non-positive max output bytes", func() Manifest {
 			m := validSource()
 			m.Budgets.MaxOutputBytes = 0
+			return m
+		}, true},
+		{"max output bytes at the host bound accepted", func() Manifest {
+			m := validSource()
+			m.Budgets.MaxOutputBytes = MaxOutputBytesLimit
+			return m
+		}, false},
+		{"max output bytes over the host bound rejected", func() Manifest {
+			m := validSource()
+			m.Budgets.MaxOutputBytes = MaxOutputBytesLimit + 1
+			return m
+		}, true},
+		{"max output bytes MaxInt rejected", func() Manifest {
+			m := validSource()
+			m.Budgets.MaxOutputBytes = math.MaxInt
 			return m
 		}, true},
 		{"negative memory", func() Manifest {

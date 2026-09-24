@@ -21,38 +21,61 @@ var fixedNow = time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 const testCooldown = 7 * 24 * time.Hour
 
 // fakeAnalyzer is the hermetic Analyzer seam: it never talks to a real LLM.
+// It records the last request, so a test can see exactly what would have
+// been sent to the model.
 type fakeAnalyzer struct {
 	healthErr  error
 	result     llm.Result
 	analyzeErr error
 	analyzed   bool
+	req        llm.Request
 }
 
 func (f *fakeAnalyzer) Health(ctx context.Context) error { return f.healthErr }
 func (f *fakeAnalyzer) Analyze(ctx context.Context, req llm.Request) (llm.Result, error) {
 	f.analyzed = true
+	f.req = req
 	return f.result, f.analyzeErr
 }
 
-// fakePoster records every hypothesis it is asked to deliver; err, if set,
-// makes every Post fail (without recording anything).
+// fakePoster records every hypothesis it is asked to deliver. err, if set,
+// makes every Post fail (without recording anything); otherwise it reports
+// delivery, defaulting to DeliveryEnqueued.
 type fakePoster struct {
-	posted []contract.HypothesisFinding
-	runIDs []string
-	err    error
+	posted   []contract.HypothesisFinding
+	runIDs   []string
+	err      error
+	delivery analyst.Delivery
+	noResult bool // report the zero Delivery with a nil error (a broken Poster)
 }
 
-func (p *fakePoster) Post(ctx context.Context, runID string, h contract.HypothesisFinding) error {
+func (p *fakePoster) Post(ctx context.Context, runID string, h contract.HypothesisFinding) (analyst.Delivery, error) {
 	if p.err != nil {
-		return p.err
+		return 0, p.err
 	}
 	p.posted = append(p.posted, h)
 	p.runIDs = append(p.runIDs, runID)
-	return nil
+	switch {
+	case p.noResult:
+		return 0, nil
+	case p.delivery != 0:
+		return p.delivery, nil
+	}
+	return analyst.DeliveryEnqueued, nil
 }
 
+// mustAnalyzeResult marshals out as the model's reply. A fixture that leaves
+// SchemaVersion or Findings at their zero values gets the schema's required
+// shape (schema_version 1, findings []), so each test states only what it is
+// about; TestRunRejectsOutputOutsideTheSchemaShape sends raw bytes instead.
 func mustAnalyzeResult(t *testing.T, out contract.AnalystOutput) llm.Result {
 	t.Helper()
+	if out.SchemaVersion == 0 {
+		out.SchemaVersion = 1
+	}
+	if out.Findings == nil {
+		out.Findings = []contract.HypothesisFinding{}
+	}
 	data, err := json.Marshal(out)
 	if err != nil {
 		t.Fatalf("marshal fixture AnalystOutput: %v", err)

@@ -196,7 +196,10 @@ Four things that look like bugs and are not:
   `heimdall_analyst_hypotheses_{hallucinated,deduped,capped,invalid}_total`.
 - **A hypothesis is in the file but nobody received it.** `persist` runs
   *before* any POST, runs under dry-run with zero posts, and survives a POST
-  failure. The file is a strict superset of what was delivered.
+  failure. The file is a strict superset of what was delivered. A POST the
+  bridge refused is counted in `heimdall_analyst_hypotheses_post_failed_total`
+  (and retried next run); one the bridge already held is logged as
+  `bridge_deduped`, not counted as posted.
 - **A citation vanished.** Every `evidence_row` is verified against the digest
   the analyst read; a row id that did not exist is dropped as a hallucination
   and counted. That is the wrapper working.
@@ -209,7 +212,10 @@ a `make` gate keeps `internal/llm` off both the detector's and the console's
 dependency graphs. If something LLM-shaped ever pages you, that is a serious
 bug — not a tuning problem.
 
-Analyst not running at all: check `heimdall_analyst_last_success_timestamp_seconds`.
+Analyst not running at all: `HeimdallAnalystStale` / `HeimdallAnalystAbsent`
+fire on `heimdall_analyst_last_success_timestamp_seconds`, and the journal names
+the hard failure — the LLM health gate, the model call, or a reply outside the
+schema's shape (`{}` is refused, not read as an all-clear).
 
 ---
 
@@ -293,6 +299,7 @@ suppression authority, so mutes expire on their own.
 |---|---|
 | `heimdall_last_run_timestamp_seconds{plane="tier1"}` | detector completed |
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
+| `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
 | `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` | per-destination backlog age |
 | `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle |
@@ -302,7 +309,10 @@ suppression authority, so mutes expire on their own.
 
 The bridge has **no heartbeat metric** — its liveness is `/healthz` only. The
 console probes it when `HEIMDALL_UI_BRIDGE_HEALTHZ_URL` is set and reports it
-*absent* rather than healthy when unset. Nothing else scrapes it today.
+*absent* rather than healthy when unset. Nothing scrapes it; instead
+`HeimdallBridgeUnreachable` watches it from the sending side, firing when
+Alertmanager's webhook deliveries keep failing. That alert must be routed to a
+receiver that does not go through the bridge (see SETUP.md, the meta-rules).
 
 **`heimdall_redaction_failures_total > 0`** means the redactor failed and
 content was withheld rather than leaked. The finding still fires — content

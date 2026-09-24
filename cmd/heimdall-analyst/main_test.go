@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -38,6 +41,18 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 	if c.LLMURL != "http://127.0.0.1:1" {
 		t.Errorf("LLMURL = %q", c.LLMURL)
+	}
+	if c.BridgeToken != "" {
+		t.Errorf("BridgeToken = %q, want empty when HEIMDALL_BRIDGE_TOKEN is unset (it is optional)", c.BridgeToken)
+	}
+	m := fullEnv(dir)
+	m["HEIMDALL_BRIDGE_TOKEN"] = "bridge-token"
+	c, err = loadConfig(env(m))
+	if err != nil {
+		t.Fatalf("loadConfig with token: %v", err)
+	}
+	if c.BridgeToken != "bridge-token" {
+		t.Errorf("BridgeToken = %q, want it read from HEIMDALL_BRIDGE_TOKEN", c.BridgeToken)
 	}
 }
 
@@ -80,8 +95,11 @@ func TestLoadConfigDryRunParsing(t *testing.T) {
 // (analyst.DefaultSystemPrompt / analyst.AnalystSchema / analyst.Run /
 // emit.RenderAnalystProm) survives being wired together, not just each
 // piece in isolation.
-func TestRunEndToEnd(t *testing.T) {
-	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// llmStub is a llama.cpp stand-in that passes the health gate and answers
+// every completion with one well-formed hypothesis citing row-1.
+func llmStub(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
 			w.Write([]byte(`{"status":"ok"}`))
@@ -115,15 +133,19 @@ func TestRunEndToEnd(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer llmSrv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
-	var bridgeHits int
-	bridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bridgeHits++
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer bridgeSrv.Close()
+// bridgeEnqueued is the bridge's /hypothesis reply for a new enqueue
+// (cmd/heimdall-bridge hypResponse).
+const bridgeEnqueued = `{"enqueued":true,"deduped":false,"ticketed":false}`
 
+// setupRun writes a one-row digest into a fresh temp tree and points every
+// env var run() reads at it, the LLM stub and bridgeURL. It returns the
+// tree's root.
+func setupRun(t *testing.T, llmURL, bridgeURL string, extra map[string]string) string {
+	t.Helper()
 	dir := t.TempDir()
 	digestDir := filepath.Join(dir, "digest")
 	if err := os.MkdirAll(digestDir, 0o755); err != nil {
@@ -144,11 +166,28 @@ func TestRunEndToEnd(t *testing.T) {
 	}
 
 	m := fullEnv(dir)
-	m["HEIMDALL_LLM_URL"] = llmSrv.URL
-	m["HEIMDALL_BRIDGE_HYPOTHESIS_URL"] = bridgeSrv.URL + "/hypothesis"
+	m["HEIMDALL_LLM_URL"] = llmURL
+	m["HEIMDALL_BRIDGE_HYPOTHESIS_URL"] = bridgeURL
+	for k, v := range extra {
+		m[k] = v
+	}
 	for k, v := range m {
 		t.Setenv(k, v)
 	}
+	return dir
+}
+
+func TestRunEndToEnd(t *testing.T) {
+	llmSrv := llmStub(t)
+
+	var bridgeHits int
+	bridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bridgeHits++
+		io.WriteString(w, bridgeEnqueued)
+	}))
+	defer bridgeSrv.Close()
+
+	dir := setupRun(t, llmSrv.URL, bridgeSrv.URL+"/hypothesis", nil)
 
 	if err := run(); err != nil {
 		t.Fatalf("run: %v", err)
@@ -165,6 +204,9 @@ func TestRunEndToEnd(t *testing.T) {
 	prom := string(promData)
 	if !strings.Contains(prom, "heimdall_analyst_hypotheses_posted_total 1\n") {
 		t.Errorf("posted counter missing/wrong:\n%s", prom)
+	}
+	if !strings.Contains(prom, "heimdall_analyst_hypotheses_post_failed_total 0\n") {
+		t.Errorf("post_failed counter missing/wrong:\n%s", prom)
 	}
 	if !strings.Contains(prom, "heimdall_analyst_last_success_timestamp_seconds") {
 		t.Errorf("heartbeat missing:\n%s", prom)
@@ -218,5 +260,80 @@ func TestRunFailsClosedOnDeadLLM(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "textfile", "heimdall-analyst.prom")); !os.IsNotExist(err) {
 		t.Errorf("heartbeat must not be written on a hard failure, stat err = %v", err)
+	}
+}
+
+// The bridge authenticates /hypothesis with a bearer token. run() sends
+// HEIMDALL_BRIDGE_TOKEN as one when it is set, sends no Authorization
+// header when it is not, and never writes the token to the log.
+func TestRunSendsTheBridgeToken(t *testing.T) {
+	const token = "t0k3n-for-the-bridge-only"
+	tests := []struct {
+		name       string
+		env        map[string]string
+		wantHeader string
+	}{
+		{"token set", map[string]string{"HEIMDALL_BRIDGE_TOKEN": token}, "Bearer " + token},
+		{"token unset", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotHeader string
+			bridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotHeader = r.Header.Get("Authorization")
+				io.WriteString(w, bridgeEnqueued)
+			}))
+			defer bridgeSrv.Close()
+			setupRun(t, llmStub(t).URL, bridgeSrv.URL+"/hypothesis", tt.env)
+
+			var logBuf bytes.Buffer
+			log.SetOutput(&logBuf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			if err := run(); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if gotHeader != tt.wantHeader {
+				t.Errorf("Authorization = %q, want %q", gotHeader, tt.wantHeader)
+			}
+			if strings.Contains(logBuf.String(), token) {
+				t.Errorf("the bridge token reached the log:\n%s", logBuf.String())
+			}
+		})
+	}
+}
+
+// A bridge that refuses the POST (here: a 401, as for a wrong token) is not
+// a hard failure — the run is persisted and the heartbeat advances — but it
+// is COUNTED, so it can alert, and it is logged as a WARNING.
+func TestRunCountsARefusedPost(t *testing.T) {
+	bridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer bridgeSrv.Close()
+	dir := setupRun(t, llmStub(t).URL, bridgeSrv.URL+"/hypothesis", nil)
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	if err := run(); err != nil {
+		t.Fatalf("run: a refused POST must not fail the run, got %v", err)
+	}
+	promData, err := os.ReadFile(filepath.Join(dir, "textfile", "heimdall-analyst.prom"))
+	if err != nil {
+		t.Fatalf("heimdall-analyst.prom not written: %v", err)
+	}
+	prom := string(promData)
+	for _, want := range []string{
+		"heimdall_analyst_hypotheses_posted_total 0\n",
+		"heimdall_analyst_hypotheses_post_failed_total 1\n",
+	} {
+		if !strings.Contains(prom, want) {
+			t.Errorf("prom missing %q:\n%s", want, prom)
+		}
+	}
+	if !strings.Contains(logBuf.String(), "WARNING: analyst: post ") {
+		t.Errorf("the refused POST was not logged as a WARNING:\n%s", logBuf.String())
 	}
 }

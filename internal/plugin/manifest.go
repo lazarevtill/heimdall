@@ -14,6 +14,14 @@ import (
 // an ABI break is never silently tolerated.
 const PluginAPIVersion = 1
 
+// MaxOutputBytesLimit is the HOST's ceiling on budgets.max_output_bytes. The
+// budget is declared by the plugin's own manifest, so without a ceiling a
+// plugin could name any size it liked: the host holds up to that many bytes
+// of stdout in memory, and an absurd value (math.MaxInt, or terabytes) used
+// to crash the whole host process outright rather than fail one query. A
+// source's SignalSet is a small JSON document; 16 MiB is generous for it.
+const MaxOutputBytesLimit = 16 << 20
+
 // Kind is the plugin category. It determines which capabilities a manifest
 // may declare: a source may hold one credential and an advisory endpoint
 // list; a detector is structurally I/O-free and may declare neither.
@@ -90,7 +98,8 @@ func LoadManifest(path string) (Manifest, error) {
 //   - id matches ^[a-z0-9]{2,16}$.
 //   - kind ∈ {source, detector}.
 //   - version non-empty.
-//   - budgets.deadline_seconds > 0; budgets.max_output_bytes > 0; memory_mb >= 0.
+//   - budgets.deadline_seconds > 0; 0 < budgets.max_output_bytes <=
+//     MaxOutputBytesLimit; memory_mb >= 0.
 //   - kind==detector MUST declare no credential and no endpoints (detectors
 //     are structurally I/O-free — a detector asking for a credential is
 //     refused).
@@ -116,6 +125,10 @@ func (m Manifest) Validate() error {
 	}
 	if m.Budgets.MaxOutputBytes <= 0 {
 		return fmt.Errorf("%w: budgets.max_output_bytes must be > 0", ErrInvalid)
+	}
+	if m.Budgets.MaxOutputBytes > MaxOutputBytesLimit {
+		return fmt.Errorf("%w: budgets.max_output_bytes %d exceeds the host limit %d",
+			ErrInvalid, m.Budgets.MaxOutputBytes, MaxOutputBytesLimit)
 	}
 	if m.Budgets.MemoryMB < 0 {
 		return fmt.Errorf("%w: budgets.memory_mb must be >= 0", ErrInvalid)
