@@ -379,6 +379,7 @@ suppression authority, so mutes expire on their own.
 | `heimdall_last_run_timestamp_seconds{plane="tier1"}` | detector completed |
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
 | `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
+| `heimdall_analyst_hypotheses_bridge_held_total{reason}` | accepted but not sent: `deduped` or `suppressed` (an operator's mute) |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
 | `heimdall_bridge_sweep_last_success_timestamp_seconds` | bridge escalation sweep completed cleanly |
 | `heimdall_bridge_storm_fused_total` / `heimdall_bridge_escalation_errors_total` | issues held back by the storm fuse / escalations that failed |
