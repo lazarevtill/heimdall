@@ -76,6 +76,8 @@ file wins and the guide is wrong.
 - `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
   `latest.json` + 14-day dated history).
 - `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
+  The detector records each complete run with `RecordRun`, which also resolves to `ok` every
+  row the run did not produce (an OK evaluation emits no finding).
 - `internal/emit` — `.prom` render (frozen label set, no `state` label, no timestamps), atomic
   replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.
@@ -117,6 +119,8 @@ file wins and the guide is wrong.
   fan-out, button-callback dispatcher (allow-listed → suppression writes), silence reconciler,
   weekly digest, notifier heartbeat.
 - `plugins/source-reference` — a real, stdlib-only reference source plugin.
+- `deploy/alerts/heimdall-findings.rules.yml` — `HeimdallFinding`, the one rule that turns a
+  `heimdall_finding` series into an alert (labels passed through unchanged) for the bridge.
 - `deploy/alerts/heimdall-meta.rules.yml` — the alerts that page when a component goes
   stale/absent/redaction-fails.
 

@@ -57,7 +57,8 @@ type NotifierStats struct {
 	DispatchErrors  int
 	// SinkBacklogs carries one sample per routed (sink, channel) pair.
 	SinkBacklogs []SinkBacklog
-	// SinkFailures carries one sample per sink that refused a delivery.
+	// SinkFailures carries one sample per routed sink, 0 for a sink that
+	// refused nothing (or had nothing to send) this cycle.
 	SinkFailures []SinkFailure
 	// LastPollSuccess is the time of the last successful Telegram poll;
 	// the zero value renders as 0 ("none since start").

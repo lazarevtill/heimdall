@@ -197,7 +197,7 @@ func run() error {
 	}
 	digestFailures := digestReport.RedactionFailures
 
-	if err := led.Upsert(now, findings); err != nil {
+	if err := led.RecordRun(now, findings); err != nil {
 		return err
 	}
 	// Spool docs first, then the atomic .prom (docs must exist before the

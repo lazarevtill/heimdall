@@ -102,7 +102,8 @@ then POSTs to the bridge.
 - **Out**: Telegram / Gotify / Synology Chat via the `Sink` seam, a Prometheus textfile-collector
   `.prom` (the emission path for everything that pages),
   redacted `findings/<fp>.json` spool docs, the digest, YouTrack issues, Telegram messages,
-  Alertmanager silences. Meta-rules in `deploy/alerts/` page when any component goes stale/absent.
+  Alertmanager silences. `deploy/alerts/` holds `HeimdallFinding` (the rule that makes a finding an
+  alert) and the meta-rules that page when any component goes stale/absent.
 
 ## Wire contract & trust properties (enforced in code + CI)
 
@@ -156,7 +157,7 @@ make ci      # lint + test + build + vuln
 | `internal/tracker` · `outbox` · `bridge` | YouTrack seam + markers; notify_outbox; webhook reconcile / hypothesis / escalation |
 | `internal/telegram` · `silence` · `notify` | Telegram + Alertmanager clients; drainer / dispatcher / reconciler / digest |
 | `plugins/source-reference` | reference source plugin (stdlib-only) |
-| `contract/` · `deploy/alerts/` · `design/` | schema docs; meta-rules; design records (`design/2026-07-19-final-design.md`) |
+| `contract/` · `deploy/alerts/` · `design/` | schema docs; finding rule + meta-rules; design records (`design/2026-07-19-final-design.md`) |
 
 ## Documentation
 

@@ -152,13 +152,14 @@ func (s *server) denyRead(w http.ResponseWriter, r *http.Request) {
 }
 
 // tokenOK reports whether the request carries the configured bearer token.
+// The scheme name is case-insensitive (RFC 9110 §11.1), as the bridge
+// already treats it: "bearer <token>" is the same credential.
 func (s *server) tokenOK(r *http.Request) bool {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, prefix) {
+	scheme, cred, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return false
 	}
-	got := strings.TrimSpace(h[len(prefix):])
+	got := strings.TrimSpace(cred)
 	// Constant-time, and length-independent: subtle.ConstantTimeCompare
 	// returns 0 for differing lengths without an early return.
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
@@ -231,7 +232,30 @@ func (s *server) basePage(r *http.Request, title, nav string) (Page, error) {
 		seen["bridge"] = ts
 	}
 	p.Components = BuildComponents(now, seen)
+
+	// The nav's firing badge is on every page, so it is counted here over
+	// the whole ledger. Left to the signals and finding handlers, it read 0
+	// on every other page while a critical finding fired, and on a finding's
+	// own page it counted just that finding. Suppression does not change
+	// it: a muted finding is still firing. An unreadable ledger shows "?",
+	// never 0.
+	if entries, err := s.ledger.List(); err != nil {
+		log.Printf("nav firing count: %v", contract.Safe(err))
+	} else {
+		p.NavFiring, p.NavCounted = countFiring(entries), true
+	}
 	return p, nil
+}
+
+// countFiring counts the entries the Signals page puts in its Firing tier.
+func countFiring(entries []ledger.Entry) int {
+	n := 0
+	for _, e := range entries {
+		if tier, _ := classify(e.State, e.Severity); tier == tierFiring {
+			n++
+		}
+	}
+	return n
 }
 
 // probeBridge asks the bridge's /healthz whether it is alive right now. Its

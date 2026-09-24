@@ -213,7 +213,7 @@ func TestStoreOpensSinceWindow(t *testing.T) {
 	s := openTestStore(t)
 	seed := func(marker string, openedAt time.Time) {
 		t.Helper()
-		if err := s.UpsertIssue(bridge.IssueRow{
+		if err := s.RecordOpened(bridge.IssueRow{
 			Marker: marker, IssueID: "HEIM-" + marker, Group: "g", Check: "c",
 			Severity: "warning", FiringSince: openedAt, OpenedAt: openedAt, State: "open",
 		}); err != nil {

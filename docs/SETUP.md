@@ -163,7 +163,11 @@ sub-field tells you whether the tracker credential works. `/healthz` never
 fails on YouTrack being down — it asserts the bridge and its own db, so read
 the sub-field rather than the status code.
 
-Then point Alertmanager at `POST /am`, sending the bearer token. Route **only**
+Then point Alertmanager at `POST /am`, sending the bearer token. The alerts
+come from [`../deploy/alerts/heimdall-findings.rules.yml`](../deploy/alerts/heimdall-findings.rules.yml)
+(`HeimdallFinding`, loaded in step 7): it turns each `heimdall_finding` series
+into an alert and passes the series labels through unchanged. Without that rule
+nothing reaches `/am` and no ticket ever opens. Route **only**
 `source="heimdall"` alerts to it, grouped by **exactly** `[group, check]`: the
 bridge keeps one ticket per `(group, check)`.
 - A delivery grouped by more labels (a `severity`, or `'...'`) splits one
@@ -381,13 +385,20 @@ Granting the unit permission to start those units is a PolicyKit/sudoers
 decision made outside this repo. If you would rather not, leave the variables
 unset — do not run the console as root to work around it.
 
-### 7. The meta-rules
+### 7. The alert rules
 
-Load [`../deploy/alerts/heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml)
-into Prometheus. **This is not optional polish.** Until it is loaded, a
-crashed detector, a dead notifier, a stuck delivery channel, a dead analyst
-and a bridge Alertmanager cannot reach are all silent — the alerts that watch
-the watcher live in that file.
+Load both files in [`../deploy/alerts/`](../deploy/alerts/) into Prometheus.
+**Neither is optional polish.**
+
+- [`heimdall-findings.rules.yml`](../deploy/alerts/heimdall-findings.rules.yml)
+  is the one rule that makes a finding an alert. Until it is loaded the
+  detector writes findings that nobody is paged about and the bridge never
+  opens a ticket. Its `source="heimdall"` alerts go to the bridge (step 3),
+  and to whatever native route pages people first.
+- [`heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml) holds
+  the alerts that watch the watcher. Until it is loaded, a crashed detector,
+  a dead notifier, a stuck delivery channel, a dead analyst and a bridge
+  Alertmanager cannot reach are all silent.
 
 Every `source="heimdall-meta"` alert must be **routed to a native Alertmanager
 receiver** (Telegram, email), never to the bridge. The bridge accepts only
@@ -417,9 +428,9 @@ Work forwards; each step depends on the one before.
 | 1 | `heimdall-detect` exits 0 | a `.prom` in the textfile dir |
 | 2 | `curl localhost:9100/metrics \| grep heimdall_` | the series is **scraped**, not merely written |
 | 3 | `curl localhost:9090/api/v1/query?query=heimdall_finding` | Prometheus has it |
-| 4 | `curl localhost:9090/api/v1/rules \| grep Heimdall` | meta-rules loaded |
+| 4 | `curl localhost:9090/api/v1/rules \| grep Heimdall` | `HeimdallFinding` and the meta-rules loaded |
 | 5 | `curl localhost:9098/healthz` | bridge up; read the YouTrack sub-field |
-| 6 | force a finding, watch Alertmanager → `/am` | a ticket appears |
+| 6 | force a finding, watch `HeimdallFinding` in Alertmanager → `/am` | a ticket appears |
 | 7 | `heimdall_notifier_sink_oldest_pending_seconds` | one sample per routed pair, `0` |
 | 8 | open the console | pages render; unset dirs say so rather than render empty |
 

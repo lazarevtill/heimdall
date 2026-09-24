@@ -191,6 +191,54 @@ func TestWrongTokenIsRejectedIndistinguishablyFromNone(t *testing.T) {
 	}
 }
 
+// The auth scheme is case-insensitive (RFC 9110), as the bridge already
+// treats it; only the token itself is compared exactly.
+func TestTheBearerSchemeIsCaseInsensitive(t *testing.T) {
+	ts := newTestServer(t, nil)
+	h := ts.handler()
+	for _, tc := range []struct {
+		header string
+		want   int
+	}{
+		{"bearer " + testToken, http.StatusOK},
+		{"BEARER " + testToken, http.StatusOK},
+		{"Bearer  " + testToken, http.StatusOK},
+		{"Bearer" + testToken, http.StatusUnauthorized},
+		{"bearer " + strings.ToUpper(testToken), http.StatusUnauthorized},
+	} {
+		w := httptest.NewRecorder()
+		r := req("GET", "/", nil)
+		r.Header.Set("Authorization", tc.header)
+		h.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("Authorization=%q: status = %d, want %d", tc.header, w.Code, tc.want)
+		}
+	}
+}
+
+// The nav's Signals badge counts every Firing-tier finding in the ledger on
+// EVERY page. It used to be set only by the signals and finding handlers,
+// so it read 0 on the other pages while a critical finding fired, and 1 on
+// a finding's own page.
+func TestTheNavBadgeCountsTheWholeLedgerOnEveryPage(t *testing.T) {
+	ts := newTestServer(t, nil)
+	h := ts.handler()
+	fp := ts.seedFinding(t, "c1", "t1", contract.SeverityCritical)
+	ts.seedFinding(t, "c1", "t2", contract.SeverityCritical)
+	ts.seedFinding(t, "c1", "t3", contract.SeverityWarning) // Warning tier, not Firing
+	const badge = `Signals <span class="spacer mono" style="font-size:11px">2</span>`
+	for _, path := range []string{"/", "/finding/" + fp, "/digest", "/hypotheses", "/tickets", "/delivery"} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, withAuth(req("GET", path, nil)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", path, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), badge) {
+			t.Errorf("%s: nav badge does not read 2 firing", path)
+		}
+	}
+}
+
 // A read is permitted with the token alone; a WRITE additionally needs an
 // allow-listed operator. Same fail-closed posture as the Telegram button
 // allow-list.

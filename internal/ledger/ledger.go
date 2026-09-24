@@ -3,9 +3,10 @@
 // guarantee; see ADR-G03). One writer connection; pragmas ride the DSN so
 // every lazily opened connection is configured identically.
 //
-// Scope note: the ledger is WRITE-ONLY in this slice (insert/bump). State
-// transitions, resolution, and findings GC arrive with the bridge/notifier
-// slice — do not invent resolve semantics here.
+// The detector is the ledger's only writer. Each run records its complete
+// result with RecordRun, which is also how a finding resolves: an OK
+// evaluation emits no finding, so a fingerprint that a complete run did not
+// produce has recovered. Findings are never deleted (no GC yet).
 package ledger
 
 import (
@@ -71,11 +72,31 @@ CREATE TABLE IF NOT EXISTS findings (
 	return nil
 }
 
-// Upsert records the run's findings: new fingerprints insert with count 1;
-// recurring ones bump count and last_seen, preserving first_seen.
-// Transactions stay short: diffing happens in Go, writes are one quick tx.
+// Upsert records findings without resolving anything: new fingerprints
+// insert with count 1; recurring ones bump count and last_seen, preserving
+// first_seen. It suits a partial write (a test seeding one finding); the
+// detector records a complete run with RecordRun instead.
 func (l *Ledger) Upsert(now time.Time, fs []contract.Finding) error {
-	if len(fs) == 0 {
+	return l.write(now, fs, false)
+}
+
+// RecordRun records one complete detector run. Every finding the run
+// produced is upserted exactly as Upsert does, and every other row still
+// firing or unknown is resolved to "ok": a check that evaluated OK emits no
+// finding, so leaving a complete run's output IS the recovery. Without it a
+// recovered finding read "firing" in the console forever, long after its
+// series left heimdall.prom and Alertmanager resolved it. An empty run
+// resolves everything. Both happen in one transaction, so a reader never
+// sees a half-resolved ledger. first_seen and count are lifetime figures
+// and survive a resolve; last_seen stays the last run that saw it non-ok.
+func (l *Ledger) RecordRun(now time.Time, fs []contract.Finding) error {
+	return l.write(now, fs, true)
+}
+
+// write runs the upsert, and with resolveAbsent the resolve, in one short
+// transaction; diffing happens in SQL, not in Go.
+func (l *Ledger) write(now time.Time, fs []contract.Finding, resolveAbsent bool) error {
+	if len(fs) == 0 && !resolveAbsent {
 		return nil
 	}
 	tx, err := l.db.Begin()
@@ -83,6 +104,15 @@ func (l *Ledger) Upsert(now time.Time, fs []contract.Finding) error {
 		return fmt.Errorf("ledger: begin: %w", err)
 	}
 	defer tx.Rollback()
+	if resolveAbsent {
+		// Resolve every open row, then let the upsert below set this run's
+		// findings back to their real state. Inside one transaction that
+		// is exactly "resolve what this run did not produce".
+		ok := contract.StateOK.String()
+		if _, err := tx.Exec(`UPDATE findings SET state = ? WHERE state <> ?`, ok, ok); err != nil {
+			return fmt.Errorf("ledger: resolve: %w", err)
+		}
+	}
 	stmt, err := tx.Prepare(`
 INSERT INTO findings (fingerprint, check_id, target, state, severity, first_seen, last_seen, count)
 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -130,7 +160,7 @@ FROM findings WHERE fingerprint = ?`, fp).
 
 // List returns every ledger entry, most-recently-seen first. It is a pure
 // read — the operator UI renders from it and must never mutate finding
-// state (that authority belongs to the detector's Upsert alone).
+// state (that authority belongs to the detector's RecordRun alone).
 //
 // Ordering is (last_seen DESC, fingerprint ASC): the fingerprint tiebreak
 // keeps the result deterministic when several findings share a run's

@@ -148,6 +148,20 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, poll pollStatus) 
 			SinkID: b.SinkID, Channel: string(b.Channel), Seconds: b.Seconds,
 		})
 	}
+	// Every routed sink gets a failure sample, 0 when it had nothing to do
+	// this cycle. Drain reports only the sinks it sent to, so an idle sink's
+	// series used to vanish between deliveries, and a rule over it read
+	// "absent", not "no failures".
+	seen := make(map[string]bool, len(sinkFailures))
+	for _, f := range sinkFailures {
+		seen[f.SinkID] = true
+	}
+	for _, b := range backlogs {
+		if !seen[b.SinkID] {
+			seen[b.SinkID] = true
+			sinkFailures = append(sinkFailures, emit.SinkFailure{SinkID: b.SinkID})
+		}
+	}
 
 	var silencesCreated, silencesDeleted int
 	authority, err := buildAuthority(d, now)

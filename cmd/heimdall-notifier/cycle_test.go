@@ -391,3 +391,34 @@ func (failingTG) SendMessage(context.Context, telegram.SendMessageRequest) (int6
 	return 0, fmt.Errorf("fake: send always fails")
 }
 func (failingTG) AnswerCallbackQuery(context.Context, string, string) error { return nil }
+
+// A routed sink with nothing to deliver still gets its failure sample, 0.
+// Drain reports only the sinks it sent to, so the series used to vanish
+// whenever the outbox was empty, and a rule over it read "absent".
+func TestRunCycleReportsEveryRoutedSinkFailureCountEvenWhenIdle(t *testing.T) {
+	sup := openTestSuppress(t)
+	tg := &fakeTG{}
+	textfileDir := t.TempDir()
+	d := cycleDeps{
+		Notify: notify.Deps{
+			TG: tg, Outbox: openTestOutbox(t), Suppress: sup,
+			MainChatID: fakeMainChatID, AnalystChatID: fakeAnalystChatID,
+		},
+		Silence:     newFakeSilenceClient(),
+		Suppress:    sup,
+		TextfileDir: textfileDir,
+		TG:          tg,
+		MainChatID:  fakeMainChatID,
+	}
+	if err := runCycle(context.Background(), fixedNow, d, pollStatus{}); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(textfileDir, heartbeatFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `heimdall_notifier_sink_failed_total{sink="` + notify.SinkTypeTelegram + `"} 0`
+	if !strings.Contains(string(data), want+"\n") {
+		t.Errorf("idle cycle lacks %q:\n%s", want, data)
+	}
+}

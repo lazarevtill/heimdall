@@ -32,6 +32,12 @@ type Page struct {
 	Flash      string
 	FlashError bool
 
+	// NavFiring is the nav badge: Firing-tier findings across the whole
+	// ledger, set on every page by basePage. NavCounted is false when the
+	// ledger could not be read.
+	NavFiring  int
+	NavCounted bool
+
 	Findings    []FindingView
 	Counts      Counts
 	Components  []ComponentView
@@ -140,7 +146,7 @@ const layoutTmpl = `{{define "layout"}}<!doctype html>
   <div class="brand"><span class="mark">` + markSVG + `</span><b>HEIMDALL</b></div>
   <div class="nav" style="display:flex;flex-direction:column;gap:2px">
     <div class="navlbl">Watch</div>
-    <a href="/" class="{{if eq .Nav "signals"}}on{{end}}">Signals <span class="spacer mono" style="font-size:11px">{{.Counts.Firing}}</span></a>
+    <a href="/" class="{{if eq .Nav "signals"}}on{{end}}">Signals <span class="spacer mono" style="font-size:11px">{{if .NavCounted}}{{.NavFiring}}{{else}}?{{end}}</span></a>
     <a href="/digest" class="{{if eq .Nav "digest"}}on{{end}}">Tier-2 digest</a>
     <a href="/hypotheses" class="{{if eq .Nav "hypotheses"}}on{{end}}">Hypotheses</a>
     <a href="/delivery" class="{{if eq .Nav "delivery"}}on{{end}}">Delivery</a>

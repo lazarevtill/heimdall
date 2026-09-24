@@ -521,12 +521,44 @@ func TestReconcileStormFuse(t *testing.T) {
 	}
 }
 
-// seedIssue directly inserts a ledger row opened at openedAt, bypassing
+// One flapping group opens a fresh issue each time it re-fires after an
+// auto-close, and each of those counts toward the fuse. Counting markers
+// instead saw one open however often the group flapped, so the fuse never
+// tripped on it.
+func TestReconcileStormFuseCountsEveryIssueOneGroupOpens(t *testing.T) {
+	deps, ft := testDeps(t, 2, nil)
+	fire := func(at time.Time) bridge.ReconcileResult {
+		return mustReconcile(t, at, deps, groupWebhook(alert("firing", "192.0.2.10", "critical", "fp-a", at)))
+	}
+	at := fixedNow
+	for i := 1; i <= 2; i++ {
+		if res := fire(at); !res.Opened {
+			t.Fatalf("open %d: %+v, want Opened", i, res)
+		}
+		at = at.Add(5 * time.Minute)
+		if res := mustReconcile(t, at, deps, groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", at))); !res.Closed {
+			t.Fatalf("resolve %d: %+v, want Closed", i, res)
+		}
+		at = at.Add(5 * time.Minute)
+	}
+	if res := fire(at); !res.StormFused || res.Opened {
+		t.Errorf("third open within the hour = %+v, want StormFused and not Opened", res)
+	}
+	if len(ft.opens) != 2 {
+		t.Errorf("tracker opens = %d, want 2", len(ft.opens))
+	}
+	// Once the first open leaves the rolling hour there is room again.
+	if res := fire(fixedNow.Add(61 * time.Minute)); !res.Opened {
+		t.Errorf("open after the window moved = %+v, want Opened", res)
+	}
+}
+
+// seedIssue records an issue the bridge created at openedAt, bypassing
 // Reconcile — this is how the storm-fuse test arranges "N issues already
 // opened in the last hour" without needing N real tracker Opens.
 func seedIssue(t *testing.T, deps bridge.Deps, marker string, openedAt time.Time) {
 	t.Helper()
-	if err := deps.Store.UpsertIssue(bridge.IssueRow{
+	if err := deps.Store.RecordOpened(bridge.IssueRow{
 		Marker:      marker,
 		IssueID:     "HEIM-seed-" + marker,
 		Group:       "seed",

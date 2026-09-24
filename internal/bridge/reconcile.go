@@ -515,7 +515,7 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 		opened.IssueID = issue.ID
 		opened.State = StateOpen
 		opened.AutoTagPending = openErr != nil
-		if err := d.Store.UpsertIssue(opened); err != nil {
+		if err := d.Store.RecordOpened(opened); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
 		}
 		if err := d.Store.SetTargets(now, marker, next); err != nil {
