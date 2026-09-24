@@ -226,6 +226,20 @@ the provider exactly as configured — a mismatch fails at the provider, not
 here. Discovery runs at boot, so a bad issuer stops the daemon rather than
 surfacing as a broken login later.
 
+Each cookie's signature is bound to its purpose (session vs in-flight login),
+so one can never be replayed as the other. The operator allow-list is
+re-checked on every request, so removing someone from `HEIMDALL_UI_OPERATORS`
+and restarting takes their writes away immediately rather than when their
+8-hour session expires.
+
+**Cross-origin writes are refused.** Every POST (mute, action) goes through
+Go's `http.CrossOriginProtection`: a browser request marked as coming from
+another origin — including a sibling subdomain or another port on the same
+host — gets 403 before any handler runs. A reverse proxy in front must
+preserve the `Host` header, because browsers too old to send `Sec-Fetch-Site`
+are checked by comparing `Origin` with `Host`. Non-browser clients (no
+`Sec-Fetch-Site`, no `Origin`) are unaffected.
+
 **`none`** is a LAN dashboard and is **read-only by default**. Writes need
 `HEIMDALL_UI_ANONYMOUS_WRITES=true`, and then the suppression ledger records
 the actor as plainly unauthenticated — because a mute with no identity has
@@ -238,7 +252,12 @@ nothing from a request ever reaches it.
 ```
 HEIMDALL_UI_ACTION_RERUN_DETECT=/bin/systemctl start heimdall-detect.service
 HEIMDALL_UI_ACTION_FORCE_DRAIN=/bin/systemctl start heimdall-drain.service
+HEIMDALL_UI_ACTION_RERUN_DETECT_TIMEOUT_SECONDS=30   # default 30; must be < 55
 ```
+
+An action's timeout must stay below 55 s, the 60 s server write deadline less
+5 s of headroom. The daemon refuses to boot on a larger value rather than risk
+cutting the response that reports the action's result.
 
 Granting the unit permission to start those units is a PolicyKit/sudoers
 decision made outside this repo. If you would rather not, leave the variables

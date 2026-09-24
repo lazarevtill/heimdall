@@ -298,26 +298,40 @@ func TestSecureCookiesDefaultOn(t *testing.T) {
 	}
 }
 
-// An action may not outlive the server's write deadline: the command would
-// still finish in its own process group, but the response carrying its result
-// would be cut, so the operator could not tell whether it ran.
-func TestActionTimeoutMayNotExceedTheWriteDeadline(t *testing.T) {
-	m := validEnv()
-	m["HEIMDALL_UI_ACTION_RERUN_DETECT"] = "/bin/true"
-	m["HEIMDALL_UI_ACTION_RERUN_DETECT_TIMEOUT_SECONDS"] =
-		strconv.Itoa(int(maxActionTimeout.Seconds()) + 1)
-
-	_, err := loadConfig(env(m))
-	if err == nil {
-		t.Fatal("want a boot error for an action timeout above the write deadline")
+// An action must finish comfortably inside the server's write deadline: the
+// command would still finish in its own process group, but the response
+// carrying its result would be cut, so the operator could not tell whether
+// it ran. Reaching the deadline exactly is already too late, so the ceiling
+// is exclusive and sits actionWriteHeadroom below it.
+func TestActionTimeoutMustStayBelowTheWriteDeadline(t *testing.T) {
+	limit := int(actionTimeoutLimit.Seconds())
+	for _, tc := range []struct {
+		name    string
+		seconds int
+		wantErr bool
+	}{
+		{"one second under the limit", limit - 1, false},
+		{"at the limit", limit, true},
+		{"at the write timeout itself", int(writeTimeout.Seconds()), true},
+		{"past the write timeout", int(writeTimeout.Seconds()) + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := validEnv()
+			m["HEIMDALL_UI_ACTION_RERUN_DETECT"] = "/bin/true"
+			m["HEIMDALL_UI_ACTION_RERUN_DETECT_TIMEOUT_SECONDS"] = strconv.Itoa(tc.seconds)
+			_, err := loadConfig(env(m))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "write timeout") {
+				t.Errorf("error = %q, want it to name the write timeout", err)
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "write timeout") {
-		t.Errorf("error = %q, want it to name the write timeout", err)
-	}
 
-	// Exactly at the ceiling is fine.
-	m["HEIMDALL_UI_ACTION_RERUN_DETECT_TIMEOUT_SECONDS"] = strconv.Itoa(int(maxActionTimeout.Seconds()))
-	if _, err := loadConfig(env(m)); err != nil {
-		t.Errorf("a timeout at the ceiling should load: %v", err)
+	// The headroom has to cover what a timed-out action still costs after
+	// its deadline: the wait for its pipes, then the redirect.
+	if actionWaitDelay >= actionWriteHeadroom {
+		t.Errorf("actionWaitDelay %s must be well inside actionWriteHeadroom %s", actionWaitDelay, actionWriteHeadroom)
 	}
 }

@@ -45,6 +45,12 @@ type Page struct {
 	Hypotheses     HypothesesView
 	HypothesisNote string
 	Tickets        TicketsView
+
+	// SuppressionUnavailable, when set, is a page-wide notice that the
+	// suppression authority could not be read. Every page that shows
+	// suppression state renders it, so "not muted" is never implied by a
+	// failure to look.
+	SuppressionUnavailable string
 }
 
 // QueryHint is one "where to look" line on the detail page.
@@ -175,6 +181,7 @@ const layoutTmpl = `{{define "layout"}}<!doctype html>
   </div>
   <div class="body">
     {{if .Flash}}<div class="flash {{if .FlashError}}err{{else}}ok{{end}}">{{.Flash}}</div>{{end}}
+    {{if .SuppressionUnavailable}}<div class="flash err">{{.SuppressionUnavailable}}</div>{{end}}
     {{template "content" .}}
   </div>
 </main>
@@ -197,6 +204,7 @@ const signalsTmpl = `{{define "subtitle"}}{{.Counts.Firing}} firing · {{.Counts
     <span class="meta">fp {{.Fingerprint}}</span>
     <span class="meta">state {{.State}}</span>
     <span class="meta">severity {{.Severity}}</span>
+    {{if .SuppressionCaveat}}<span class="meta" style="color:var(--warn)">suppression: {{.SuppressionCaveat}}</span>{{end}}
     <span class="spacer"><a class="btn" href="/finding/{{.Fingerprint}}">Where to look</a></span>
   </div>
 </div>
@@ -282,7 +290,7 @@ const findingTmpl = `{{define "subtitle"}}{{with .Finding}}{{.Target}}{{end}}{{e
         <div class="kv"><span class="k">occurrences</span><span class="v">{{.Count}}</span></div>
         {{if $.Evidence.Group}}<div class="kv"><span class="k">group</span><span class="v">{{$.Evidence.Group}}</span></div>{{end}}
         {{if $.Evidence.Class}}<div class="kv"><span class="k">class</span><span class="v">{{$.Evidence.Class}}</span></div>{{end}}
-        <div class="kv"><span class="k">suppression</span><span class="v" style="color:{{if .Muted}}var(--warn){{else}}var(--ok){{end}}">{{if .Muted}}{{.MuteUntil}}{{else}}none active{{end}}</span></div>
+        <div class="kv"><span class="k">suppression</span><span class="v" style="color:{{if or .Muted .SuppressionCaveat}}var(--warn){{else}}var(--ok){{end}}">{{if .Muted}}{{.MuteUntil}}{{else if .SuppressionCaveat}}{{.SuppressionCaveat}}{{else}}none active{{end}}</span></div>
       </div>
     </div>
 
@@ -356,7 +364,7 @@ const deliveryTmpl = `{{define "subtitle"}}why you did — or didn't — hear ab
   <p style="font-size:13px;line-height:1.55;color:var(--ink-500);margin:0 0 14px">
     Every row still has a live series and still appears in the digest. Muting changes who gets woken, not what is known.
   </p>
-  {{if not .Suppression}}<div class="empty">Nothing suppressed.</div>{{else}}
+  {{if not .Suppression}}<div class="empty">{{if .SuppressionUnavailable}}Suppression state unavailable — see the notice above.{{else}}Nothing suppressed.{{end}}</div>{{else}}
   <table>
     <thead><tr><th>Scope</th><th>Matches</th><th>Expires</th><th>Days used</th><th>Reason</th><th>Origin</th></tr></thead>
     <tbody>
@@ -512,6 +520,12 @@ const hypothesesTmpl = `{{define "subtitle"}}{{if .Hypotheses.Present}}{{.Hypoth
 {{if .Hypotheses.Truncated}}
 <div class="flash" style="background:var(--warn-soft);color:#7a4d0f">
   Showing the most recent runs only; older run files remain on disk.
+</div>
+{{end}}
+
+{{if .Hypotheses.Unreadable}}
+<div class="flash err">
+  {{.Hypotheses.Unreadable}} run file(s) among the most recent could not be read and are not shown below.
 </div>
 {{end}}
 

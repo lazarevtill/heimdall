@@ -42,6 +42,9 @@ import (
 //   - `state` is bound to the login attempt, defeating login-CSRF.
 //   - PKCE (S256) is always sent, so an intercepted authorization code is
 //     useless without the verifier.
+//   - The login-state and session cookies share one HMAC key, so each MAC is
+//     bound to its PURPOSE (auth.go): a login cookie, which /login mints for
+//     anyone, can never verify as a session, nor a session as login state.
 
 // oidcSkew is the clock-skew allowance on exp/iat.
 const oidcSkew = 2 * time.Minute
@@ -315,7 +318,13 @@ func (c *OIDCClient) VerifyIDToken(ctx context.Context, raw, wantNonce string) (
 	if claims.IssuedAt != 0 && now.Add(oidcSkew).Before(time.Unix(claims.IssuedAt, 0)) {
 		return IDClaims{}, errors.New("oidc: id_token was issued in the future")
 	}
-	if wantNonce != "" && claims.Nonce != wantNonce {
+	// An empty wantNonce is refused rather than treated as "skip the check":
+	// every login attempt binds one, so an empty value means the caller lost
+	// it, and skipping would accept a token minted for any session.
+	if wantNonce == "" {
+		return IDClaims{}, errors.New("oidc: no nonce is bound to this login attempt")
+	}
+	if claims.Nonce != wantNonce {
 		return IDClaims{}, errors.New("oidc: id_token nonce does not match this login attempt")
 	}
 	if claims.Subject == "" {

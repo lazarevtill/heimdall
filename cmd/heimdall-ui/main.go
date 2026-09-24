@@ -270,13 +270,15 @@ func parseActions(getenv func(string) string) (ActionSet, error) {
 				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q must be a positive integer", spec.env, v)
 			}
 			timeout = time.Duration(n) * time.Second
-			// An action may not outlive the server's write deadline: the
-			// command would still finish in its own process group, but the
-			// response carrying its result would be cut, so the operator
-			// sees a dead connection and cannot tell whether it ran.
-			if timeout > maxActionTimeout {
-				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q exceeds the %s server write timeout; the result could not be delivered",
-					spec.env, v, maxActionTimeout)
+			// An action must finish comfortably inside the server's write
+			// deadline: the command would still complete in its own process
+			// group, but the response carrying its result would be cut, so
+			// the operator sees a dead connection and cannot tell whether it
+			// ran. "Comfortably" is actionWriteHeadroom — reaching the
+			// deadline exactly is already too late (see action.go).
+			if timeout >= actionTimeoutLimit {
+				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q must be below %s: the %s server write timeout less %s headroom; the result could not be delivered",
+					spec.env, v, actionTimeoutLimit, writeTimeout, actionWriteHeadroom)
 			}
 		}
 		out[spec.name] = Action{Name: spec.name, Label: spec.label, Argv: argv, Timeout: timeout}

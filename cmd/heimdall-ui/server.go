@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lazarevtill/heimdall/internal/bridge"
 	"github.com/lazarevtill/heimdall/internal/contract"
@@ -66,6 +67,19 @@ type server struct {
 // handler wires the routes. Note the deliberate asymmetry: reads are GET,
 // every write is POST. A mute or an action must never be reachable by a
 // link a browser can prefetch.
+//
+// The whole mux sits behind net/http's CrossOriginProtection. GET (and so
+// the OIDC callback, which arrives as a cross-site top-level navigation) is
+// always let through; a POST that a browser marks as coming from another
+// origin — Sec-Fetch-Site other than same-origin/none, or, from a browser
+// too old to send that, an Origin whose host is not this Host — is refused
+// 403 before any handler runs. POST-only writes are not enough on their own:
+// the SameSite=Lax session cookie is still sent from any SAME-SITE origin (a
+// sibling subdomain, another port on the same host), and `none` mode with
+// anonymous writes has no cookie at all, so without this any page a LAN
+// browser visited could post a mute or run an action. A request carrying
+// neither header is a non-browser client (automation holding the bearer
+// token) and passes: it has no ambient credential to be tricked into using.
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -80,7 +94,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /delivery", s.authed(s.handleDelivery))
 	mux.HandleFunc("POST /mute", s.authed(s.handleMute))
 	mux.HandleFunc("POST /action/{name}", s.authed(s.handleAction))
-	return mux
+	return http.NewCrossOriginProtection().Handler(mux)
 }
 
 // operatorKey is the header carrying the acting operator's identity. It is
@@ -170,11 +184,20 @@ func identityOf(r *http.Request) Identity {
 // list is indistinguishable from none.
 func (s *server) operator(r *http.Request) string { return identityOf(r).Operator }
 
+// healthzProbe is a well-formed fingerprint used only to make /healthz run a
+// real query. Whether a finding with this id exists is irrelevant; that the
+// lookup completes is the whole signal.
+const healthzProbe = "0000000000000000"
+
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// Liveness only, and deliberately unauthenticated: it asserts that this
 	// process is up and its ledger answers a trivial query. It reveals no
 	// finding content.
-	if _, err := s.ledger.List(); err != nil {
+	//
+	// The query is ONE primary-key lookup, never a listing. This route is
+	// reachable by anyone, and the ledger handle has a single connection: a
+	// full scan per probe would let a probe flood starve every page's reads.
+	if _, _, err := s.ledger.Get(healthzProbe); err != nil {
 		http.Error(w, "not ok", http.StatusServiceUnavailable)
 		return
 	}
@@ -204,7 +227,7 @@ func (s *server) basePage(r *http.Request, title, nav string) (Page, error) {
 		// absent heartbeats, which is the honest reading.
 		log.Printf("heartbeats: %v", contract.Safe(err))
 	}
-	if ts, ok := s.probeBridge(); ok {
+	if ts, ok := s.probeBridge(r.Context()); ok {
 		seen["bridge"] = ts
 	}
 	p.Components = BuildComponents(now, seen)
@@ -215,11 +238,15 @@ func (s *server) basePage(r *http.Request, title, nav string) (Page, error) {
 // the one binary that renders no heartbeat textfile, so this is the only
 // liveness signal available for it. An unconfigured URL reports "not seen",
 // which BuildComponents renders as absent rather than healthy.
-func (s *server) probeBridge() (time.Time, bool) {
+//
+// It runs on every page render, so it is bound to the REQUEST's context as
+// well as the client timeout: a browser that gives up on a slow page stops
+// the probe with it rather than leaving it to run out its clock.
+func (s *server) probeBridge(ctx context.Context) (time.Time, bool) {
 	if s.bridgeHealthzURL == "" {
 		return time.Time{}, false
 	}
-	req, err := http.NewRequest(http.MethodGet, s.bridgeHealthzURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.bridgeHealthzURL, nil)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -243,28 +270,125 @@ func (s *server) actionList() []Action {
 	return out
 }
 
-// authority builds a FRESH suppression authority per request — declarative
-// file plus runtime mutes, re-read every time. No caching, matching
-// heimdall-bridge and heimdall-notifier: a stale authority would show a mute
-// that has already expired, or hide one just written.
-func (s *server) authority(now time.Time) (*suppress.Authority, error) {
-	var declarative []suppress.Suppression
+// suppressionState is the suppression authority as the pages need it: the
+// evaluated authority, the raw records it was built from (the delivery page
+// lists them), and whether any group-scoped record is in force.
+type suppressionState struct {
+	authority   *suppress.Authority
+	declarative []suppress.Suppression
+	runtime     []suppress.Suppression
+	// records is exactly what the authority evaluates: the declarative rows
+	// as loaded, plus the runtime rows that pass Validate — the same filter
+	// NewAuthority applies. Used only to look up a display reason for a
+	// decision the authority has already made.
+	records []suppress.Suppression
+	// groupScoped is true when at least one ACTIVE group_check record exists.
+	// Only then can a finding whose group is unknown have a wrong answer.
+	groupScoped bool
+}
+
+// loadSuppressions builds a FRESH suppression authority per request —
+// declarative file plus runtime mutes, re-read every time. No caching,
+// matching heimdall-bridge and heimdall-notifier: a stale authority would
+// show a mute that has already expired, or hide one just written.
+func (s *server) loadSuppressions(now time.Time) (suppressionState, error) {
+	var st suppressionState
 	if s.suppressionsFile != "" {
-		var err error
-		declarative, err = suppress.LoadDeclarative(s.suppressionsFile, now)
+		declarative, err := suppress.LoadDeclarative(s.suppressionsFile, now)
 		if err != nil {
-			return nil, fmt.Errorf("load declarative suppressions: %w", err)
+			return suppressionState{}, fmt.Errorf("load declarative suppressions: %w", err)
 		}
+		st.declarative = declarative
 	}
 	runtimeMutes, err := s.suppress.ListRuntime()
 	if err != nil {
-		return nil, fmt.Errorf("list runtime suppressions: %w", err)
+		return suppressionState{}, fmt.Errorf("list runtime suppressions: %w", err)
 	}
-	a, skipped := suppress.NewAuthority(declarative, runtimeMutes)
+	st.runtime = runtimeMutes
+
+	a, skipped := suppress.NewAuthority(st.declarative, st.runtime)
 	if skipped > 0 {
 		log.Printf("suppression authority skipped %d invalid runtime row(s)", skipped)
 	}
-	return a, nil
+	st.authority = a
+	st.records = append(st.records, st.declarative...)
+	for _, r := range st.runtime {
+		if r.Validate(time.Time{}) == nil {
+			st.records = append(st.records, r)
+		}
+	}
+	for _, r := range st.records {
+		if r.Scope == suppress.ScopeGroupCheck && r.Active(now) {
+			st.groupScoped = true
+			break
+		}
+	}
+	return st, nil
+}
+
+// suppressionUnavailable is the page-wide notice shown when the authority
+// cannot be built. It says what the page can and cannot claim, because the
+// alternative readings are both wrong: a 500 takes the console away exactly
+// when an operator needs it, and silently rendering everything "not muted"
+// would state a falsehood about what is being held back.
+const suppressionUnavailable = "Suppression state is unavailable: the suppression authority could not be read, " +
+	"so nothing on this page is marked muted or dismissed — and that does not mean nothing is. " +
+	"The cause is in the console's journal."
+
+// suppressionsFor loads the authority for a page. A failure is logged and
+// surfaced on the page as suppressionUnavailable; the returned state then
+// has a nil authority, which every view renders as "cannot tell", never as
+// "not muted".
+func (s *server) suppressionsFor(p *Page) suppressionState {
+	st, err := s.loadSuppressions(p.Now)
+	if err != nil {
+		log.Printf("suppression state unavailable: %v", contract.Safe(err))
+		p.SuppressionUnavailable = suppressionUnavailable
+		return suppressionState{}
+	}
+	return st
+}
+
+// hypothesisDismissal adapts the authority to ReadRuns. The DECISION is the
+// authority's (HypothesisSuppressed, which covers declarative records as
+// well as runtime mutes); the records are consulted only for a reason to
+// show. A nil return — no authority — makes ReadRuns mark nothing dismissed,
+// and the page carries suppressionUnavailable to say why.
+func (st suppressionState) hypothesisDismissal(now time.Time) func(hypFP string) (string, bool) {
+	if st.authority == nil {
+		return nil
+	}
+	return func(hypFP string) (string, bool) {
+		if !st.authority.HypothesisSuppressed(now, hypFP) {
+			return "", false
+		}
+		for _, r := range st.records {
+			if r.MatchesHypothesis(now, hypFP) {
+				return r.Reason, true
+			}
+		}
+		return "", true
+	}
+}
+
+// spoolGroups returns fingerprint → group for the listed findings, read from
+// their spool documents. The ledger stores no group, and group_check is the
+// scope every Telegram mute button writes, so without this a finding muted
+// from Telegram rendered here as not muted while the bridge and Alertmanager
+// were holding it back. It costs one spool read per finding, so it is
+// skipped when no group-scoped record is active — the only case in which
+// the answer could change.
+func (s *server) spoolGroups(entries []ledger.Entry, st suppressionState) map[string]string {
+	if st.authority == nil || !st.groupScoped || s.spoolDir == "" {
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if ev := ReadSpool(s.spoolDir, e.Fingerprint, e.LastSeen); ev.Present && ev.Group != "" {
+			out[e.Fingerprint] = ev.Group
+		}
+	}
+	return out
 }
 
 func (s *server) handleSignals(w http.ResponseWriter, r *http.Request) {
@@ -278,12 +402,12 @@ func (s *server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	authority, err := s.authority(p.Now)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	p.Findings = BuildFindings(p.Now, entries, authority)
+	st := s.suppressionsFor(&p)
+	p.Findings = BuildFindings(p.Now, entries, SuppressionContext{
+		Authority:   st.authority,
+		Groups:      s.spoolGroups(entries, st),
+		GroupScoped: st.groupScoped,
+	})
 	p.Counts = Summarise(p.Findings)
 	p.Flash, p.FlashError = flashFrom(r)
 	s.write(w, s.tmpl.signals, p)
@@ -312,16 +436,22 @@ func (s *server) handleFinding(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such finding", http.StatusNotFound)
 		return
 	}
-	authority, err := s.authority(p.Now)
-	if err != nil {
-		s.fail(w, err)
-		return
+	// The spool is read FIRST: it is the only record of the finding's group,
+	// which a group-scoped suppression needs in order to be evaluated.
+	p.Evidence = ReadSpool(s.spoolDir, fp, entry.LastSeen)
+	var groups map[string]string
+	if p.Evidence.Present && p.Evidence.Group != "" {
+		groups = map[string]string{fp: p.Evidence.Group}
 	}
-	views := BuildFindings(p.Now, []ledger.Entry{entry}, authority)
+	st := s.suppressionsFor(&p)
+	views := BuildFindings(p.Now, []ledger.Entry{entry}, SuppressionContext{
+		Authority:   st.authority,
+		Groups:      groups,
+		GroupScoped: st.groupScoped,
+	})
 	p.Finding = &views[0]
 	p.Title = entry.Check
 	p.Queries = QueryHintsFor(entry)
-	p.Evidence = ReadSpool(s.spoolDir, fp, entry.LastSeen)
 	p.Counts = Summarise(views)
 	p.Flash, p.FlashError = flashFrom(r)
 	s.write(w, s.tmpl.finding, p)
@@ -348,16 +478,12 @@ func (s *server) handleHypotheses(w http.ResponseWriter, r *http.Request) {
 	}
 	// Hypothesis mutes are ScopeHypothesis suppressions keyed by hyp_fp, so
 	// a hypothesis an operator already dismissed is marked as such rather
-	// than presented again as new.
-	muted := map[string]contract2Suppression{}
-	if runtimeMutes, err := s.suppress.ListRuntime(); err == nil {
-		for _, m := range runtimeMutes {
-			if m.Scope == suppress.ScopeHypothesis && m.Active(p.Now) && m.Matcher.HypFP != "" {
-				muted[m.Matcher.HypFP] = contract2Suppression{Reason: m.Reason}
-			}
-		}
-	}
-	p.Hypotheses = ReadRuns(s.analystRunDir, p.Now, muted)
+	// than presented again as new. The decision goes through the full
+	// authority — a declarative dismissal counts exactly as a Telegram one —
+	// and an unreadable authority is SAID on the page rather than rendered
+	// as "nothing dismissed".
+	st := s.suppressionsFor(&p)
+	p.Hypotheses = ReadRuns(s.analystRunDir, p.Now, st.hypothesisDismissal(p.Now))
 	p.HypothesisNote = hypothesisNote
 	p.Flash, p.FlashError = flashFrom(r)
 	s.write(w, s.tmpl.hypotheses, p)
@@ -388,20 +514,12 @@ func (s *server) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Sinks = BuildSinks(backlogs)
 
-	runtimeMutes, err := s.suppress.ListRuntime()
-	if err != nil {
-		s.fail(w, err)
-		return
+	// A broken suppressions file must not take the sink view down with it;
+	// the page says the suppression half is unavailable instead.
+	st := s.suppressionsFor(&p)
+	if st.authority != nil {
+		p.Suppression = BuildSuppressions(p.Now, append(append([]suppress.Suppression{}, st.declarative...), st.runtime...))
 	}
-	var declarative []suppress.Suppression
-	if s.suppressionsFile != "" {
-		declarative, err = suppress.LoadDeclarative(s.suppressionsFile, p.Now)
-		if err != nil {
-			s.fail(w, err)
-			return
-		}
-	}
-	p.Suppression = BuildSuppressions(p.Now, append(append([]suppress.Suppression{}, declarative...), runtimeMutes...))
 	p.Flash, p.FlashError = flashFrom(r)
 	s.write(w, s.tmpl.delivery, p)
 }
@@ -423,6 +541,14 @@ func (s *server) handleMute(w http.ResponseWriter, r *http.Request) {
 
 	if fp == "" {
 		s.redirectFlash(w, r, "/", "refused: no fingerprint given", true)
+		return
+	}
+	// Validated BEFORE it is used for anything — including the redirect
+	// targets below. It is form input: "/finding/"+fp with fp = `../\evil`
+	// is cleaned by http.Redirect to `/\evil`, which a browser reads as
+	// //evil — an open redirect built out of an error message.
+	if !contract.ValidFingerprint(fp) {
+		s.redirectFlash(w, r, "/", "refused: not a well-formed fingerprint", true)
 		return
 	}
 	if reason == "" {
@@ -487,8 +613,13 @@ func (s *server) handleAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.runner.Run(r.Context(), a)
+	// The journal keeps the output the flash may have to shorten.
+	logged := ""
+	if res.Output != "" {
+		logged = " — output: " + contract.SafeString(res.Output)
+	}
 	if err != nil {
-		log.Printf("%s ran %s: %v", actor, name, contract.Safe(err))
+		log.Printf("%s ran %s: %v%s", actor, name, contract.Safe(err), logged)
 		msg := a.Label + " failed: " + err.Error()
 		if res.Output != "" {
 			msg += " — " + res.Output
@@ -496,7 +627,7 @@ func (s *server) handleAction(w http.ResponseWriter, r *http.Request) {
 		s.redirectFlash(w, r, "/", msg, true)
 		return
 	}
-	log.Printf("%s ran %s ok in %s", actor, name, res.Duration.Round(time.Millisecond))
+	log.Printf("%s ran %s ok in %s%s", actor, name, res.Duration.Round(time.Millisecond), logged)
 	msg := a.Label + " completed in " + res.Duration.Round(time.Millisecond).String() + "."
 	if res.Output != "" {
 		msg += " " + res.Output
@@ -529,22 +660,38 @@ func flashFrom(r *http.Request) (string, bool) {
 	return "", false
 }
 
+// maxFlashBytes bounds a flash message before it is escaped into the
+// redirect. Action output can be kilobytes, and percent-encoding roughly
+// triples it; a Location header that size is refused by common reverse
+// proxies (nginx's default upstream header buffer is 4–8 KB), which would
+// turn a completed action into a 502. The journal keeps the full text.
+const maxFlashBytes = 1 << 10
+
 // redirectFlash POST-redirect-GETs with a message, so a refresh after a
 // write never re-submits it.
+//
+// The message is escaped with url.QueryEscape, which escapes everything the
+// query grammar treats specially. The hand-rolled replacer it replaces left
+// ';' and control bytes raw, and net/url drops any query pair containing a
+// ';' — so a failed action whose output held one flashed nothing at all.
 func (s *server) redirectFlash(w http.ResponseWriter, r *http.Request, path, msg string, isErr bool) {
-	q := "?msg=" + urlQueryEscape(msg)
+	q := "?msg=" + url.QueryEscape(truncateFlash(msg))
 	if isErr {
 		q += "&err=1"
 	}
 	http.Redirect(w, r, path+q, http.StatusSeeOther)
 }
 
-// urlQueryEscape escapes a flash message for the query string.
-func urlQueryEscape(s string) string {
-	return strings.NewReplacer(
-		"%", "%25", "&", "%26", "#", "%23", "+", "%2B",
-		" ", "+", "\n", " ", "\r", " ",
-	).Replace(s)
+// truncateFlash cuts msg to maxFlashBytes on a rune boundary, saying so.
+func truncateFlash(msg string) string {
+	if len(msg) <= maxFlashBytes {
+		return msg
+	}
+	cut := maxFlashBytes
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + " … (truncated; the full text is in the console's journal)"
 }
 
 // write renders a page. The template is executed into a buffer FIRST: a

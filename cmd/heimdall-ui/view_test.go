@@ -66,7 +66,7 @@ func TestBuildFindingsOrdersByTierThenRecencyThenFingerprint(t *testing.T) {
 		// tiebreak must settle it, or the list reshuffles between renders.
 		entry("dddd", "c-unknown2", "t5", "unknown", "critical", fixedNow),
 	}
-	got := BuildFindings(fixedNow, entries, nil)
+	got := BuildFindings(fixedNow, entries, SuppressionContext{})
 
 	var order []string
 	for _, v := range got {
@@ -84,9 +84,9 @@ func TestBuildFindingsIsDeterministicAcrossRuns(t *testing.T) {
 		entry("aaaa", "b", "t", "firing", "critical", fixedNow),
 		entry("bbbb", "c", "t", "firing", "critical", fixedNow),
 	}
-	first := BuildFindings(fixedNow, entries, nil)
+	first := BuildFindings(fixedNow, entries, SuppressionContext{})
 	for i := 0; i < 5; i++ {
-		again := BuildFindings(fixedNow, entries, nil)
+		again := BuildFindings(fixedNow, entries, SuppressionContext{})
 		if diff := cmp.Diff(first, again); diff != "" {
 			t.Fatalf("run %d differs (-first +again):\n%s", i, diff)
 		}
@@ -116,7 +116,7 @@ func TestBuildFindingsKeepsMutedRowsVisibleAndCounted(t *testing.T) {
 		entry("aaaa", "c1", "t1", "firing", "critical", fixedNow),
 		entry("bbbb", "c2", "t2", "firing", "critical", fixedNow),
 	}
-	got := BuildFindings(fixedNow, entries, authority)
+	got := BuildFindings(fixedNow, entries, SuppressionContext{Authority: authority})
 
 	if len(got) != 2 {
 		t.Fatalf("want both findings present, got %d", len(got))
@@ -163,9 +163,76 @@ func TestBuildFindingsExpiredSuppressionDoesNotMute(t *testing.T) {
 	authority, _ := suppress.NewAuthority(nil, []suppress.Suppression{sup})
 	got := BuildFindings(fixedNow, []ledger.Entry{
 		entry("aaaa", "c1", "t1", "firing", "critical", fixedNow),
-	}, authority)
+	}, SuppressionContext{Authority: authority})
 	if got[0].Muted {
 		t.Error("an expired suppression must not mute")
+	}
+}
+
+// group_check is the scope every Telegram mute button writes, and the ledger
+// stores no group. The console must evaluate it where a spool document gave
+// the group, and must NOT claim "none active" where it could not.
+func TestBuildFindingsEvaluatesGroupScopedSuppressions(t *testing.T) {
+	rec := func(key string, scope suppress.Scope, m suppress.Matcher, reason string) suppress.Suppression {
+		return suppress.Suppression{
+			Key: key, Scope: scope, Matcher: m,
+			Until:          fixedNow.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			CumulativeDays: 7, Reason: reason, Actor: "tg-user", Source: suppress.SourceRuntime,
+		}
+	}
+	telegramMute := rec("btn-backup--backup-verify", suppress.ScopeGroupCheck,
+		suppress.Matcher{Group: "backup", Check: "backup-verify"}, "muted via Telegram [Mute 7d]")
+	fpMute := rec("ui-aaaa", suppress.ScopeFingerprint, suppress.Matcher{Fingerprint: "aaaa"}, "console mute")
+
+	type row struct {
+		Muted  bool
+		Reason string
+		Caveat string
+	}
+	for _, tc := range []struct {
+		name        string
+		recs        []suppress.Suppression
+		sc          SuppressionContext // Authority is built from recs unless noAuthority
+		noAuthority bool
+		want        row
+	}{
+		{"group known and matching", []suppress.Suppression{telegramMute},
+			SuppressionContext{Groups: map[string]string{"aaaa": "backup"}, GroupScoped: true}, false,
+			row{Muted: true, Reason: "muted via Telegram [Mute 7d]"}},
+		{"group known, a different group", []suppress.Suppression{telegramMute},
+			SuppressionContext{Groups: map[string]string{"aaaa": "media"}, GroupScoped: true}, false,
+			row{}},
+		{"group unknown while a group-scoped record is active", []suppress.Suppression{telegramMute},
+			SuppressionContext{GroupScoped: true}, false,
+			row{Caveat: caveatGroupUnknown}},
+		{"group unknown but no group-scoped record exists", []suppress.Suppression{fpMute},
+			SuppressionContext{Groups: nil, GroupScoped: false}, false,
+			row{Muted: true, Reason: "console mute"}},
+		{"group unknown, nothing matches, no group scope in force", nil,
+			SuppressionContext{GroupScoped: false}, false,
+			row{}},
+		{"a fingerprint mute is conclusive even without the group", []suppress.Suppression{telegramMute, fpMute},
+			SuppressionContext{GroupScoped: true}, false,
+			row{Muted: true, Reason: "console mute"}},
+		{"no authority at all", nil, SuppressionContext{}, true,
+			row{Caveat: caveatUnavailable}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := tc.sc
+			if !tc.noAuthority {
+				a, skipped := suppress.NewAuthority(nil, tc.recs)
+				if skipped != 0 {
+					t.Fatalf("authority skipped %d valid rows", skipped)
+				}
+				sc.Authority = a
+			}
+			got := BuildFindings(fixedNow, []ledger.Entry{
+				entry("aaaa", "backup-verify", "datastore-02", "firing", "critical", fixedNow),
+			}, sc)
+			if diff := cmp.Diff(tc.want, row{got[0].Muted, got[0].MuteReason, got[0].SuppressionCaveat}); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

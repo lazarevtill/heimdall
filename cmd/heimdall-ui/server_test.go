@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lazarevtill/heimdall/internal/bridge"
 	"github.com/lazarevtill/heimdall/internal/contract"
@@ -545,12 +547,63 @@ func TestFlashMessageIsEscapedIntoTheQueryAndOutOfTheMarkup(t *testing.T) {
 	}
 }
 
-func TestURLQueryEscape(t *testing.T) {
-	got := urlQueryEscape("a&b #c +d\ne")
-	for _, bad := range []string{"&", "#", "\n"} {
-		if strings.Contains(got, bad) {
-			t.Errorf("escaped flash still contains %q: %q", bad, got)
-		}
+// A flash message must arrive exactly as sent. The old hand-rolled escaper
+// left ';' raw, and net/url DROPS any query pair containing one — so a
+// failed action whose output held a ';' flashed nothing at all.
+func TestFlashSurvivesTheRedirect(t *testing.T) {
+	ts := newTestServer(t, nil)
+	for _, msg := range []string{
+		"step 1 ok; step 2 FAILED: disk full",
+		"a&b #c +d %e",
+		"line one\nline two",
+		"exit 1 — \x1b[31mred\x1b[0m",
+		"?msg=spoof&err=0",
+	} {
+		t.Run(msg, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			ts.redirectFlash(w, req("POST", "/mute", nil), "/", msg, true)
+			loc := w.Header().Get("Location")
+			u, err := url.Parse(loc)
+			if err != nil {
+				t.Fatalf("Location %q does not parse: %v", loc, err)
+			}
+			got, isErr := flashFrom(&http.Request{URL: u})
+			if got != msg || !isErr {
+				t.Errorf("flash = (%q, %v), want (%q, true); Location %q", got, isErr, msg, loc)
+			}
+		})
+	}
+}
+
+// Action output can be kilobytes; escaped into a Location header it would
+// exceed common proxies' header buffers. The flash is cut on a rune
+// boundary and says so.
+func TestTruncateFlash(t *testing.T) {
+	long := strings.Repeat("é", maxFlashBytes) // two bytes per rune
+	for _, tc := range []struct {
+		name, in     string
+		wantSame     bool
+		wantMaxBytes int
+	}{
+		{"short is untouched", "Muted for 7 day(s).", true, 0},
+		{"exactly the cap is untouched", strings.Repeat("a", maxFlashBytes), true, 0},
+		{"long is cut and marked", long, false, maxFlashBytes + 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateFlash(tc.in)
+			if tc.wantSame {
+				if got != tc.in {
+					t.Errorf("changed a message within the cap")
+				}
+				return
+			}
+			if len(got) > tc.wantMaxBytes || !strings.Contains(got, "truncated") {
+				t.Errorf("len=%d, want <= %d and a truncation note", len(got), tc.wantMaxBytes)
+			}
+			if !utf8.ValidString(got) {
+				t.Error("truncation split a rune")
+			}
+		})
 	}
 }
 
@@ -766,5 +819,328 @@ func TestDigestPageRendersBlindSpotsFirst(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("digest page missing %q", want)
 		}
+	}
+}
+
+// ── Cross-origin writes ─────────────────────────────────────────────────
+
+// A write a browser marks as coming from another origin is refused before
+// any handler runs — whatever the auth mode, and whether or not the request
+// would otherwise have been authorised. SameSite=Lax still sends the session
+// cookie from a same-site sibling, and `none` with anonymous writes has no
+// cookie at all, so without this a drive-by form could mute or run actions.
+func TestCrossOriginWritesAreRefused(t *testing.T) {
+	type setup func(t *testing.T, ts *testServer, r *http.Request)
+	anonymousLAN := func(t *testing.T, ts *testServer, r *http.Request) {
+		ts.authMode, ts.anonymousWrites = AuthNone, true
+	}
+	oidcOperator := func(t *testing.T, ts *testServer, r *http.Request) {
+		ts.authMode = AuthOIDC
+		ts.sessionKey = []byte("a-session-key-of-adequate-length")
+		payload, _ := json.Marshal(session{Subject: "s", Operator: testOperator, Expiry: fixedNow.Add(time.Hour).Unix()})
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sign(ts.sessionKey, purposeSession, payload)})
+	}
+	tokenOperator := func(t *testing.T, ts *testServer, r *http.Request) { withOperator(withAuth(r)) }
+
+	for _, tc := range []struct {
+		name    string
+		setup   setup
+		path    string
+		headers map[string]string
+	}{
+		{"drive-by mute on an anonymous LAN console", anonymousLAN, "/mute",
+			map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.invalid"}},
+		{"drive-by action on an anonymous LAN console", anonymousLAN, "/action/force-drain",
+			map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.invalid"}},
+		{"same-site sibling riding the Lax session cookie", oidcOperator, "/mute",
+			map[string]string{"Sec-Fetch-Site": "same-site", "Origin": "https://grafana.example.invalid"}},
+		{"same-site sibling running an action", oidcOperator, "/action/force-drain",
+			map[string]string{"Sec-Fetch-Site": "same-site"}},
+		{"old browser: no Sec-Fetch-Site, foreign Origin", tokenOperator, "/mute",
+			map[string]string{"Origin": "https://evil.invalid"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestServer(t, ActionSet{"force-drain": {Name: "force-drain", Label: "Force drain", Argv: []string{"/bin/true"}}})
+			fp := ts.seedFinding(t, "backup-verify", "datastore-02", contract.SeverityCritical)
+			form := url.Values{}
+			if tc.path == "/mute" {
+				form = url.Values{"fingerprint": {fp}, "reason": {"x"}, "days": {"14"}}
+			}
+			r := req("POST", tc.path, form)
+			tc.setup(t, ts, r)
+			for k, v := range tc.headers {
+				r.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+			ts.handler().ServeHTTP(w, r)
+			if w.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", w.Code)
+			}
+			mutes, err := ts.sup.ListRuntime()
+			if err != nil {
+				t.Fatalf("ListRuntime: %v", err)
+			}
+			if len(mutes) != 0 || len(ts.runner.ran) != 0 {
+				t.Errorf("a refused cross-origin write had an effect: %d mute(s), ran %v", len(mutes), ts.runner.ran)
+			}
+		})
+	}
+}
+
+// The protection must not break the console's own forms or non-browser
+// clients: a same-origin browser POST, and a request carrying neither
+// header, both still write.
+func TestSameOriginAndNonBrowserWritesStillWork(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"the console's own form", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "http://example.com"}},
+		{"old browser, matching Origin", map[string]string{"Origin": "http://example.com"}},
+		{"automation with the bearer token", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestServer(t, nil)
+			fp := ts.seedFinding(t, "c1", "t1", contract.SeverityCritical)
+			r := withOperator(withAuth(req("POST", "/mute", url.Values{"fingerprint": {fp}, "reason": {"x"}, "days": {"1"}})))
+			for k, v := range tc.headers {
+				r.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+			ts.handler().ServeHTTP(w, r)
+			if w.Code != http.StatusSeeOther {
+				t.Fatalf("status = %d, want 303", w.Code)
+			}
+			if mutes, _ := ts.sup.ListRuntime(); len(mutes) != 1 {
+				t.Errorf("want the mute written, got %d", len(mutes))
+			}
+		})
+	}
+}
+
+// ── Mute redirect targets ───────────────────────────────────────────────
+
+// The fingerprint is form input and becomes part of a redirect target. It is
+// validated before ANY redirect is built from it: `../\evil` used to clean
+// to `/\evil`, which a browser follows to //evil.
+func TestMuteNeverRedirectsOffSite(t *testing.T) {
+	ts := newTestServer(t, nil)
+	for _, fp := range []string{`../\evil.invalid`, `..%2F..%5Cevil.invalid`, `//evil.invalid`, "ABCDEF0123456789"} {
+		for _, form := range []url.Values{
+			{"fingerprint": {fp}, "reason": {""}, "days": {"7"}},   // the no-reason refusal
+			{"fingerprint": {fp}, "reason": {"x"}, "days": {"99"}}, // the bad-days refusal
+		} {
+			w := httptest.NewRecorder()
+			ts.handler().ServeHTTP(w, withOperator(withAuth(req("POST", "/mute", form))))
+			loc := w.Header().Get("Location")
+			if w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "/?") {
+				t.Errorf("fingerprint %q: status %d Location %q, want a 303 to the console root", fp, w.Code, loc)
+			}
+			if strings.Contains(loc, "evil") {
+				t.Errorf("fingerprint %q leaked into the redirect target: %q", fp, loc)
+			}
+		}
+	}
+	if mutes, _ := ts.sup.ListRuntime(); len(mutes) != 0 {
+		t.Errorf("a malformed fingerprint wrote %d mute(s)", len(mutes))
+	}
+}
+
+// ── Liveness ────────────────────────────────────────────────────────────
+
+// /healthz is a real query, so a dead ledger handle reads as unhealthy.
+func TestHealthzFailsWhenTheLedgerCannotAnswer(t *testing.T) {
+	ts := newTestServer(t, nil)
+	ts.led.Close()
+	w := httptest.NewRecorder()
+	ts.handler().ServeHTTP(w, req("GET", "/healthz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 with the ledger closed", w.Code)
+	}
+}
+
+// The bridge probe runs on every page, so it is bound to the request: a
+// browser that gives up stops the probe with it.
+func TestBridgeProbeHonoursTheRequestContext(t *testing.T) {
+	release := make(chan struct{})
+	bridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer bridgeSrv.Close()
+	defer close(release)
+
+	ts := newTestServer(t, nil)
+	ts.bridgeHealthzURL = bridgeSrv.URL
+	ts.httpc = &http.Client{Timeout: 30 * time.Second}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, ok := ts.probeBridge(ctx); ok {
+		t.Error("a cancelled probe must not report the bridge alive")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("the probe ignored the request context: took %s", elapsed)
+	}
+}
+
+// ── Suppression state on the pages ──────────────────────────────────────
+
+// seedFindingWithSpool seeds the ledger AND writes the detector's real spool
+// document for the same finding, so the console can learn its group.
+func (ts *testServer) seedFindingWithSpool(t *testing.T, check, target, group string) string {
+	t.Helper()
+	f, err := contract.NewFinding(fixedNow, contract.FindingSpec{
+		Check: check, Target: target, Group: group, Node: "n",
+		Class: contract.ClassHard, Severity: contract.SeverityCritical,
+		State: contract.StateFiring, Title: "t",
+	})
+	if err != nil {
+		t.Fatalf("NewFinding: %v", err)
+	}
+	if err := ts.led.Upsert(fixedNow, []contract.Finding{f}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := emit.WriteSpool(ts.spoolDir, []contract.Finding{f}); err != nil {
+		t.Fatalf("WriteSpool: %v", err)
+	}
+	return f.Fingerprint
+}
+
+// A Telegram mute is group-scoped. Where the spool gives the group, the
+// console must show the finding muted; where it cannot, it must say it
+// cannot tell rather than "none active".
+func TestTelegramMutesAreEvaluatedWhereTheGroupIsKnown(t *testing.T) {
+	ts := newTestServer(t, nil)
+	withSpool := ts.seedFindingWithSpool(t, "backup-verify", "datastore-02", "backup")
+	noSpool := ts.seedFinding(t, "backup-verify", "datastore-03", contract.SeverityCritical) // group "g", no spool doc
+	for _, g := range []string{"backup", "g"} {
+		if _, err := ts.sup.AddMute(fixedNow, "btn-"+g+"--backup-verify", suppress.ScopeGroupCheck,
+			suppress.Matcher{Group: g, Check: "backup-verify"}, 7, "", "", "muted via Telegram [Mute 7d]", "tg-user"); err != nil {
+			t.Fatalf("AddMute: %v", err)
+		}
+	}
+
+	until := fixedNow.Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	for _, tc := range []struct {
+		name, path string
+		want       []string
+		notWant    []string
+	}{
+		{"detail, group known", "/finding/" + withSpool,
+			[]string{"muted · still detected", until}, []string{"none active", caveatGroupUnknown}},
+		{"detail, group unknown", "/finding/" + noSpool,
+			[]string{caveatGroupUnknown}, []string{"none active", "muted · still detected"}},
+		{"list", "/",
+			[]string{"muted · still detected", "muted via Telegram [Mute 7d]", "suppression: " + caveatGroupUnknown}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			ts.handler().ServeHTTP(w, withAuth(req("GET", tc.path, nil)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d", w.Code)
+			}
+			body := w.Body.String()
+			for _, s := range tc.want {
+				if !strings.Contains(body, s) {
+					t.Errorf("page missing %q", s)
+				}
+			}
+			for _, s := range tc.notWant {
+				if strings.Contains(body, s) {
+					t.Errorf("page should not say %q", s)
+				}
+			}
+		})
+	}
+}
+
+// A broken suppressions.json must not take the console down: every page
+// renders, says the suppression state is unavailable, and does not claim
+// "none active" or "nothing suppressed".
+func TestBrokenSuppressionsFileDegradesInsteadOfFailing(t *testing.T) {
+	ts := newTestServer(t, nil)
+	fp := ts.seedFinding(t, "backup-verify", "datastore-02", contract.SeverityCritical)
+	broken := filepath.Join(t.TempDir(), "suppressions.json")
+	if err := os.WriteFile(broken, []byte(`[{"key":`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ts.suppressionsFile = broken
+
+	for _, tc := range []struct {
+		path    string
+		want    []string
+		notWant []string
+	}{
+		{"/", []string{"backup-verify", "Suppression state is unavailable", caveatUnavailable}, nil},
+		{"/finding/" + fp, []string{"backup-verify", "Suppression state is unavailable", caveatUnavailable}, []string{"none active"}},
+		{"/delivery", []string{"Suppression state is unavailable", "telegram"}, []string{"Nothing suppressed."}},
+		{"/hypotheses", []string{"Suppression state is unavailable"}, nil},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			ts.handler().ServeHTTP(w, withAuth(req("GET", tc.path, nil)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 with a notice", w.Code)
+			}
+			body := w.Body.String()
+			for _, s := range tc.want {
+				if !strings.Contains(body, s) {
+					t.Errorf("page missing %q", s)
+				}
+			}
+			for _, s := range tc.notWant {
+				if strings.Contains(body, s) {
+					t.Errorf("page should not say %q", s)
+				}
+			}
+		})
+	}
+}
+
+// A hypothesis dismissed declaratively is dismissed: the page asks the full
+// authority, not just the runtime mutes.
+func TestHypothesisDismissalComesFromTheWholeAuthority(t *testing.T) {
+	ts := newTestServer(t, nil)
+	writeRun(t, ts.analystRunDir, sampleRun("20260823T050000Z", fixedNow,
+		contract.HypothesisFinding{Hypothesis: "declared away", Fingerprint: "91c4aaaabbbbcccc"},
+		contract.HypothesisFinding{Hypothesis: "still open", Fingerprint: "1234aaaabbbbcccc"}))
+	decl := filepath.Join(t.TempDir(), "suppressions.json")
+	body := `[{"key":"decl-h","scope":"hypothesis","matcher":{"hyp_fp":"91c4aaaabbbbcccc"},` +
+		`"until":"` + fixedNow.Add(48*time.Hour).Format(time.RFC3339) + `","cumulative_days":2,` +
+		`"reason":"known correlation, tracked in IaC","actor":"iac"}]`
+	if err := os.WriteFile(decl, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ts.suppressionsFile = decl
+
+	w := httptest.NewRecorder()
+	ts.handler().ServeHTTP(w, withAuth(req("GET", "/hypotheses", nil)))
+	page := w.Body.String()
+	if strings.Count(page, "dismissed by an operator") != 1 {
+		t.Errorf("want exactly one hypothesis marked dismissed, got %d", strings.Count(page, "dismissed by an operator"))
+	}
+	if !strings.Contains(page, "known correlation, tracked in IaC") {
+		t.Error("the declarative reason should be shown")
+	}
+}
+
+// A corrupt newest run must not vanish without a word.
+func TestHypothesesPageSaysWhenRunFilesAreUnreadable(t *testing.T) {
+	ts := newTestServer(t, nil)
+	ts.analystRunDir = t.TempDir()
+	writeRun(t, ts.analystRunDir, sampleRun("20260823T050000Z", fixedNow,
+		contract.HypothesisFinding{Hypothesis: "h", Fingerprint: "aaaabbbbccccdddd"}))
+	if err := os.WriteFile(filepath.Join(ts.analystRunDir, "20260823T060000Z.json"), []byte("{"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	ts.handler().ServeHTTP(w, withAuth(req("GET", "/hypotheses", nil)))
+	if !strings.Contains(w.Body.String(), "1 run file(s) among the most recent could not be read") {
+		t.Error("the page should say a run file could not be read")
 	}
 }

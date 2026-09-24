@@ -148,3 +148,59 @@ func TestExecRunnerHonoursCallerCancellation(t *testing.T) {
 		t.Fatal("want an error for an already-cancelled context")
 	}
 }
+
+// The cap is applied as output ARRIVES: a flood never sits in memory, and
+// every write reports complete so a chatty child never sees EPIPE.
+func TestCappedBufferKeepsTheHeadAndAcceptsEveryWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		limit         int
+		writes        []string
+		wantKept      string
+		wantTruncated bool
+	}{
+		{"under the cap", 8, []string{"abc", "de"}, "abcde", false},
+		{"exactly the cap", 5, []string{"abc", "de"}, "abcde", false},
+		{"a write straddles the cap", 4, []string{"abc", "de"}, "abcd", true},
+		{"writes after the cap are dropped", 3, []string{"abc", "de", "fgh"}, "abc", true},
+		{"empty writes change nothing", 3, []string{"abc", ""}, "abc", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &cappedBuffer{limit: tc.limit}
+			for _, w := range tc.writes {
+				n, err := c.Write([]byte(w))
+				if n != len(w) || err != nil {
+					t.Fatalf("Write(%q) = (%d, %v), want (%d, nil)", w, n, err, len(w))
+				}
+			}
+			if got := c.buf.String(); got != tc.wantKept || c.truncated != tc.wantTruncated {
+				t.Errorf("kept %q truncated=%v, want %q truncated=%v", got, c.truncated, tc.wantKept, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+// A child that outlives the command while holding its stdout (backgrounded,
+// or escaped from the process group) must not hold the handler hostage: the
+// command's own exit is reported once actionWaitDelay has passed.
+func TestExecRunnerDoesNotWaitForAChildHoldingTheOutput(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	start := time.Now()
+	res, err := ExecRunner{}.Run(context.Background(), Action{
+		Name: "leaves-a-child",
+		// sh exits 0 at once; the backgrounded sleep inherits stdout.
+		Argv:    []string{"/bin/sh", "-c", "sleep 8 & echo started"},
+		Timeout: 20 * time.Second,
+	})
+	if elapsed := time.Since(start); elapsed > actionWaitDelay+3*time.Second {
+		t.Fatalf("Run waited %s for a child holding the pipe; want about actionWaitDelay (%s)", elapsed, actionWaitDelay)
+	}
+	if err != nil {
+		t.Fatalf("the command itself exited 0; want success, got %v", err)
+	}
+	if !strings.Contains(res.Output, "started") || !strings.Contains(res.Output, "may be incomplete") {
+		t.Errorf("Output = %q, want the command's output plus a note that it may be incomplete", res.Output)
+	}
+}

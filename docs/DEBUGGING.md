@@ -242,7 +242,28 @@ including reads. In `oidc` mode a browser is redirected to `/login` instead.
 **Writes 403 with a valid session** — the identity is not on
 `HEIMDALL_UI_OPERATORS`. In OIDC mode the allow-list is matched against `sub`,
 `email` and `preferred_username`; check which one your provider actually
-populates by reading the login line in the journal.
+populates by reading the login line in the journal. The allow-list is
+re-checked on every request, so an operator removed from it loses writes on
+the next restart even with a live session.
+
+**A POST answers 403 before any handler logs anything** — cross-origin
+protection refused it: the browser marked the request as coming from another
+origin (`Sec-Fetch-Site: cross-site` or `same-site`), or an old browser sent an
+`Origin` that does not match `Host`. Behind a reverse proxy, check that the
+proxy preserves `Host`.
+
+**Everyone was logged out after an upgrade** — expected once: session cookies
+signed before cookie signatures were bound to their purpose no longer verify.
+
+**"Suppression state is unavailable"** — the suppression authority could not
+be read (usually a malformed `suppressions.json`, or a state.db error). The
+pages still render, but nothing is marked muted, and the banner says that this
+does NOT mean nothing is. The cause is in the console's journal.
+
+**"group-scoped suppressions cannot be evaluated here"** — a `group_check`
+mute (the scope every Telegram mute button writes) is active, and this
+finding has no spool document to recover its group from. The ledger stores no
+group, so the console cannot tell whether that mute covers this row.
 
 **OIDC login fails** — the daemon does discovery at boot, so a bad issuer
 stops it starting. After that:

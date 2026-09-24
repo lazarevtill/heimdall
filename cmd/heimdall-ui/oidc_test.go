@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,6 +27,20 @@ type fakeProvider struct {
 	kid    string
 	srv    *httptest.Server
 	issuer string
+
+	// The token endpoint answers with whatever idToken returns; with none
+	// set it refuses the grant. tokenCalls counts every exchange attempt, so
+	// a test can prove a refusal happened BEFORE the provider was asked.
+	mu         sync.Mutex
+	idToken    func() string
+	tokenCalls atomic.Int32
+}
+
+// issue sets what the token endpoint returns for the next exchange.
+func (p *fakeProvider) issue(f func() string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.idToken = f
 }
 
 func newFakeProvider(t *testing.T) *fakeProvider {
@@ -43,6 +59,19 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 			TokenEndpoint:         p.issuer + "/token",
 			JWKSURI:               p.issuer + "/jwks",
 		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		p.tokenCalls.Add(1)
+		p.mu.Lock()
+		issue := p.idToken
+		p.mu.Unlock()
+		// A real provider refuses an exchange without the PKCE verifier.
+		if issue == nil || r.ParseForm() != nil || r.PostForm.Get("code_verifier") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"id_token": issue(), "token_type": "Bearer"})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		e := big.NewInt(int64(key.PublicKey.E)).Bytes()
@@ -229,6 +258,20 @@ func TestVerifyIDTokenRefusesTamperedTokens(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// An empty expected nonce is a lost binding, not "skip the check": even a
+// token whose own nonce is also empty must be refused.
+func TestVerifyIDTokenRefusesAnEmptyExpectedNonce(t *testing.T) {
+	p := newFakeProvider(t)
+	c := p.client(t, fixedNow)
+	claims := validClaims(p, fixedNow)
+	claims["nonce"] = ""
+	tok := p.signToken(map[string]any{"alg": "RS256", "kid": p.kid, "typ": "JWT"}, claims)
+	_, err := c.VerifyIDToken(context.Background(), tok, "")
+	if err == nil || !strings.Contains(err.Error(), "no nonce") {
+		t.Errorf("err = %v, want a refusal naming the missing nonce", err)
 	}
 }
 

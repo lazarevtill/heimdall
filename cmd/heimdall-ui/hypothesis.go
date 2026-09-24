@@ -91,6 +91,11 @@ type HypothesesView struct {
 	Total int
 	// Truncated is true when more runs exist on disk than are shown.
 	Truncated bool
+	// Unreadable counts run files (among those considered) that could not be
+	// opened or decoded. They are skipped rather than blanking the page, but
+	// never silently: a corrupt newest run must not simply vanish, and a
+	// directory of nothing BUT corrupt runs must not read as "no runs".
+	Unreadable int
 }
 
 // ReadRuns loads the most recent analyst runs.
@@ -99,8 +104,12 @@ type HypothesesView struct {
 // unreadable directory yields Present=false with a reason. One corrupt run
 // file is skipped rather than blanking the page — but it is never rendered
 // as an empty successful run, which would read as "the analyst found
-// nothing".
-func ReadRuns(dir string, now time.Time, muted map[string]contract2Suppression) HypothesesView {
+// nothing", and it is counted in Unreadable so the page can say so.
+//
+// dismissed reports whether an operator has dismissed a hypothesis, and why.
+// It is the suppression authority's decision, adapted by the caller; nil
+// means "unknown", and marks nothing dismissed.
+func ReadRuns(dir string, now time.Time, dismissed func(hypFP string) (reason string, ok bool)) HypothesesView {
 	if dir == "" {
 		return HypothesesView{Reason: "No analyst run directory is configured, so Tier-3 hypotheses are unavailable."}
 	}
@@ -134,6 +143,7 @@ func ReadRuns(dir string, now time.Time, muted map[string]contract2Suppression) 
 	for _, name := range names {
 		run, ok := readRunFile(filepath.Join(dir, name))
 		if !ok {
+			v.Unreadable++
 			continue
 		}
 		rv := RunView{
@@ -169,22 +179,23 @@ func ReadRuns(dir string, now time.Time, muted map[string]contract2Suppression) 
 				TextTruncated:  utf8.RuneCountInString(f.Hypothesis) >= contract.HypMaxText,
 				RowsTruncated:  len(f.EvidenceRows) >= hypBoundedItems,
 			}
-			if s, ok := muted[f.Fingerprint]; ok {
-				hv.Muted = true
-				hv.MuteReason = s.Reason
+			if dismissed != nil {
+				if reason, ok := dismissed(f.Fingerprint); ok {
+					hv.Muted = true
+					hv.MuteReason = reason
+				}
 			}
 			rv.Findings = append(rv.Findings, hv)
 			v.Total++
 		}
 		v.Runs = append(v.Runs, rv)
 	}
+	if len(v.Runs) == 0 && v.Unreadable > 0 {
+		v.Reason = fmt.Sprintf("%d analyst run file(s) are on disk, but none could be read. "+
+			"This is not the same as the analyst having produced nothing.", v.Unreadable)
+	}
 	return v
 }
-
-// contract2Suppression is the minimal suppression shape this page needs,
-// declared locally so the reader does not depend on the suppress package's
-// full record just to show a reason.
-type contract2Suppression struct{ Reason string }
 
 // readRunFile decodes one run file. contract.AnalystRun is plain strings and
 // slices — no int-backed enum — so it round-trips through encoding/json

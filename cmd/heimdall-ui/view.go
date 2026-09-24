@@ -56,6 +56,32 @@ type FindingView struct {
 	MuteReason string
 	// MuteUntil is the active suppression's expiry, when muted.
 	MuteUntil string
+	// SuppressionCaveat is set when the row is NOT shown as muted but the
+	// console cannot actually rule a suppression out — so the page must not
+	// say "none active". Empty means the absence of a mute is established.
+	SuppressionCaveat string
+}
+
+// The two reasons a row's suppression state can be undecidable.
+const (
+	caveatUnavailable  = "suppression state unavailable"
+	caveatGroupUnknown = "group-scoped suppressions cannot be evaluated here"
+)
+
+// SuppressionContext is what BuildFindings needs to annotate each row, and
+// to be honest when it cannot.
+type SuppressionContext struct {
+	// Authority is the evaluated suppression authority, or nil when it could
+	// not be built. A nil authority marks every row undecidable — never
+	// "not muted".
+	Authority *suppress.Authority
+	// Groups maps fingerprint → group where a spool document recorded one.
+	// The ledger stores no group, so this is the console's only source; a
+	// fingerprint absent from the map has an UNKNOWN group, not an empty one.
+	Groups map[string]string
+	// GroupScoped is true when at least one active group_check record exists.
+	// An unknown group only matters then.
+	GroupScoped bool
 }
 
 // classify assigns the reading tier and badge label for a ledger entry.
@@ -90,7 +116,7 @@ func classify(state, severity string) (tier int, label string) {
 // fingerprint tiebreak matters: one detector run stamps every finding with
 // an identical last_seen, so without it the list would reshuffle between
 // renders for no reason.
-func BuildFindings(now time.Time, entries []ledger.Entry, authority *suppress.Authority) []FindingView {
+func BuildFindings(now time.Time, entries []ledger.Entry, sc SuppressionContext) []FindingView {
 	out := make([]FindingView, 0, len(entries))
 	for _, e := range entries {
 		tier, label := classify(e.State, e.Severity)
@@ -108,15 +134,27 @@ func BuildFindings(now time.Time, entries []ledger.Entry, authority *suppress.Au
 			Tier:         tier,
 			Label:        label,
 		}
-		if authority != nil {
+		if sc.Authority == nil {
+			v.SuppressionCaveat = caveatUnavailable
+		} else {
 			// MatchFields is used rather than FindingSuppression because the
 			// ledger stores the identity fields, not a reconstructed
 			// contract.Finding — and fabricating one here would mean
 			// inventing a class and severity the ledger never recorded.
-			if s := authority.MatchFields(now, e.Fingerprint, "", e.Check, e.Target); s != nil {
+			//
+			// The group comes from the spool, when there is one. Passing ""
+			// for an unknown group can still establish a fingerprint- or
+			// target-scoped mute, but it can never match group_check — the
+			// scope every Telegram mute button writes — so a miss is only
+			// conclusive when the group was known or no group-scoped
+			// record is active.
+			group, groupKnown := sc.Groups[e.Fingerprint]
+			if s := sc.Authority.MatchFields(now, e.Fingerprint, group, e.Check, e.Target); s != nil {
 				v.Muted = true
 				v.MuteReason = s.Reason
 				v.MuteUntil = s.Until
+			} else if !groupKnown && sc.GroupScoped {
+				v.SuppressionCaveat = caveatGroupUnknown
 			}
 		}
 		out = append(out, v)
