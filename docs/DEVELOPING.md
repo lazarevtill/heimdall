@@ -233,6 +233,18 @@ explicit zero for every expected label combination. A sink that has never had
 a backlog must still have a series, or it is indistinguishable from a sink
 that was removed.
 
+### A redaction pattern that crosses a JSON string
+
+`contract.Redact` is also run over serialized JSON (and must stay safe
+there), where `"` ends a string and `\` starts an escape. The old
+url-credentials pattern once matched from one digest row's `https://` to a
+LATER row's `@`. It spliced two rows into one: still valid JSON, zero failures
+counted. So **no repeating character class in a pattern may admit `"` or
+`\`** (use the shared `secretValue` fragment).
+`TestRedactNeverConsumesAQuoteOrBackslash` enforces it for every pattern.
+Where a structured document leaves the process, prefer redacting each
+decoded string, as `internal/llm` does, to redacting the serialized form.
+
 ---
 
 ## Process

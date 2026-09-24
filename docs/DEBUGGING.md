@@ -90,6 +90,16 @@ or open the finding in the console, which renders the same document.
 
 Common causes: credential expired, endpoint unreachable, the query returned
 an empty vector, a plugin exited non-zero or blew its deadline or output cap.
+Also, by design:
+- **a NaN or ±Inf sample** (e.g. `histogram_quantile` on an idle series, or a
+  division by a zero derivative). It is not a measurement, so it is refused
+  at the source;
+- **a dead-man timestamp more than 5 minutes in the future**. That is almost
+  always a success metric exported in milliseconds rather than seconds, or
+  clock skew. The evidence says which;
+- **a graduated trend whose signal went blind.** Once a Tier-2 trend has
+  graduated, it stays present as `unknown` rather than resolving when its
+  source fails, and only a measured value below `clear_threshold` resolves it.
 A plugin failure is deliberately whole-batch: `Run` accepts output entirely or
 discards it entirely, so a partly-broken plugin can never look like a calm run.
 
@@ -200,9 +210,13 @@ jq '{generated_at, rows: (.rows|length), unknown_markers, rows_truncated}' \
 - **Rows all `baseline_warming`** → Tier 2 needs its 7-day warm-up. A
   never-seen `(check, target)` is warming by default, fail-closed. This is
   expected on a fresh install and resolves itself.
-- **`rows_truncated` persistently non-zero** → the 200-row cap is biting. The
-  cap keeps non-ok rows preferentially, so what was dropped was calm, but
-  sustained truncation is worth raising.
+- **`rows_truncated` persistently non-zero** → the 200-row or 32 KB cap is
+  biting (`heimdall_digest_rows_truncated_total`). The caps keep non-ok rows
+  preferentially, so what was dropped was calm, but sustained truncation is
+  worth raising.
+- **An echo list ends in `"[truncated: N more]"`** → more than 50 entries.
+  During a wide outage that is expected for `open_tier1_findings` and
+  `unknown_markers`.
 
 Dated history lives in `digest/history/` and is GC'd after 14 days.
 

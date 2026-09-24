@@ -64,7 +64,9 @@ file wins and the guide is wrong.
 - `internal/baseline` — Tier-2 SQLite store (features/warmup/template_baseline/crossing) over the
   engine `state.db` (own handle, no `PRAGMA user_version`).
 - `internal/tier2` — Tier-2 C6–C9 evaluation (robust-IQR zscore), graduation with hysteresis +
-  7-day warm-up; unknown/warming never graduates.
+  7-day warm-up; unknown/warming never graduates. A GRADUATED trend is held — Firing in the hold
+  band, Unknown when unmeasurable — until a measured clear, so it never flaps at the threshold or
+  resolves on a backend outage (the `.prom` is replaced whole every run).
 - `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
   `latest.json` + 14-day dated history).
 - `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).

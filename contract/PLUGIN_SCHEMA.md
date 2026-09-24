@@ -20,7 +20,8 @@ subprocess instead of a harness edit. Go types + enforcement: `internal/plugin`.
   interpreted).
 - **capabilities** — see below.
 - **budgets** — `{deadline_seconds, memory_mb, max_output_bytes}`;
-  `deadline_seconds > 0` and `max_output_bytes > 0` are hard requirements;
+  `deadline_seconds > 0` and `0 < max_output_bytes <= 16 MiB`
+  (`plugin.MaxOutputBytesLimit`) are hard requirements;
   `memory_mb >= 0` is accepted but only **advisory** at N=1 (see Sandbox
   status).
 
@@ -97,7 +98,12 @@ following is a fail-closed error, not a degraded success:
 - the child exits non-zero
 - the deadline elapses (`min(ctx deadline, budgets.deadline_seconds)`) — the
   child **and its process group** are killed so a forking child cannot
-  outlive the timeout
+  outlive the timeout. The deadline also holds against a descendant that
+  left the process group (`setsid`, a double fork) and still holds the
+  output pipes: the host closes its own read ends at the deadline instead of
+  waiting for EOF. Such a descendant itself survives, because a process-group
+  kill cannot reach it; killing it is the systemd unit's job (`KillMode=`
+  and the cgroup).
 - the child's stdout exceeds `budgets.max_output_bytes` — the child is
   killed and the output is discarded, never truncated-and-returned
 
@@ -107,7 +113,10 @@ process — no `PATH`, no `HOME`, no ambient secrets — plus, iff `kind` is
 `"<credential>=<secret>"` carrying the one declared credential's value.
 Captured stderr (bounded to a small fixed cap) is folded into the error text
 on a non-zero exit or a kill, for diagnostics only — it is never mixed into
-the returned stdout.
+the returned stdout. The injected credential's exact value is replaced with
+`[REDACTED:plugin-credential]` in that stderr text, and in any per-query error
+text, before it goes anywhere. The pattern redactor only knows secret
+*shapes*, but the host knows this secret's exact value.
 
 `Run` validates none of the plugin's stdout **content** — it does not decode
 JSON or check the payload's own `plugin_api` field. That is the separate

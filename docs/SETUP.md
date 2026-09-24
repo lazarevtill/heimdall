@@ -62,7 +62,20 @@ cannot be diagnosed while an earlier one is broken.
 
 The manifest is validated fail-loud: duplicate ids, duplicate
 `(check, target)` fingerprints, and a Tier-2 spec with `severity: critical`
-are all refused at load. That is deliberate — Tier 2 can never page.
+are all refused at load. That is deliberate — Tier 2 can never page. Each
+Tier-2 spec must also have:
+
+- `baseline_window_seconds > 0`. There is no default, and 0 made every row
+  read `ok`/zscore 0 forever.
+- A real hysteresis band, ordered for the signal's direction:
+  `clear_threshold < graduate_threshold` for `quantile`, `flap` and
+  `template_surprise`, and `clear_threshold > graduate_threshold` for `slope`.
+  Omitted (0/0) or equal thresholds are refused.
+- A unique `(target, feature)`. That pair is the baseline store's key, so two
+  specs sharing it would read each other's history as their own.
+
+Check the rendered manifest against these rules **before** upgrading: a
+violation stops the detector at load, and `HeimdallDetectorStale` pages.
 
 ### 2. `heimdall-detect` — Tier 1 + Tier 2
 
@@ -81,6 +94,13 @@ HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_QUERY_LIMIT=8
 HEIMDALL_CRED_FILE=/run/credentials/heimdall/creds    # k=v lines
 ```
+
+`HEIMDALL_PROM_URL` and `HEIMDALL_VL_URL` must be absolute `http(s)` URLs with
+a host, or the detector refuses to start. The error names the variable, never
+the value, because these URLs may carry credentials. A malformed cred-file
+line is reported by line number only, for the same reason. A Tier-1
+expectation may use `victorialogs` as well as `prometheus` once
+`HEIMDALL_VL_URL` is set.
 
 **Verify** — do not move on until all three are true:
 
