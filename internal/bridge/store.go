@@ -264,13 +264,17 @@ func (s *Store) StartEpisode(row IssueRow) error {
 	return nil
 }
 
-// RecordOpened is UpsertIssue for the row of an issue the bridge has just
-// CREATED in the tracker. It also appends the open to issue_opens, in the
-// same transaction, which is what the storm fuse counts. The issues table
-// has one row per marker and each new episode overwrites its opened_at, so
+// RecordOpened is UpsertIssue for the row of an issue the bridge CREATED in
+// the tracker. It also appends the open to issue_opens, in the same
+// transaction, which is what the storm fuse counts. The issues table has
+// one row per marker and each new episode overwrites its opened_at, so
 // counting there saw one flapping group opening a fresh issue every few
 // minutes as a single open, and the fuse never tripped. Rows older than
 // opensRetention are pruned here.
+//
+// It is idempotent per (marker, issue_id): Reconcile also calls it when it
+// completes an open that a crash or failed write left unrecorded, and a
+// creation must count once, never twice.
 func (s *Store) RecordOpened(row IssueRow) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -281,8 +285,10 @@ func (s *Store) RecordOpened(row IssueRow) error {
 		return fmt.Errorf("bridge: record opened %s: %w", row.Marker, err)
 	}
 	at := row.OpenedAt.Unix()
-	if _, err := tx.Exec(`INSERT INTO issue_opens (marker, issue_id, opened_at) VALUES (?, ?, ?)`,
-		row.Marker, row.IssueID, at); err != nil {
+	if _, err := tx.Exec(`
+INSERT INTO issue_opens (marker, issue_id, opened_at)
+SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM issue_opens WHERE marker = ? AND issue_id = ?)`,
+		row.Marker, row.IssueID, at, row.Marker, row.IssueID); err != nil {
 		return fmt.Errorf("bridge: record opened %s: append: %w", row.Marker, err)
 	}
 	if _, err := tx.Exec(`DELETE FROM issue_opens WHERE opened_at < ?`,

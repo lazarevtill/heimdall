@@ -599,8 +599,14 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 		// comment) and is mute-gated PER TARGET.
 		ledger.State = StateOpen
 		save := d.Store.UpsertIssue
-		if newEpisode {
+		switch {
+		case newEpisode:
 			save = d.Store.StartEpisode
+		case completingOpen:
+			// The issue was created by an open that never recorded it (a
+			// crash or failed write after the tracker's create). It still
+			// counts toward the storm fuse.
+			save = d.Store.RecordOpened
 		}
 		if err := save(ledger); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
@@ -680,7 +686,11 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 	}
 	if rowFound || isAuto {
 		ledger.State = StateResolved
-		if err := d.Store.UpsertIssue(ledger); err != nil {
+		save := d.Store.UpsertIssue
+		if completingOpen {
+			save = d.Store.RecordOpened // created, as above, even if already recovered
+		}
+		if err := save(ledger); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
 		}
 	}
