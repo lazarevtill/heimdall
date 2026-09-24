@@ -18,11 +18,12 @@
 // Like heimdall-bridge (and unlike the oneshot heimdall-detect/
 // heimdall-analyst), heimdall-notifier is a persistent daemon: it calls
 // time.Now().UTC() once per loop iteration (loop.go), never inside
-// internal/ (ADR-G10 exempts cmd/ for exactly this reason).
+// internal/ (ADR-G10 exempts cmd/ for exactly this reason). It stops
+// cleanly on SIGTERM/SIGINT.
 //
 // main is thin by design: env/flags, wiring, then runLoop. Every piece of
 // actual per-cycle logic lives in testable functions this package's tests
-// call directly (handleUpdates, runCycle, maybeSendDigest,
+// call directly (iterate, handleUpdates, runCycle, maybeSendDigest,
 // shouldSendDigest, weekKey) — the infinite for loop in loop.go is not
 // itself testable, so it contains no logic beyond calling those functions.
 package main
@@ -34,8 +35,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/lazarevtill/heimdall/internal/contract"
 	"github.com/lazarevtill/heimdall/internal/notify"
@@ -217,6 +220,9 @@ func run() error {
 		return err
 	}
 
+	// No client-wide Timeout: it would cut the getUpdates long-poll. Every
+	// other call gets its own deadline instead (notify.DefaultCallTimeout),
+	// applied where the call is made.
 	httpc := &http.Client{}
 	tg := telegram.NewClient(cfg.TelegramURL, cfg.TelegramToken, httpc)
 	sc := silence.NewClient(cfg.AlertmanagerURL, httpc)
@@ -264,6 +270,9 @@ func run() error {
 			AnalystChatID: cfg.AnalystChatID,
 			AllowedUsers:  cfg.AllowedUsers,
 			Routes:        routes,
+			// Lives for the process: a sink's 429 retry_after is honoured
+			// across cycles, not just for the rest of one drain pass.
+			Backoff: notify.NewSinkBackoff(),
 		},
 		Silence:          sc,
 		Suppress:         engineSuppress,
@@ -281,10 +290,15 @@ func run() error {
 		cfg.MainChatID, cfg.AnalystChatID, len(cfg.AllowedUsers), cfg.PollTimeoutSeconds,
 		strings.Join(sinkIDs, ","))
 
-	// runLoop runs for the life of the process (context.Background(): no
-	// signal-driven graceful shutdown in this slice, matching the brief's
-	// scope — a systemd unit's stop/restart is the operational shutdown
-	// path, exactly as for heimdall-bridge's http.ListenAndServe).
-	runLoop(context.Background(), tg, cd, cfg.PollTimeoutSeconds)
+	// SIGTERM (systemd stop/restart) and SIGINT end the loop cleanly: the
+	// signal interrupts a long-poll or an error backoff immediately, but an
+	// iteration that has already received updates finishes its dispatch,
+	// drain and heartbeat first (see iterate), so a restart never cuts a
+	// send between "delivered" and "recorded as delivered". The deferred
+	// store Closes then run.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	runLoop(ctx, tg, cd, cfg.PollTimeoutSeconds)
+	log.Print("stopping: shutdown signal received, in-flight cycle completed")
 	return nil
 }

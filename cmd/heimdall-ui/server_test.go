@@ -103,7 +103,7 @@ func newTestServer(t *testing.T, actions ActionSet) *testServer {
 		tmpl:          tmpl,
 		actions:       actions,
 		runner:        runner,
-		routes:        notify.DefaultTelegramRoutes(nil, 0, 0),
+		routing:       notify.DefaultTelegramRouting(),
 		authMode:      AuthToken,
 		token:         testToken,
 		operators:     map[string]bool{testOperator: true},
@@ -423,6 +423,43 @@ func TestMuteWritesThroughTheSuppressionAuthority(t *testing.T) {
 	}
 	if !strings.Contains(body, fp) {
 		t.Error("a muted finding must stay on the page")
+	}
+}
+
+// The flash states the expiry actually in force. A shorter mute over a
+// longer active one does not shorten it (the suppression store never
+// shortens and charges nothing for a no-op), so "Muted for 1 day(s)" would
+// tell the operator something false.
+func TestMuteFlashReportsTheExpiryInForce(t *testing.T) {
+	ts := newTestServer(t, nil)
+	fp := ts.seedFinding(t, "c1", "t1", contract.SeverityCritical)
+
+	mute := func(days string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		ts.handler().ServeHTTP(w, withOperator(withAuth(req("POST", "/mute", url.Values{
+			"fingerprint": {fp}, "reason": {"rollout noise"}, "days": {days},
+		}))))
+		if w.Code != http.StatusSeeOther {
+			t.Fatalf("status = %d, want 303", w.Code)
+		}
+		u, err := url.Parse(w.Header().Get("Location"))
+		if err != nil {
+			t.Fatalf("parse Location: %v", err)
+		}
+		msg, isErr := flashFrom(&http.Request{URL: u})
+		if isErr {
+			t.Fatalf("mute %sd flashed an error: %q", days, msg)
+		}
+		return msg
+	}
+
+	want := "Muted until " + fixedNow.Add(7*24*time.Hour).UTC().Format(time.RFC3339) + "."
+	if got := mute("7"); !strings.HasPrefix(got, want) {
+		t.Errorf("7d flash = %q, want prefix %q", got, want)
+	}
+	if got := mute("1"); !strings.HasPrefix(got, want) {
+		t.Errorf("1d over an active 7d: flash = %q, want it to report the unchanged expiry %q", got, want)
 	}
 }
 

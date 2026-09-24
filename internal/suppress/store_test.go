@@ -1,6 +1,7 @@
 package suppress_test
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,54 +39,143 @@ func TestAddMuteFirstCallSetsCumulativeDays(t *testing.T) {
 	}
 }
 
-func TestAddMuteExtendAccumulates(t *testing.T) {
-	s := openTestStore(t)
-	m := suppress.Matcher{Group: "disk", Check: "smart-fail"}
-	if _, err := s.AddMute(fixedNow, "k1", suppress.ScopeGroupCheck, m, 10, "", "", "r1", "ops"); err != nil {
-		t.Fatalf("AddMute #1: %v", err)
+// addMuteStep is one AddMute call in a scripted sequence against one key.
+type addMuteStep struct {
+	at      time.Duration // offset from fixedNow
+	addDays int
+	reason  string
+}
+
+// TestAddMuteCapSemantics pins the cap rules exactly:
+//
+//	(a) a row whose dated until is already past is a LAPSED mute: a new
+//	    press starts a fresh episode (cumulative = addDays, until = now+addDays);
+//	(b) on an active dated row, newUntil = max(existingUntil, now+addDays) and
+//	    cumulative grows by the whole extra days actually added —
+//	    ceil((newUntil-existingUntil)/24h), 0 when not extended — so a
+//	    shorter press never shortens a mute and costs nothing;
+//	the cap (30) is checked against the resulting cumulative.
+func TestAddMuteCapSemantics(t *testing.T) {
+	day := 24 * time.Hour
+	until := func(d time.Duration) string { return fixedNow.Add(d).UTC().Format(time.RFC3339) }
+
+	cases := []struct {
+		name  string
+		steps []addMuteStep
+		// want is the row after the LAST step (which must succeed).
+		wantUntil      string
+		wantCumulative int
+		wantReason     string
+	}{
+		{
+			name:      "first press",
+			steps:     []addMuteStep{{0, 7, "r1"}},
+			wantUntil: until(7 * day), wantCumulative: 7, wantReason: "r1",
+		},
+		{
+			name:      "a later press extends by the whole days it adds",
+			steps:     []addMuteStep{{0, 10, "r1"}, {day, 10, "r2"}},
+			wantUntil: until(11 * day), wantCumulative: 11, wantReason: "r2",
+		},
+		{
+			name:      "a partial-day extension is charged a whole day",
+			steps:     []addMuteStep{{0, 7, "r1"}, {time.Hour, 7, "r2"}},
+			wantUntil: until(7*day + time.Hour), wantCumulative: 8, wantReason: "r2",
+		},
+		{
+			name:      "a shorter press never shortens the mute and costs nothing",
+			steps:     []addMuteStep{{0, 7, "mute 7d"}, {time.Hour, 1, "ack 1d"}},
+			wantUntil: until(7 * day), wantCumulative: 7, wantReason: "mute 7d",
+		},
+		{
+			name:      "a double-tap in the same second costs nothing",
+			steps:     []addMuteStep{{0, 7, "r1"}, {0, 7, "r2"}},
+			wantUntil: until(7 * day), wantCumulative: 7, wantReason: "r1",
+		},
+		{
+			name:      "a lapsed mute starts a fresh episode",
+			steps:     []addMuteStep{{0, 30, "r1"}, {60 * day, 1, "r2"}},
+			wantUntil: until(61 * day), wantCumulative: 1, wantReason: "r2",
+		},
+		{
+			name:      "an extension landing exactly on the cap is allowed",
+			steps:     []addMuteStep{{0, 25, "r1"}, {23 * day, 7, "r2"}},
+			wantUntil: until(30 * day), wantCumulative: 30, wantReason: "r2",
+		},
 	}
-	later := fixedNow.Add(24 * time.Hour)
-	rec, err := s.AddMute(later, "k1", suppress.ScopeGroupCheck, m, 10, "", "", "r2", "ops")
-	if err != nil {
-		t.Fatalf("AddMute #2: %v", err)
-	}
-	if rec.CumulativeDays != 20 {
-		t.Errorf("CumulativeDays after extend = %d, want 20", rec.CumulativeDays)
-	}
-	rows, err := s.ListRuntime()
-	if err != nil {
-		t.Fatalf("ListRuntime: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("len(rows) = %d, want 1 (extend must upsert, not duplicate)", len(rows))
-	}
-	if rows[0].Reason != "r2" {
-		t.Errorf("stored reason = %q, want r2 (extend should overwrite)", rows[0].Reason)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestStore(t)
+			m := suppress.Matcher{Group: "disk", Check: "smart-fail"}
+			var rec suppress.Suppression
+			for i, st := range tc.steps {
+				var err error
+				rec, err = s.AddMute(fixedNow.Add(st.at), "k1", suppress.ScopeGroupCheck, m, st.addDays, "", "", st.reason, "ops")
+				if err != nil {
+					t.Fatalf("AddMute step %d: %v", i, err)
+				}
+			}
+			rows, err := s.ListRuntime()
+			if err != nil {
+				t.Fatalf("ListRuntime: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("len(rows) = %d, want 1 (a re-press must upsert, never duplicate)", len(rows))
+			}
+			type view struct {
+				Until      string
+				Cumulative int
+				Reason     string
+			}
+			want := view{tc.wantUntil, tc.wantCumulative, tc.wantReason}
+			if diff := cmp.Diff(want, view{rows[0].Until, rows[0].CumulativeDays, rows[0].Reason}); diff != "" {
+				t.Errorf("stored row (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(rows[0], rec); diff != "" {
+				t.Errorf("AddMute's returned record differs from what was stored (-stored +returned):\n%s", diff)
+			}
+		})
 	}
 }
 
 func TestAddMuteExtendPastCapRejectedNoMutation(t *testing.T) {
-	s := openTestStore(t)
-	m := suppress.Matcher{Target: "192.0.2.10"}
-	if _, err := s.AddMute(fixedNow, "k2", suppress.ScopeTarget, m, 25, "", "", "r1", "ops"); err != nil {
-		t.Fatalf("AddMute #1: %v", err)
+	day := 24 * time.Hour
+	cases := []struct {
+		name  string
+		first addMuteStep
+		then  addMuteStep
+	}{
+		{"extension crossing the cap", addMuteStep{0, 25, "r1"}, addMuteStep{24 * day, 7, "r2"}},
+		{"a fresh episode longer than the cap", addMuteStep{0, 5, "r1"}, addMuteStep{10 * day, 31, "r2"}},
 	}
-	before, err := s.ListRuntime()
-	if err != nil {
-		t.Fatalf("ListRuntime before: %v", err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestStore(t)
+			m := suppress.Matcher{Target: "192.0.2.10"}
+			if _, err := s.AddMute(fixedNow.Add(tc.first.at), "k2", suppress.ScopeTarget, m, tc.first.addDays, "", "", tc.first.reason, "ops"); err != nil {
+				t.Fatalf("AddMute #1: %v", err)
+			}
+			before, err := s.ListRuntime()
+			if err != nil {
+				t.Fatalf("ListRuntime before: %v", err)
+			}
 
-	_, err = s.AddMute(fixedNow, "k2", suppress.ScopeTarget, m, 10, "", "", "r2", "ops")
-	if err == nil {
-		t.Fatal("want error: extend would push cumulative_days to 35 > 30 cap")
-	}
+			_, err = s.AddMute(fixedNow.Add(tc.then.at), "k2", suppress.ScopeTarget, m, tc.then.addDays, "", "", tc.then.reason, "ops")
+			if err == nil {
+				t.Fatal("want a cap refusal, got nil")
+			}
+			if !errors.Is(err, suppress.ErrCapExceeded) {
+				t.Errorf("error = %v, want it to wrap suppress.ErrCapExceeded so a caller can say why", err)
+			}
 
-	after, err := s.ListRuntime()
-	if err != nil {
-		t.Fatalf("ListRuntime after: %v", err)
-	}
-	if diff := cmp.Diff(before, after); diff != "" {
-		t.Errorf("rejected AddMute must not mutate the row (-before +after):\n%s", diff)
+			after, err := s.ListRuntime()
+			if err != nil {
+				t.Fatalf("ListRuntime after: %v", err)
+			}
+			if diff := cmp.Diff(before, after); diff != "" {
+				t.Errorf("rejected AddMute must not mutate the row (-before +after):\n%s", diff)
+			}
+		})
 	}
 }
 

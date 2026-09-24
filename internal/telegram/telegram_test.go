@@ -3,11 +3,16 @@ package telegram_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/lazarevtill/heimdall/internal/telegram"
 )
@@ -297,5 +302,213 @@ func TestEditReplyMarkupNon200(t *testing.T) {
 	})
 	if err := c.EditReplyMarkup(context.Background(), fakeChatID, 77, nil); err == nil {
 		t.Fatal("EditReplyMarkup: want error on 403, got nil")
+	}
+}
+
+// --- Credential hygiene ---
+
+// net/http embeds the full request URL in its transport errors, and the Bot
+// API puts the token IN the path. Every error a Client returns must
+// therefore have the token scrubbed out, or one DNS blip writes the bot
+// credential into the journal. An unreachable loopback port produces exactly
+// that error shape without any network.
+func TestErrorsNeverCarryTheToken(t *testing.T) {
+	const token = "123456789:AAHfakeTokenValueForTests_abcdefghij"
+	c := telegram.NewClient("http://127.0.0.1:1", token, nil)
+
+	calls := []struct {
+		name string
+		call func() error
+	}{
+		{"getUpdates", func() error { _, err := c.GetUpdates(context.Background(), 0, 0); return err }},
+		{"sendMessage", func() error {
+			_, err := c.SendMessage(context.Background(), telegram.SendMessageRequest{ChatID: fakeChatID, Text: "x"})
+			return err
+		}},
+		{"answerCallbackQuery", func() error { return c.AnswerCallbackQuery(context.Background(), "cbq1", "") }},
+		{"editMessageReplyMarkup", func() error { return c.EditReplyMarkup(context.Background(), fakeChatID, 1, nil) }},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if err == nil {
+				t.Fatal("want a transport error against a closed port, got nil")
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Errorf("error leaks the bot token: %q", err)
+			}
+			if !strings.Contains(err.Error(), "[REDACTED:telegram-token]") {
+				t.Errorf("error = %q, want the token replaced by a visible marker", err)
+			}
+		})
+	}
+}
+
+// A body echoed back by a hostile or misconfigured proxy is scrubbed too.
+func TestNon200BodyEchoingTheTokenIsScrubbed(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("upstream failed for " + r.URL.Path))
+	})
+	_, err := c.GetUpdates(context.Background(), 0, 0)
+	if err == nil {
+		t.Fatal("want error on 502, got nil")
+	}
+	if strings.Contains(err.Error(), fakeToken) {
+		t.Errorf("error leaks the bot token: %q", err)
+	}
+}
+
+// --- Rate limiting ---
+
+// Telegram answers flood control with HTTP 429 and a machine-readable
+// parameters.retry_after. The caller needs the value, not just the text, so
+// it can stop hammering the API for exactly that long.
+func TestTooManyRequestsCarriesRetryAfter(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 35","parameters":{"retry_after":35}}`))
+	})
+	_, err := c.SendMessage(context.Background(), telegram.SendMessageRequest{ChatID: fakeChatID, Text: "x"})
+	var apiErr *telegram.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want a *telegram.APIError reachable via errors.As", err)
+	}
+	got := struct {
+		Status, Code int
+		RetryAfter   time.Duration
+	}{apiErr.StatusCode, apiErr.ErrorCode, apiErr.RetryAfter()}
+	want := struct {
+		Status, Code int
+		RetryAfter   time.Duration
+	}{http.StatusTooManyRequests, 429, 35 * time.Second}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("APIError mismatch (-want +got):\n%s", diff)
+	}
+	if !strings.Contains(err.Error(), "retry after 35") {
+		t.Errorf("error = %q, want the API description kept", err)
+	}
+}
+
+func TestAPIErrorWithoutRetryAfterReportsZero(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`))
+	})
+	_, err := c.SendMessage(context.Background(), telegram.SendMessageRequest{ChatID: fakeChatID, Text: "x"})
+	var apiErr *telegram.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want a *telegram.APIError", err)
+	}
+	if apiErr.RetryAfter() != 0 {
+		t.Errorf("RetryAfter = %v, want 0 when the API sent none", apiErr.RetryAfter())
+	}
+}
+
+// --- Message length ---
+
+func TestTextLengthCountsUTF16CodeUnits(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{"empty", "", 0},
+		{"ascii", "abc", 3},
+		{"two-byte runes count once", "ééé", 3},
+		{"astral runes count twice", "🔬x", 3},
+		{"an invalid byte counts once (JSON sends it as U+FFFD)", "a\xffb", 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := telegram.TextLength(tc.in); got != tc.want {
+				t.Errorf("TextLength(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSplitTextNeverSplitsARuneAndLosesNothing(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		limit int
+		want  []string
+	}{
+		{"fits", "abcd", 4, []string{"abcd"}},
+		{"empty stays one empty chunk", "", 4, []string{""}},
+		{"exact multiple", "abcdef", 3, []string{"abc", "def"}},
+		{"remainder", "abcdefg", 3, []string{"abc", "def", "g"}},
+		{"multi-byte runes are atomic", "ééééé", 2, []string{"éé", "éé", "é"}},
+		// A surrogate pair must never be split across two messages.
+		{"astral rune moves to the next chunk whole", "ab🔬cd", 3, []string{"ab", "🔬c", "d"}},
+		{"invalid bytes pass through verbatim", "a\xffbc", 2, []string{"a\xff", "bc"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := telegram.SplitText(tc.in, tc.limit)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("SplitText(%q, %d) mismatch (-want +got):\n%s", tc.in, tc.limit, diff)
+			}
+			if strings.Join(got, "") != tc.in {
+				t.Errorf("chunks do not concatenate back to the input byte-for-byte")
+			}
+		})
+	}
+}
+
+// A body over Telegram's 4096-character cap is rejected by the API forever,
+// which would pin that outbox entry pending with no way out. The transport
+// sends it as ordered chunks instead: every byte still arrives, in order,
+// and the inline buttons ride on the LAST chunk so they sit under the whole
+// message.
+func TestSendMessageSplitsAnOverlongPlainTextBody(t *testing.T) {
+	var bodies []map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		bodies = append(bodies, decodeBody(t, r))
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, 100+len(bodies))
+	})
+	text := strings.Repeat("x", telegram.MaxMessageLength) + strings.Repeat("y", 10)
+	buttons := []telegram.Button{{Text: "Ack", CallbackData: "a|k"}}
+
+	msgID, err := c.SendMessage(context.Background(), telegram.SendMessageRequest{ChatID: fakeChatID, Text: text, Buttons: buttons})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("sendMessage calls = %d, want 2 chunks", len(bodies))
+	}
+	var rejoined string
+	for _, b := range bodies {
+		rejoined += b["text"].(string)
+	}
+	if rejoined != text {
+		t.Error("chunks do not reassemble into the original body")
+	}
+	if _, present := bodies[0]["reply_markup"]; present {
+		t.Error("the first chunk carries reply_markup; buttons belong on the last chunk only")
+	}
+	if _, present := bodies[1]["reply_markup"]; !present {
+		t.Error("the last chunk is missing the buttons")
+	}
+	if msgID != 102 {
+		t.Errorf("message id = %d, want the LAST chunk's id (102), the one carrying the buttons", msgID)
+	}
+}
+
+// Splitting entity markup mid-tag would turn a formatted message into a
+// parse error, so only plain text is split; a caller that sets ParseMode owns
+// its own length.
+func TestSendMessageDoesNotSplitFormattedText(t *testing.T) {
+	calls := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	})
+	text := strings.Repeat("x", telegram.MaxMessageLength+1)
+	if _, err := c.SendMessage(context.Background(), telegram.SendMessageRequest{ChatID: fakeChatID, Text: text, ParseMode: "HTML"}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("sendMessage calls = %d, want 1 (formatted text is never split)", calls)
 	}
 }

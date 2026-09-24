@@ -3,6 +3,7 @@ package suppress
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -48,6 +49,15 @@ var validFeedbackEvents = map[string]bool{
 	"extend":         true,
 }
 
+// ErrCapExceeded is wrapped by AddMute's refusal when a dated mute would
+// push cumulative_days past the 30-day cap. Callers test it with errors.Is
+// to tell "your budget is spent" apart from a store fault — the Telegram
+// dispatcher toasts the difference back to the presser.
+var ErrCapExceeded = errors.New("suppress: 30-day cumulative mute cap exceeded")
+
+// maxCumulativeDays is the dated-mute cap, in whole days.
+const maxCumulativeDays = 30
+
 // Store is the SQLite-backed runtime-mute half of the suppression
 // authority: the notifier's Telegram buttons (S7) write here; NewAuthority
 // reads ListRuntime to union it with the declarative side.
@@ -84,9 +94,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // Callers filter by Active(now) as needed; this returns raw rows so
 // expired/archived records stay visible to the weekly digest consumer.
 func (s *Store) ListRuntime() ([]Suppression, error) {
-	rows, err := s.db.Query(`
-SELECT key, scope, matcher_json, until, review_after, cumulative_days, reason, actor, source
-FROM suppressions ORDER BY key`)
+	rows, err := s.db.Query(`SELECT ` + runtimeColumns + ` FROM suppressions ORDER BY key`)
 	if err != nil {
 		return nil, fmt.Errorf("suppress: list runtime: %w", err)
 	}
@@ -94,16 +102,9 @@ FROM suppressions ORDER BY key`)
 
 	var out []Suppression
 	for rows.Next() {
-		var rec Suppression
-		var scope, matcherJSON, source string
-		if err := rows.Scan(&rec.Key, &scope, &matcherJSON, &rec.Until, &rec.ReviewAfter,
-			&rec.CumulativeDays, &rec.Reason, &rec.Actor, &source); err != nil {
-			return nil, fmt.Errorf("suppress: list runtime scan: %w", err)
-		}
-		rec.Scope = Scope(scope)
-		rec.Source = Source(source)
-		if err := json.Unmarshal([]byte(matcherJSON), &rec.Matcher); err != nil {
-			return nil, fmt.Errorf("suppress: list runtime %s: unmarshal matcher: %w", rec.Key, err)
+		rec, err := scanRuntime(rows)
+		if err != nil {
+			return nil, fmt.Errorf("suppress: list runtime: %w", err)
 		}
 		out = append(out, rec)
 	}
@@ -113,22 +114,67 @@ FROM suppressions ORDER BY key`)
 	return out, nil
 }
 
-// AddMute inserts or EXTENDS a runtime mute keyed by key, adding addDays to
-// the record's cumulative_days. until selects the mode: passing the literal
-// "never" produces an unbounded mute (Until="never"), which REQUIRES
-// reviewAfter to be non-empty and BYPASSES the 30-day cap (its review_after
-// is the accountability mechanism instead — the design: "never past the cap
-// without an MR"). Any other value of until selects the dated path, where
-// the persisted Until is always computed as now+addDays (RFC3339) — the
-// resulting cumulative_days (existing + addDays) must not exceed 30, or the
-// call is REJECTED with an error naming the cap and the row is NOT mutated.
+// runtimeColumns is the canonical column list scanRuntime decodes.
+const runtimeColumns = `key, scope, matcher_json, until, review_after, cumulative_days, reason, actor, source`
+
+// scanRuntime decodes one suppressions row selected as runtimeColumns.
+func scanRuntime(row interface{ Scan(...any) error }) (Suppression, error) {
+	var rec Suppression
+	var scope, matcherJSON, source string
+	if err := row.Scan(&rec.Key, &scope, &matcherJSON, &rec.Until, &rec.ReviewAfter,
+		&rec.CumulativeDays, &rec.Reason, &rec.Actor, &source); err != nil {
+		return Suppression{}, fmt.Errorf("scan: %w", err)
+	}
+	rec.Scope = Scope(scope)
+	rec.Source = Source(source)
+	if err := json.Unmarshal([]byte(matcherJSON), &rec.Matcher); err != nil {
+		return Suppression{}, fmt.Errorf("%s: unmarshal matcher: %w", rec.Key, err)
+	}
+	return rec, nil
+}
+
+// AddMute inserts or EXTENDS a runtime mute keyed by key. until selects the
+// mode.
 //
-// AddMute is upsert-by-key: a second call for the same key is the "extend"
-// path — the existing cumulative_days is read, addDays is added on top, the
-// cap is enforced against that new total, and the row is replaced via
-// ON CONFLICT(key) DO UPDATE. A first call for a new key starts
-// cumulative_days at addDays. The resulting record is Validated before it is
-// persisted.
+// UNBOUNDED ("never"). Passing the literal "never" produces Until="never",
+// which REQUIRES reviewAfter to be non-empty and BYPASSES the 30-day cap
+// (its review_after is the accountability mechanism instead — the design:
+// "never past the cap without an MR"); cumulative_days still grows by
+// addDays, for the record.
+//
+// DATED (any other until value; the argument is otherwise ignored). The
+// press asks for "muted until at least now+addDays", and what it costs is
+// the days it ACTUALLY adds:
+//
+//   - no row yet, or a row whose dated Until is already before now (a
+//     LAPSED mute — the previous episode is over): a fresh episode,
+//     Until = now+addDays, cumulative_days = addDays;
+//   - an ACTIVE dated row: Until = max(existingUntil, now+addDays), and
+//     cumulative_days grows by the whole days that adds,
+//     ceil((newUntil-existingUntil)/24h). A press that would not move Until
+//     (a shorter button, a double-tap in the same second) changes NOTHING —
+//     the row, its reason and its actor stay as they were and the existing
+//     record is returned — so a shorter press can never shorten a mute and
+//     never spends budget;
+//   - a dated press over an unbounded ("never") row keeps the pre-cap
+//     behaviour: Until = now+addDays, cumulative_days = existing + addDays.
+//
+// Times are compared at whole-second precision, the precision Until is
+// stored at. The resulting cumulative_days must not exceed 30, or the call
+// is REJECTED with an error wrapping ErrCapExceeded and the row is NOT
+// mutated. So the cap bounds one continuous mute episode of a key to 30
+// days; once it lapses, the key starts again.
+//
+// KNOWN LIMITATION: the cap is per KEY, not per silenced finding. Callers
+// key their own records ("btn-<group>--<check>" from a Telegram button,
+// "ui-<fingerprint>" from the console), so one finding covered by both a
+// group_check mute and a fingerprint mute has two independent 30-day
+// budgets. Closing that needs a per-subject ledger; it is not done here.
+//
+// AddMute is upsert-by-key: it never creates a second row for a key, and
+// the resulting record is Validated before it is persisted. A row that
+// Validates badly on read (corrupt Until) is treated as lapsed, matching
+// Active's fail-safe reading of it.
 func (s *Store) AddMute(now time.Time, key string, scope Scope, m Matcher,
 	addDays int, until, reviewAfter, reason, actor string) (Suppression, error) {
 	tx, err := s.db.Begin()
@@ -137,30 +183,56 @@ func (s *Store) AddMute(now time.Time, key string, scope Scope, m Matcher,
 	}
 	defer tx.Rollback()
 
-	var existingCumulative int
-	err = tx.QueryRow(`SELECT cumulative_days FROM suppressions WHERE key = ?`, key).Scan(&existingCumulative)
+	existing, err := scanRuntime(tx.QueryRow(`SELECT `+runtimeColumns+` FROM suppressions WHERE key = ?`, key))
+	found := true
 	switch {
-	case err == sql.ErrNoRows:
-		existingCumulative = 0
+	case errors.Is(err, sql.ErrNoRows):
+		found = false
 	case err != nil:
 		return Suppression{}, fmt.Errorf("suppress: add mute %s: read existing: %w", key, err)
 	}
 
-	var newUntil string
+	var (
+		newUntil      string
+		newCumulative int
+	)
 	if until == "never" {
 		if reviewAfter == "" {
 			return Suppression{}, fmt.Errorf("suppress: add mute %s: until=\"never\" requires review_after", key)
 		}
 		newUntil = "never"
+		newCumulative = addDays
+		if found {
+			newCumulative += existing.CumulativeDays
+		}
 	} else {
-		newUntil = now.Add(time.Duration(addDays) * 24 * time.Hour).UTC().Format(time.RFC3339)
-	}
+		requested := now.Add(time.Duration(addDays) * 24 * time.Hour).UTC().Truncate(time.Second)
+		newUntil = requested.Format(time.RFC3339)
+		newCumulative = addDays
 
-	newCumulative := existingCumulative + addDays
-	if newUntil != "never" && newCumulative > 30 {
-		return Suppression{}, fmt.Errorf(
-			"suppress: add mute %s: cumulative_days %d would exceed the 30-day cap (never past the cap without an MR)",
-			key, newCumulative)
+		if found {
+			existingUntil, perr := time.Parse(time.RFC3339, existing.Until)
+			switch {
+			case existing.Until == "never":
+				newCumulative = existing.CumulativeDays + addDays
+			case perr != nil || existingUntil.Before(now):
+				// Lapsed (or unreadable, which Active also treats as
+				// inactive): a fresh episode — the defaults above.
+			case !requested.After(existingUntil):
+				// Already muted at least this long: nothing to add, so
+				// nothing to write and nothing to charge.
+				return existing, nil
+			default:
+				extra := requested.Sub(existingUntil)
+				extraDays := int((extra + 24*time.Hour - 1) / (24 * time.Hour))
+				newCumulative = existing.CumulativeDays + extraDays
+			}
+		}
+		if newCumulative > maxCumulativeDays {
+			return Suppression{}, fmt.Errorf(
+				"suppress: add mute %s: cumulative_days %d would exceed the 30-day cap (never past the cap without an MR): %w",
+				key, newCumulative, ErrCapExceeded)
+		}
 	}
 
 	rec := Suppression{

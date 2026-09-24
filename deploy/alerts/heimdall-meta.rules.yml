@@ -40,7 +40,7 @@ groups:
           source: heimdall-meta
         annotations:
           summary: "Heimdall notifier has not completed a cycle in 15m"
-          description: "The notifier writes its heartbeat only after a successful cycle, so a stalled poll loop, a wedged store, or a crash all present as this gauge failing to advance. Alerts are still being detected and enqueued — they are simply not being delivered."
+          description: "The notifier writes its heartbeat only after a successful cycle, so a crash, a wedged loop, an outbox store fault, or a failing heartbeat write all present as this gauge failing to advance. Alerts are still being detected and enqueued — they are simply not being delivered. (A failing Telegram poll does NOT stop the cycle; that is HeimdallNotifierPollStale.)"
       - alert: HeimdallNotifierAbsent
         expr: absent(heimdall_notifier_last_success_timestamp_seconds)
         labels:
@@ -49,6 +49,23 @@ groups:
         annotations:
           summary: "Heimdall notifier heartbeat series is absent"
           description: "Bootstrap gap, deleted textfile, or the notifier has never completed a cycle. Absence is never treated as ok."
+      # A failed Telegram getUpdates poll no longer skips the cycle — drain,
+      # silence reconcile and the heartbeat keep running, so the other sinks
+      # still deliver during a Telegram outage. The price is that a dead
+      # poller no longer stalls the heartbeat above, so it gets its own
+      # rule. It warns rather than pages: delivery continues (the backlog
+      # rules cover the Telegram sink itself), but button presses — acks,
+      # mutes — are not being received. 0 means no successful poll since the
+      # notifier started, which the `for` rides out on a normal start.
+      - alert: HeimdallNotifierPollStale
+        expr: time() - heimdall_notifier_last_poll_success_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall notifier has not polled Telegram successfully in 15m"
+          description: "getUpdates keeps failing: Telegram is unreachable, the bot token was revoked, or another consumer holds the bot (HTTP 409: a webhook is set, or a second notifier is running). Deliveries continue, but inline-button presses are not being received. The notifier log names the error, with the token shown as [REDACTED:telegram-token]."
 
       # ── Per-sink delivery backlog ────────────────────────────────────
       # WHY THIS IS SEPARATE FROM THE HEARTBEAT ABOVE. A send failure is

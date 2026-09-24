@@ -12,6 +12,8 @@ import (
 const (
 	helpNotifierLastSuccess = "# HELP heimdall_notifier_last_success_timestamp_seconds Unix time of the last successful notifier cycle (drain+dispatch+reconcile); a stale value (no advance in 15m) must page — a dead notifier fails silently otherwise.\n" +
 		"# TYPE heimdall_notifier_last_success_timestamp_seconds gauge\n"
+	helpNotifierLastPollSuccess = "# HELP heimdall_notifier_last_poll_success_timestamp_seconds Unix time of the last successful Telegram getUpdates poll; 0 if none since the process started. The cycle runs even when polling fails, so this — not last_success — is what goes stale when button presses stop arriving.\n" +
+		"# TYPE heimdall_notifier_last_poll_success_timestamp_seconds gauge\n"
 	helpNotifierDrained = "# HELP heimdall_notifier_drained_total Outbox entries fully discharged (accepted by every sink routed for their channel) during the last cycle.\n" +
 		"# TYPE heimdall_notifier_drained_total counter\n"
 	helpNotifierSilencesCreated = "# HELP heimdall_notifier_silences_created_total Alertmanager silences created during the last reconcile pass.\n" +
@@ -57,6 +59,9 @@ type NotifierStats struct {
 	SinkBacklogs []SinkBacklog
 	// SinkFailures carries one sample per sink that refused a delivery.
 	SinkFailures []SinkFailure
+	// LastPollSuccess is the time of the last successful Telegram poll;
+	// the zero value renders as 0 ("none since start").
+	LastPollSuccess time.Time
 }
 
 // RenderNotifierProm renders heimdall-notifier.prom: the notifier's own
@@ -82,6 +87,12 @@ func RenderNotifierProm(now time.Time, s NotifierStats) []byte {
 	var b bytes.Buffer
 	b.WriteString(helpNotifierLastSuccess)
 	b.WriteString("heimdall_notifier_last_success_timestamp_seconds " + strconv.FormatInt(now.Unix(), 10) + "\n")
+	var lastPoll int64
+	if !s.LastPollSuccess.IsZero() {
+		lastPoll = s.LastPollSuccess.Unix()
+	}
+	b.WriteString(helpNotifierLastPollSuccess)
+	b.WriteString("heimdall_notifier_last_poll_success_timestamp_seconds " + strconv.FormatInt(lastPoll, 10) + "\n")
 	b.WriteString(helpNotifierDrained)
 	b.WriteString("heimdall_notifier_drained_total " + strconv.Itoa(s.Drained) + "\n")
 	b.WriteString(helpNotifierSilencesCreated)

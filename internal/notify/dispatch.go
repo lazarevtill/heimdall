@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -94,27 +95,44 @@ func actorOf(cq telegram.CallbackQuery) string {
 //  3. Per muteActionSpecs: AddMute (dated: until="", addDays from the spec,
 //     key "btn-<subject>", scope+matcher derived from subject via
 //     matcherFor) then RecordFeedback for the spec's event, then
-//     AnswerCallbackQuery with the spec's toast. Re-pressing the same button
-//     re-uses the same key, so AddMute's cumulative-extend semantics apply
-//     (accumulate, capped at 30 — never a second row). "u" (Useful) writes
-//     only feedback (event "useful"), no mute. "ex" (Explain) and "ot" (Open
-//     ticket) write NOTHING — they are acknowledged with an honest toast
+//     AnswerCallbackQuery with the spec's toast. Re-pressing re-uses the
+//     same key, so AddMute's extend semantics apply (a press is charged only
+//     the days it actually adds, capped at 30 per episode — never a second
+//     row). "u" (Useful) writes only feedback (event "useful"), no mute.
+//     "ex" (Explain) and "ot" (Open ticket) write NOTHING — they are acknowledged with an honest toast
 //     ("Explain not yet wired" / "Open a ticket in YouTrack"); full /explain
 //     and open-ticket wiring are out of this slice.
-//  4. A suppress-store error (AddMute/RecordFeedback) is returned to the
-//     caller to log; nothing about the failure is hidden, and the press can
-//     simply be re-sent (AddMute/RecordFeedback are both safe to retry).
+//  4. A suppress-store error (AddMute/RecordFeedback), a cap refusal or a
+//     malformed subject is returned to the caller to log AND toasted back
+//     to the presser first — a refusal the operator cannot see reads as a
+//     mute that took. The press can simply be re-sent (AddMute and
+//     RecordFeedback are both safe to retry).
+//  5. A press that would not lengthen an existing mute (a shorter button on
+//     a longer mute) changes nothing in the store, and the toast says so
+//     ("Already muted until …") instead of claiming the shorter mute.
+//
+// Every AnswerCallbackQuery runs under its own deadline (Deps.CallTimeout),
+// so a hung Telegram cannot stall the poll loop on an acknowledgement.
 func Dispatch(ctx context.Context, now time.Time, d Deps, cq telegram.CallbackQuery) (DispatchResult, error) {
+	answer := func(text string) error {
+		actx, cancel := context.WithTimeout(ctx, d.callTimeout())
+		defer cancel()
+		if err := d.TG.AnswerCallbackQuery(actx, cq.ID, text); err != nil {
+			return fmt.Errorf("notify: dispatch: answer callback: %w", err)
+		}
+		return nil
+	}
+
 	if !d.AllowedUsers[cq.From.ID] {
-		if err := d.TG.AnswerCallbackQuery(ctx, cq.ID, "not authorized"); err != nil {
-			return DispatchResult{Authorized: false}, fmt.Errorf("notify: dispatch: answer callback: %w", err)
+		if err := answer("not authorized"); err != nil {
+			return DispatchResult{Authorized: false}, err
 		}
 		return DispatchResult{Authorized: false}, nil
 	}
 
 	action, subject, err := Decode(cq.Data)
 	if err != nil {
-		_ = d.TG.AnswerCallbackQuery(ctx, cq.ID, "malformed button")
+		_ = answer("malformed button")
 		return DispatchResult{Authorized: true}, fmt.Errorf("notify: dispatch: %w", err)
 	}
 	result := DispatchResult{Authorized: true, Action: action}
@@ -122,50 +140,53 @@ func Dispatch(ctx context.Context, now time.Time, d Deps, cq telegram.CallbackQu
 
 	switch action {
 	case "ex":
-		if err := d.TG.AnswerCallbackQuery(ctx, cq.ID, "Explain not yet wired"); err != nil {
-			return result, fmt.Errorf("notify: dispatch: answer callback: %w", err)
-		}
-		return result, nil
+		return result, answer("Explain not yet wired")
 	case "ot":
-		if err := d.TG.AnswerCallbackQuery(ctx, cq.ID, "Open a ticket in YouTrack"); err != nil {
-			return result, fmt.Errorf("notify: dispatch: answer callback: %w", err)
-		}
-		return result, nil
+		return result, answer("Open a ticket in YouTrack")
 	case "u":
 		if err := d.Suppress.RecordFeedback(now, "btn-"+subject, "useful", actor); err != nil {
+			_ = answer("Feedback not recorded (see notifier log)")
 			return result, fmt.Errorf("notify: dispatch: record feedback: %w", err)
 		}
 		result.Feedback = true
-		if err := d.TG.AnswerCallbackQuery(ctx, cq.ID, "Thanks"); err != nil {
-			return result, fmt.Errorf("notify: dispatch: answer callback: %w", err)
-		}
-		return result, nil
+		return result, answer("Thanks")
 	}
 
 	spec, ok := muteActionSpecs[action]
 	if !ok {
-		_ = d.TG.AnswerCallbackQuery(ctx, cq.ID, "unknown action")
+		_ = answer("unknown action")
 		return result, fmt.Errorf("notify: dispatch: unknown action %q", action)
 	}
 
 	matcher, err := matcherFor(spec.scope, subject)
 	if err != nil {
+		_ = answer("malformed button")
 		return result, fmt.Errorf("notify: dispatch: %w", err)
 	}
 
 	key := "btn-" + subject
-	if _, err := d.Suppress.AddMute(now, key, spec.scope, matcher, spec.addDays, "", "", spec.reason, actor); err != nil {
+	rec, err := d.Suppress.AddMute(now, key, spec.scope, matcher, spec.addDays, "", "", spec.reason, actor)
+	if err != nil {
+		if errors.Is(err, suppress.ErrCapExceeded) {
+			_ = answer("Refused: the 30-day cap for this mute is spent")
+		} else {
+			_ = answer("Mute not recorded (see notifier log)")
+		}
 		return result, fmt.Errorf("notify: dispatch: add mute: %w", err)
 	}
-	result.Muted = true
+	toast := spec.toast
+	requested := now.Add(time.Duration(spec.addDays) * 24 * time.Hour).UTC().Truncate(time.Second)
+	if until, perr := time.Parse(time.RFC3339, rec.Until); perr == nil && until.After(requested) {
+		toast = "Already muted until " + rec.Until
+	} else {
+		result.Muted = true
+	}
 
 	if err := d.Suppress.RecordFeedback(now, key, spec.event, actor); err != nil {
+		_ = answer(toast + ", but the feedback record failed")
 		return result, fmt.Errorf("notify: dispatch: record feedback: %w", err)
 	}
 	result.Feedback = true
 
-	if err := d.TG.AnswerCallbackQuery(ctx, cq.ID, spec.toast); err != nil {
-		return result, fmt.Errorf("notify: dispatch: answer callback: %w", err)
-	}
-	return result, nil
+	return result, answer(toast)
 }

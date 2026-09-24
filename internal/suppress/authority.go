@@ -110,6 +110,23 @@ func (a *Authority) ActiveAnnotations(now time.Time) []string {
 	return out
 }
 
+// ActiveRecords returns a copy of every record in force at now, of EVERY
+// scope and including unbounded "never" records, sorted by key. It is the
+// honest count of what is muted: ActiveSilences deliberately drops the
+// scopes Alertmanager cannot represent (hypothesis, analyst) and the
+// unbounded records, so counting it undercounts precisely the mutes an
+// operator most needs to see.
+func (a *Authority) ActiveRecords(now time.Time) []Suppression {
+	var out []Suppression
+	for _, r := range a.records {
+		if r.Active(now) {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
 // Silence is the downstream projection the notifier materializes into
 // Alertmanager (loopback :9093). This package PRODUCES it; it does NOT talk
 // to Alertmanager (that is S7). Matchers are label=value equalities on the

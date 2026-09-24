@@ -192,3 +192,31 @@ func TestActiveSilencesProjection(t *testing.T) {
 		t.Errorf("target silence matchers (-want +got):\n%s", diff)
 	}
 }
+
+// ActiveRecords is the "everything in force right now" view the weekly
+// digest counts. Unlike ActiveSilences it must NOT drop the scopes that
+// have no Alertmanager projection (hypothesis, analyst) or the unbounded
+// "never" records — those are exactly the mutes an operator most needs to
+// see counted.
+func TestActiveRecordsIncludesEveryScopeAndNeverSortedByKey(t *testing.T) {
+	fp := validFingerprintRec()
+	fp.Key = "c-fp"
+	hyp := validHypothesisRec()
+	hyp.Key = "a-hyp"
+	an := validAnalystRec()
+	an.Key = "d-an"
+	never := validNeverRec()
+	never.Key = "b-never"
+	expired := validTargetRec()
+	expired.Key = "e-expired"
+	expired.Until = pastRFC3339()
+
+	auth, _ := suppress.NewAuthority([]suppress.Suppression{fp, hyp, never}, []suppress.Suppression{an, expired})
+	var got []string
+	for _, r := range auth.ActiveRecords(fixedNow) {
+		got = append(got, r.Key)
+	}
+	if diff := cmp.Diff([]string{"a-hyp", "b-never", "c-fp", "d-an"}, got); diff != "" {
+		t.Errorf("ActiveRecords keys (-want +got):\n%s", diff)
+	}
+}

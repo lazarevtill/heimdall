@@ -72,7 +72,8 @@ file wins and the guide is wrong.
   replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.
 - `internal/suppress` — the **single suppression authority**: declarative (`suppressions.json`)
-  ∪ runtime (SQLite mutes), five scopes, 30-day rolling cumulative cap, active-silence projection.
+  ∪ runtime (SQLite mutes), five scopes, 30-day cap per continuous mute episode (a lapsed mute
+  starts afresh; a shorter press never shortens), active-silence projection.
 - `internal/plugin` — subprocess plugin host (manifest validate, `plugin_api` version gate,
   scrubbed-env/deadline/pgroup-kill/output-cap runner, capability-scoped credential injection) +
   the `source.Source` adapter that drives a source plugin as a data source.

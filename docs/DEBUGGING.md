@@ -121,6 +121,16 @@ series that makes a dead destination alertable.
 grep heimdall_notifier_sink_failed_total /var/lib/node_exporter/heimdall-notifier.prom
 ```
 
+This counts sends a sink refused in the last cycle. A sink that is unusable
+right now (unreachable, timed out after the 15 s per-call deadline, throttled
+with a `429`, or answering `5xx`) is **benched for the rest of that pass**, so
+a dead sink shows about one failure per cycle rather than one per pending
+entry. A sink that answered and refused one message is not benched, because
+the oldest entry being unacceptable must not starve everything queued behind
+it. Telegram's `retry_after` is honoured across cycles. The notifier log line
+for each failing sink carries the pass's **first error**. That is where a
+Gotify `401`, a Synology error code or a Telegram `400` shows up.
+
 **Inspect the queue directly:**
 
 ```bash
@@ -153,7 +163,26 @@ header, never the URL, so it will not appear in a timeout or DNS error.
 
 **Telegram** — the only interactive sink. Button presses become suppression
 writes; a press from a user not in `HEIMDALL_ALLOWED_USER_IDS` writes nothing,
-fail-closed and silently by design.
+fail-closed and silently by design. A refused press from an allowed user (the
+cap, a store error) is answered with a toast that says so. A plain-text body
+longer than Telegram's 4096-character limit is sent as ordered chunks, still
+byte-for-byte, with the buttons on the last one, instead of being refused
+forever. The bot token never appears in the log: every Telegram error is
+scrubbed to `[REDACTED:telegram-token]`.
+
+**Buttons stopped working but alerts still arrive** — the Telegram poll is
+failing (`HeimdallNotifierPollStale`). A failed `getUpdates` no longer skips
+the cycle, so drain, silence reconcile and the heartbeat carry on, and the
+other sinks keep delivering. Check
+`heimdall_notifier_last_poll_success_timestamp_seconds` and the log. An HTTP
+`409` means something else holds the bot: a webhook is set, or a second
+notifier is running.
+
+**Alertmanager silences** — the reconciler ignores silences Alertmanager has
+already expired (it keeps them listed for its retention period), and replaces
+a live silence whose matchers or end time have drifted from the ledger. It
+creates the new silence before deleting the old one, so nothing is unsilenced
+in between. It never touches a silence it did not create.
 
 ---
 
@@ -287,7 +316,18 @@ its page explain itself when unset or unreadable, precisely so "empty" and
 **An action returns 501** — that action has no configured command, so it does
 not exist. This is the default; nothing is wrong.
 
-**A mute is refused** — the 30-day rolling cumulative cap. The error names it.
+**A mute is refused** — the 30-day cap on one continuous mute. The error names
+it. How it counts, per mute key:
+- a new mute, or one whose previous mute has **lapsed**, starts a fresh
+  episode that costs the days asked for;
+- extending an **active** mute costs only the days it actually adds;
+- a shorter press on a longer active mute changes nothing and costs nothing.
+  It never shortens the mute, and the console and Telegram both report the
+  expiry actually in force.
+
+Known limitation: the budget is per key, and the Telegram buttons
+(`btn-<group>--<check>`) and the console (`ui-<fingerprint>`) key their
+records differently. So one finding covered by both scopes has two budgets.
 There is deliberately **no un-mute**: no such operation exists anywhere in the
 suppression authority, so mutes expire on their own.
 
@@ -301,6 +341,7 @@ suppression authority, so mutes expire on their own.
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
 | `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
+| `heimdall_notifier_last_poll_success_timestamp_seconds` | last successful Telegram poll (0 = none since start) |
 | `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` | per-destination backlog age |
 | `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle |
 | `heimdall_redaction_failures_total` | **content withheld — always investigate** |

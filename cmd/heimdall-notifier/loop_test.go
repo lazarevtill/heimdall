@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lazarevtill/heimdall/internal/notify"
+	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/telegram"
 )
@@ -31,10 +36,15 @@ const (
 type fakeTG struct {
 	sends   []telegram.SendMessageRequest
 	answers []string
+	// sendDeadlines records, per SendMessage, whether its context carried
+	// a deadline.
+	sendDeadlines []bool
 }
 
-func (f *fakeTG) SendMessage(_ context.Context, req telegram.SendMessageRequest) (int64, error) {
+func (f *fakeTG) SendMessage(ctx context.Context, req telegram.SendMessageRequest) (int64, error) {
 	f.sends = append(f.sends, req)
+	_, ok := ctx.Deadline()
+	f.sendDeadlines = append(f.sendDeadlines, ok)
 	return int64(len(f.sends)), nil
 }
 
@@ -171,5 +181,170 @@ func TestHandleUpdatesNoUpdatesLeavesOffsetUnchanged(t *testing.T) {
 	}
 	if dispatchErrors != 0 {
 		t.Errorf("dispatchErrors = %d, want 0", dispatchErrors)
+	}
+}
+
+// fakePoller is a scripted poller: it returns updates/err, and can run a
+// hook (e.g. cancel the loop's context, standing in for SIGTERM) while the
+// poll is in flight.
+type fakePoller struct {
+	updates []telegram.Update
+	err     error
+	during  func()
+	offsets []int64
+}
+
+func (p *fakePoller) GetUpdates(_ context.Context, offset int64, _ int) ([]telegram.Update, error) {
+	p.offsets = append(p.offsets, offset)
+	if p.during != nil {
+		p.during()
+	}
+	return p.updates, p.err
+}
+
+// iterDeps is a cycleDeps with one pending main-channel entry, so a test can
+// see whether the cycle (and with it the drain) ran.
+func iterDeps(t *testing.T) (cycleDeps, *fakeTG, string) {
+	t.Helper()
+	ob := openTestOutbox(t)
+	sup := openTestSuppress(t)
+	tg := &fakeTG{}
+	dir := t.TempDir()
+	if _, err := ob.Enqueue(fixedNow, outbox.ChannelMain, "disk check firing", "escalate-[hb:node--c1-deadman]"); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	return cycleDeps{
+		Notify: notify.Deps{
+			TG: tg, Outbox: ob, Suppress: sup,
+			MainChatID: fakeMainChatID, AnalystChatID: fakeAnalystChatID,
+			AllowedUsers: map[int64]bool{fakeAllowedUser: true},
+		},
+		Silence: newFakeSilenceClient(), Suppress: sup,
+		TextfileDir: dir, TG: tg, MainChatID: fakeMainChatID,
+	}, tg, dir
+}
+
+// iterNow is the loop tests' clock: a Tuesday, so the Monday weekly digest
+// never adds a send these tests are not about.
+var iterNow = fixedNow.Add(24 * time.Hour)
+
+func testLoopConfig() loopConfig {
+	return loopConfig{pollTimeoutSeconds: 1, errorBackoff: 0, clock: func() time.Time { return iterNow }}
+}
+
+func readHeartbeat(t *testing.T, dir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, heartbeatFilename))
+	if err != nil {
+		t.Fatalf("heartbeat not written: %v", err)
+	}
+	return string(data)
+}
+
+// A failed getUpdates used to `continue` straight back to polling, skipping
+// the drain, the silence reconcile, the heartbeat and the digest. With
+// several sinks that turned a Telegram outage (or a revoked token, or a 409
+// from a second poller) into a total blackout: Gotify and Synology Chat
+// stopped too, and the stale-heartbeat page queued behind them in the very
+// outbox nothing was draining. The cycle now runs after the backoff either
+// way; the poller's own health is its own gauge.
+func TestIterateRunsTheCycleWhenThePollFails(t *testing.T) {
+	cd, tg, dir := iterDeps(t)
+	st := &loopState{offset: 7}
+	p := &fakePoller{err: errors.New("telegram: getUpdates: status 409: api error: Conflict")}
+
+	iterate(context.Background(), p, cd, testLoopConfig(), st)
+
+	if len(tg.sends) != 1 {
+		t.Errorf("sends = %d, want 1: the drain must run although the poll failed", len(tg.sends))
+	}
+	if st.offset != 7 {
+		t.Errorf("offset = %d, want 7 unchanged (nothing was received)", st.offset)
+	}
+	hb := readHeartbeat(t, dir)
+	for _, want := range []string{
+		"heimdall_notifier_last_success_timestamp_seconds " + strconv.FormatInt(iterNow.Unix(), 10) + "\n",
+		"heimdall_notifier_last_poll_success_timestamp_seconds 0\n",
+	} {
+		if !strings.Contains(hb, want) {
+			t.Errorf("heartbeat missing %q:\n%s", want, hb)
+		}
+	}
+}
+
+func TestIterateRecordsASuccessfulPoll(t *testing.T) {
+	cd, _, dir := iterDeps(t)
+	st := &loopState{}
+	p := &fakePoller{updates: []telegram.Update{callbackUpdate(41, fakeAllowedUser, "a|node--c1-deadman")}}
+
+	iterate(context.Background(), p, cd, testLoopConfig(), st)
+
+	if st.offset != 42 {
+		t.Errorf("offset = %d, want 42", st.offset)
+	}
+	if !st.lastPollSuccess.Equal(iterNow) {
+		t.Errorf("lastPollSuccess = %v, want %v", st.lastPollSuccess, iterNow)
+	}
+	want := "heimdall_notifier_last_poll_success_timestamp_seconds " + strconv.FormatInt(iterNow.Unix(), 10) + "\n"
+	if hb := readHeartbeat(t, dir); !strings.Contains(hb, want) {
+		t.Errorf("heartbeat missing %q:\n%s", want, hb)
+	}
+}
+
+// Shutdown (SIGTERM cancels the loop's context). A signal that interrupts
+// the long poll or the error backoff ends the iteration with no side
+// effects; one that arrives after updates were received lets the iteration
+// FINISH — dispatch, drain, heartbeat — under an uncancelled context, so a
+// restart never cuts a send between "delivered" and "recorded as
+// delivered" (which would re-send it) or drops a received button press.
+func TestIterateAndShutdown(t *testing.T) {
+	cases := []struct {
+		name      string
+		poller    func(cancel context.CancelFunc) *fakePoller
+		wantSends int
+	}{
+		{"signal during a failing poll: no cycle", func(cancel context.CancelFunc) *fakePoller {
+			return &fakePoller{err: context.Canceled, during: cancel}
+		}, 0},
+		{"signal during the error backoff: no cycle", func(cancel context.CancelFunc) *fakePoller {
+			// The poll fails normally; the signal lands while the loop is
+			// sleeping off the error (the backoff is an hour, so only the
+			// cancellation can end it).
+			return &fakePoller{err: errors.New("boom"), during: func() {
+				go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+			}}
+		}, 0},
+		{"signal after updates arrived: the cycle completes", func(cancel context.CancelFunc) *fakePoller {
+			return &fakePoller{during: cancel}
+		}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cd, tg, _ := iterDeps(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := testLoopConfig()
+			cfg.errorBackoff = time.Hour // only a cancellation can end it
+			iterate(ctx, tc.poller(cancel), cd, cfg, &loopState{})
+			if len(tg.sends) != tc.wantSends {
+				t.Errorf("sends = %d, want %d", len(tg.sends), tc.wantSends)
+			}
+		})
+	}
+}
+
+func TestRunLoopReturnsOnCancellation(t *testing.T) {
+	cd, _, _ := iterDeps(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &fakePoller{during: cancel}
+	done := make(chan struct{})
+	go func() { runLoop(ctx, p, cd, 1); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runLoop did not return after its context was cancelled")
+	}
+	if len(p.offsets) != 1 {
+		t.Errorf("polls = %d, want exactly 1 before the loop noticed the cancellation", len(p.offsets))
 	}
 }

@@ -155,6 +155,15 @@ Routing validation is fail-fast at boot and every rule maps to a way messages
 would otherwise vanish quietly: an unrouted channel, a route naming an
 undeclared sink, a declared-but-never-routed sink, a missing credential.
 
+The console may be pointed at the same `HEIMDALL_SINKS_FILE` for its delivery
+view. It reads only the routing topology, so it does **not** need the sink
+credentials. Keep `HEIMDALL_GOTIFY_TOKEN` and the Synology URL out of the
+console's environment.
+
+Every outbound call (a sink send, a button answer, an Alertmanager request)
+has a 15 s deadline, so one hung endpoint cannot wedge the loop. `SIGTERM`
+stops the notifier cleanly between sends.
+
 **Verify:** the boot line lists the sinks it built. Then check
 `heimdall-notifier.prom` for `heimdall_notifier_sink_oldest_pending_seconds`
 — one sample per routed `(sink, channel)` pair, `0` when clear.

@@ -316,7 +316,7 @@ const findingTmpl = `{{define "subtitle"}}{{with .Finding}}{{.Target}}{{end}}{{e
       </div>
       <button class="primary" type="submit">Mute</button>
       <p style="font-size:11.5px;line-height:1.5;color:var(--ink-400);margin:0">
-        Counts against the 30-day rolling budget. There is no un-mute here — mutes expire on their own.
+        A continuous mute is capped at 30 days in total. A shorter mute never shortens one already in force. There is no un-mute here — mutes expire on their own.
       </p>
     </form>
     {{else}}

@@ -26,7 +26,7 @@ import (
 const maxFormBytes = 64 << 10
 
 // muteMaxDays is the largest single mute this console will write. The
-// authority's own 30-day rolling cap is the real ceiling and is enforced
+// authority's own 30-day per-episode cap is the real ceiling and is enforced
 // inside AddMute; this is a smaller, per-request guard so one mis-typed form
 // cannot spend the whole budget at once.
 const muteMaxDays = 14
@@ -49,7 +49,7 @@ type server struct {
 	tmpl    *templates
 	actions ActionSet
 	runner  Runner
-	routes  notify.Routes
+	routing notify.Routing // sink id -> channels; topology only, no sink credentials
 
 	// Access model. See auth.go: mode is explicit, never defaulted.
 	authMode        AuthMode
@@ -507,7 +507,7 @@ func (s *server) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	backlogs, err := notify.Backlogs(p.Now, notify.Deps{Outbox: s.outbox, Routes: s.routes})
+	backlogs, err := notify.BacklogsForRouting(p.Now, s.outbox, s.routing)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -526,7 +526,7 @@ func (s *server) handleDelivery(w http.ResponseWriter, r *http.Request) {
 
 // handleMute writes a runtime suppression. This is the console's ONLY write
 // to the suppression authority, and it goes through AddMute so the 30-day
-// rolling cap, validation and the feedback ledger all apply exactly as they
+// per-episode cap, validation and the feedback ledger all apply exactly as they
 // do for a Telegram button press.
 func (s *server) handleMute(w http.ResponseWriter, r *http.Request) {
 	actor := s.operator(r) // guaranteed non-empty: authed() gates POST
@@ -576,7 +576,7 @@ func (s *server) handleMute(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	key := "ui-" + fp
-	_, err = s.suppress.AddMute(now, key, suppress.ScopeFingerprint,
+	rec, err := s.suppress.AddMute(now, key, suppress.ScopeFingerprint,
 		suppress.Matcher{Fingerprint: fp}, days, "", "", reason, actor)
 	if err != nil {
 		// The cap rejection lands here, and its message names the cap. It is
@@ -594,10 +594,14 @@ func (s *server) handleMute(w http.ResponseWriter, r *http.Request) {
 	// oidc/token mode; with anonymous writes enabled it is whoever can reach
 	// the LAN. It is the one free-text field on the write path, so it goes
 	// to the journal redacted like any other untrusted string.
-	log.Printf("%s muted %s (%s/%s) for %dd: %s",
-		actor, fp, entry.Check, entry.Target, days, contract.SafeString(reason))
+	//
+	// The flash states the RESULTING expiry, not the days asked for: a
+	// shorter mute over a longer active one never shortens it (and costs
+	// nothing), so "muted for N days" would misstate what is in force.
+	log.Printf("%s muted %s (%s/%s) for %dd, until %s: %s",
+		actor, fp, entry.Check, entry.Target, days, rec.Until, contract.SafeString(reason))
 	s.redirectFlash(w, r, "/finding/"+fp,
-		fmt.Sprintf("Muted for %d day(s). Detection continues — only notification is held back.", days), false)
+		fmt.Sprintf("Muted until %s. Detection continues — only notification is held back.", rec.Until), false)
 }
 
 // handleAction runs a configured command. The name selects from the fixed

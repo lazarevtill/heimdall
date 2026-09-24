@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -82,44 +83,64 @@ func buildAuthority(d cycleDeps, now time.Time) (*suppress.Authority, error) {
 	return authority, nil
 }
 
-// runCycle performs one housekeeping pass at now: Drain the outbox, build a
-// FRESH suppression Authority (declarative + runtime, re-read each cycle)
-// and ReconcileSilences, then write the heimdall-notifier.prom heartbeat.
-// dispatchErrors from the poll phase is threaded in for the heartbeat
-// counter. Returns an error only for a heartbeat WRITE failure — the
-// drain/reconcile-authority/reconcile-silences errors are logged and folded
-// into the heartbeat counters as their zero-progress values, never fatal:
-// the daemon must keep running (its heartbeat going stale is itself the
-// visible failure signal for anything upstream of the write).
-func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors int) error {
-	var (
-		drained      int
-		sinkFailures []emit.SinkFailure
-	)
+// pollStatus is what the poll phase hands runCycle for the heartbeat.
+type pollStatus struct {
+	// DispatchErrors counts callback dispatch errors this iteration.
+	DispatchErrors int
+	// LastSuccess is the last successful getUpdates; zero if none since
+	// the process started.
+	LastSuccess time.Time
+}
+
+// runCycle performs one housekeeping pass at now: Drain the outbox, measure
+// the per-sink backlogs, build a FRESH suppression Authority (declarative +
+// runtime, re-read each cycle) and ReconcileSilences, then write the
+// heimdall-notifier.prom heartbeat.
+//
+// What is fatal to the cycle, and what is not:
+//
+//   - A sink refusing a send is NOT: the entry stays pending, the refusal is
+//     logged with its first error and counted, and the backlog gauge is
+//     what pages on a dead destination.
+//   - A reconcile/authority failure is NOT: logged, and the result
+//     accumulated so far still feeds the counters.
+//   - An outbox STORE fault (Drain or Backlogs could not read or write the
+//     queue) IS: nothing can be delivered, so the heartbeat is withheld and
+//     an error returned. Writing it anyway kept the critical staleness rule
+//     quiet while no alert could be delivered at all.
+//   - A heartbeat write failure is returned too.
+//
+// The daemon keeps running either way; a stale heartbeat is the signal.
+func runCycle(ctx context.Context, now time.Time, d cycleDeps, poll pollStatus) error {
+	var sinkFailures []emit.SinkFailure
+	var storeErr error
+
+	// Drain returns the tally accumulated so far alongside a store fault,
+	// so the per-sink lines below are still logged for what it did do.
 	drainResult, err := notify.Drain(ctx, now, d.Notify, 0)
 	if err != nil {
-		log.Printf("drain: %v", contract.Safe(err))
-	} else {
-		drained = drainResult.Sent
-		if drainResult.Failed > 0 {
-			log.Printf("drain: %d entr(y/ies) not fully delivered, left pending for retry", drainResult.Failed)
-		}
-		for _, id := range sortedSinkIDs(drainResult.PerSink) {
-			o := drainResult.PerSink[id]
-			sinkFailures = append(sinkFailures, emit.SinkFailure{SinkID: id, Count: o.Failed})
-			if o.Failed > 0 {
-				log.Printf("drain: sink %s refused %d deliver(y/ies)", id, o.Failed)
-			}
+		storeErr = fmt.Errorf("drain: %w", err)
+	}
+	if drainResult.Failed > 0 {
+		log.Printf("drain: %d entr(y/ies) not fully delivered, left pending for retry", drainResult.Failed)
+	}
+	for _, id := range sortedSinkIDs(drainResult.PerSink) {
+		o := drainResult.PerSink[id]
+		sinkFailures = append(sinkFailures, emit.SinkFailure{SinkID: id, Count: o.Failed})
+		switch {
+		case o.Failed > 0:
+			log.Printf("drain: sink %s refused %d deliver(y/ies), skipped %d more; first error: %v",
+				id, o.Failed, o.Skipped, contract.Safe(o.Err))
+		case o.Skipped > 0:
+			log.Printf("drain: sink %s skipped %d deliver(y/ies): %v", id, o.Skipped, contract.Safe(o.Err))
 		}
 	}
 
 	// Measured AFTER the drain, so a backlog cleared this cycle reports 0
-	// rather than its pre-drain age. A measurement failure must not wedge
-	// the cycle: the heartbeat still needs writing, and the backlog series
-	// going absent is itself caught by the meta-rules' absent() arm.
+	// rather than its pre-drain age.
 	backlogs, err := notify.Backlogs(now, d.Notify)
 	if err != nil {
-		log.Printf("backlogs: %v", contract.Safe(err))
+		storeErr = errors.Join(storeErr, fmt.Errorf("backlogs: %w", err))
 	}
 	sinkBacklogs := make([]emit.SinkBacklog, 0, len(backlogs))
 	for _, b := range backlogs {
@@ -144,13 +165,18 @@ func runCycle(ctx context.Context, now time.Time, d cycleDeps, dispatchErrors in
 		}
 	}
 
+	if storeErr != nil {
+		return fmt.Errorf("outbox store fault, heartbeat withheld so the staleness rule fires: %w", storeErr)
+	}
+
 	data := emit.RenderNotifierProm(now, emit.NotifierStats{
-		Drained:         drained,
+		Drained:         drainResult.Sent,
 		SilencesCreated: silencesCreated,
 		SilencesDeleted: silencesDeleted,
-		DispatchErrors:  dispatchErrors,
+		DispatchErrors:  poll.DispatchErrors,
 		SinkBacklogs:    sinkBacklogs,
 		SinkFailures:    sinkFailures,
+		LastPollSuccess: poll.LastSuccess,
 	})
 	path := filepath.Join(d.TextfileDir, heartbeatFilename)
 	if err := emit.WriteFileAtomic(path, data); err != nil {
@@ -204,7 +230,9 @@ func shouldSendDigest(now time.Time, lastSentWeek string) bool {
 // next cycle retries). Gathers DigestInput from the suppress store:
 // ExpiringMutes via ExpiringRuntimeMutes over ListRuntime within
 // digestExpiryWindow; FeedbackCounts via CountFeedbackSince(now-7d);
-// ActiveMuteCount via a fresh Authority's ActiveSilences(now).
+// ActiveMuteCount and ReviewOverdue from a fresh Authority's
+// ActiveRecords(now) — every record in force, declarative included, of
+// every scope. The send runs under notify.DefaultCallTimeout.
 func maybeSendDigest(ctx context.Context, now time.Time, d cycleDeps, lastSentWeek string) (string, error) {
 	if !shouldSendDigest(now, lastSentWeek) {
 		return lastSentWeek, nil
@@ -223,14 +251,18 @@ func maybeSendDigest(ctx context.Context, now time.Time, d cycleDeps, lastSentWe
 		return lastSentWeek, fmt.Errorf("digest: build authority: %w", err)
 	}
 
+	active := authority.ActiveRecords(now)
 	in := notify.DigestInput{
 		ExpiringMutes:   notify.ExpiringRuntimeMutes(now, digestExpiryWindow, runtimeMutes),
+		ReviewOverdue:   notify.ReviewOverdueMutes(now, active),
 		FeedbackCounts:  feedbackCounts,
-		ActiveMuteCount: len(authority.ActiveSilences(now)),
+		ActiveMuteCount: len(active),
 	}
 	text := notify.RenderWeeklyDigest(now, in)
 
-	if _, err := d.TG.SendMessage(ctx, telegram.SendMessageRequest{ChatID: d.MainChatID, Text: text}); err != nil {
+	sendCtx, cancel := context.WithTimeout(ctx, notify.DefaultCallTimeout)
+	defer cancel()
+	if _, err := d.TG.SendMessage(sendCtx, telegram.SendMessageRequest{ChatID: d.MainChatID, Text: text}); err != nil {
 		return lastSentWeek, fmt.Errorf("digest: send: %w", err)
 	}
 

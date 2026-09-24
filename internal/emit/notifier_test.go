@@ -51,3 +51,32 @@ func TestRenderNotifierPromZeroCountersStillEmitsLines(t *testing.T) {
 		}
 	}
 }
+
+// A getUpdates failure no longer stops the cycle (the drain to every other
+// sink must keep running), so the heartbeat keeps advancing while the
+// Telegram poller is dead. This gauge is what makes a broken poller — and
+// with it every button press — alertable. It is ALWAYS emitted: 0 means
+// "no successful poll since this process started", which a staleness rule
+// reads as maximally stale rather than as an absent series.
+func TestRenderNotifierPromLastPollSuccess(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		poll time.Time
+		want string
+	}{
+		{"never polled", time.Time{}, "heimdall_notifier_last_poll_success_timestamp_seconds 0\n"},
+		{"polled", now.Add(-time.Minute), "heimdall_notifier_last_poll_success_timestamp_seconds " +
+			strconv.FormatInt(now.Add(-time.Minute).Unix(), 10) + "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(emit.RenderNotifierProm(now, emit.NotifierStats{LastPollSuccess: tc.poll}))
+			for _, want := range []string{"# TYPE heimdall_notifier_last_poll_success_timestamp_seconds gauge\n", tc.want} {
+				if !strings.Contains(got, want) {
+					t.Errorf("RenderNotifierProm missing %q in:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
