@@ -12,11 +12,10 @@ import (
 )
 
 // TestEndToEndManifestToEngineToPluginSubprocessToFinding is the headline
-// proof for this slice: a manifest.Manifest built DIRECTLY in code (not via
-// manifest.Load, whose verify.backend enum only allows
-// prometheus/victorialogs/pbs — bypassing Load here is correct for this
-// integration test and keeps S3-b self-contained without touching manifest
-// validation) routes two expectations to a *SourcePlugin backed by the REAL
+// proof for this slice: a manifest.Manifest built DIRECTLY in code (the
+// installed-plugin path through manifest.Load and a "plugin:<id>" backend is
+// TestInstalledPluginServesAManifestBackend) routes two expectations to a
+// *SourcePlugin backed by the REAL
 // compiled plugins/source-reference subprocess, through detect.Engine.Run,
 // producing real contract.Finding values.
 //

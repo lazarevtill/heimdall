@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lazarevtill/heimdall/internal/config"
 	"github.com/lazarevtill/heimdall/internal/contract"
+	"github.com/lazarevtill/heimdall/internal/source"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 )
 
@@ -357,4 +360,63 @@ func TestRunTier1ExpectationOnVictoriaLogs(t *testing.T) {
 	if got := states["c1-deadman"]; !strings.HasPrefix(got, "unknown: ") || !strings.Contains(got, "no source wired for backend pbs") {
 		t.Errorf("pbs Tier-1 finding = %q, want an explicit Unknown (no source wired)", got)
 	}
+}
+
+// buildSources wires every CONFIGURED backend. An unusable PBS fails the
+// start; a broken PLUGIN install does not stop the other checks — its
+// backend answers Unknown with the reason instead.
+func TestBuildSources(t *testing.T) {
+	base := config.Config{PromURL: "http://127.0.0.1:9090"}
+
+	got, err := buildSources(base)
+	if err != nil {
+		t.Fatalf("buildSources(minimal): %v", err)
+	}
+	if _, ok := got["prometheus"]; !ok || len(got) != 1 {
+		t.Errorf("minimal config wired %v, want prometheus only", keys(got))
+	}
+
+	withVL := base
+	withVL.VLURL = "http://127.0.0.1:9428"
+	if got, err := buildSources(withVL); err != nil || got["victorialogs"] == nil {
+		t.Errorf("VL configured: sources %v, err %v; want victorialogs wired", keys(got), err)
+	}
+
+	badPBS := base
+	badPBS.PBSURL, badPBS.PBSCA = "https://pbs.example.invalid:8007", []byte("not a certificate")
+	if _, err := buildSources(badPBS); err == nil {
+		t.Error("PBS with an unusable CA: want a startup error")
+	}
+
+	broken := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(broken, "refsrc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "refsrc", "plugin.json"), []byte(`{"plugin_api":2}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withPlugins := base
+	withPlugins.PluginDir = broken
+	got, err = buildSources(withPlugins)
+	if err != nil {
+		t.Fatalf("a broken plugin must not fail the start: %v", err)
+	}
+	if got["prometheus"] == nil {
+		t.Error("prometheus lost to a broken plugin")
+	}
+	src := got["plugin:refsrc"]
+	if src == nil {
+		t.Fatal("broken plugin not registered: its expectations would read 'no source wired' instead of the reason")
+	}
+	if sig, _ := src.Query(context.Background(), source.Query{ID: "q"}); sig.State != contract.StateUnknown {
+		t.Errorf("broken plugin answered %v, want Unknown", sig.State)
+	}
+}
+
+func keys(m map[string]source.Source) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

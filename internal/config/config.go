@@ -8,10 +8,18 @@
 // cred file (both may be absent — no new required env vars for them).
 // SuppressionsFile (HEIMDALL_SUPPRESSIONS_FILE) is optional: empty when a lab
 // has no declarative suppressions yet (an empty authority is valid).
+//
+// PBS (HEIMDALL_PBS_URL) is optional and all-or-nothing: with a URL set, the
+// pinned CA (HEIMDALL_PBS_CA_FILE) and the API token pair (HEIMDALL_PBS_TOKEN_ID
+// / HEIMDALL_PBS_TOKEN_SECRET, in the cred file) are all required, and the CA
+// is read and parsed here — a half-configured PBS source fails the start, it
+// does not become a permanent Unknown. PluginDir (HEIMDALL_PLUGIN_DIR) is
+// optional; the detector loads every source plugin installed under it.
 package config
 
 import (
 	"bufio"
+	"crypto/x509"
 	"fmt"
 	"net/url"
 	"os"
@@ -28,9 +36,19 @@ type Config struct {
 	DigestDir        string
 	VLURL            string // optional: empty when no victorialogs tier2 specs are configured
 	SuppressionsFile string // HEIMDALL_SUPPRESSIONS_FILE — optional
+	PBSURL           string // HEIMDALL_PBS_URL — optional; see the package doc
+	PBSCA            []byte // contents of HEIMDALL_PBS_CA_FILE (PEM), read at load
+	PluginDir        string // HEIMDALL_PLUGIN_DIR — optional
 	QueryLimit       int
 	Credentials      map[string]string
 }
+
+// PBS credential keys, looked up in the cred file (never plain env: they are
+// the API token).
+const (
+	PBSTokenIDKey     = "HEIMDALL_PBS_TOKEN_ID"
+	PBSTokenSecretKey = "HEIMDALL_PBS_TOKEN_SECRET"
+)
 
 // Load reads config through the supplied getenv (os.Getenv in main;
 // a map lookup in tests).
@@ -44,6 +62,8 @@ func Load(getenv func(string) string) (Config, error) {
 		DigestDir:        getenv("HEIMDALL_DIGEST_DIR"),
 		VLURL:            getenv("HEIMDALL_VL_URL"),            // optional
 		SuppressionsFile: getenv("HEIMDALL_SUPPRESSIONS_FILE"), // optional
+		PBSURL:           getenv("HEIMDALL_PBS_URL"),           // optional
+		PluginDir:        getenv("HEIMDALL_PLUGIN_DIR"),        // optional
 		QueryLimit:       8,
 	}
 	required := []struct{ name, val string }{
@@ -81,7 +101,41 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		c.Credentials = creds
 	}
+	if c.PBSURL != "" {
+		if err := c.loadPBS(getenv("HEIMDALL_PBS_CA_FILE")); err != nil {
+			return Config{}, err
+		}
+	}
 	return c, nil
+}
+
+// loadPBS validates the all-or-nothing PBS settings and reads the pinned CA.
+// PBS serves TLS with a private CA, so the URL must be https — a plain-http
+// PBS URL would make the pinned CA meaningless.
+func (c *Config) loadPBS(caFile string) error {
+	if err := checkBackendURL("HEIMDALL_PBS_URL", c.PBSURL); err != nil {
+		return err
+	}
+	if u, _ := url.Parse(c.PBSURL); u.Scheme != "https" { // parses: checkBackendURL just did
+		return fmt.Errorf("config: HEIMDALL_PBS_URL must be https (the PBS source pins a CA)")
+	}
+	if caFile == "" {
+		return fmt.Errorf("config: HEIMDALL_PBS_URL is set but HEIMDALL_PBS_CA_FILE is not (the PBS source always pins its CA)")
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return fmt.Errorf("config: HEIMDALL_PBS_CA_FILE: %w", err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+		return fmt.Errorf("config: HEIMDALL_PBS_CA_FILE holds no PEM certificate")
+	}
+	c.PBSCA = pem
+	for _, k := range []string{PBSTokenIDKey, PBSTokenSecretKey} {
+		if c.Credentials[k] == "" {
+			return fmt.Errorf("config: HEIMDALL_PBS_URL is set but %s is not in the credential file (HEIMDALL_CRED_FILE)", k)
+		}
+	}
+	return nil
 }
 
 // checkBackendURL fails fast on a backend URL that is not an absolute

@@ -22,6 +22,7 @@ import (
 	"github.com/lazarevtill/heimdall/internal/emit"
 	"github.com/lazarevtill/heimdall/internal/ledger"
 	"github.com/lazarevtill/heimdall/internal/manifest"
+	"github.com/lazarevtill/heimdall/internal/plugin"
 	"github.com/lazarevtill/heimdall/internal/source"
 	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/tier2"
@@ -77,18 +78,9 @@ func run() error {
 	}
 	defer bstore.Close()
 
-	// ONE sources map, keyed by manifest backend, serves both tiers. The
-	// VictoriaLogs client used to be wired for Tier 2 only, so a Tier-1
-	// expectation on victorialogs (which the manifest accepts) was a
-	// permanent "no source wired" Unknown. A backend with no client here —
-	// pbs today — still resolves to an explicit, alertable Unknown per
-	// expectation (engine) and per spec (Tier-2 loop), never a silent skip.
-	sources := map[string]source.Source{
-		"prometheus": source.NewProm(cfg.PromURL, nil),
-	}
-	if cfg.VLURL != "" {
-		sources["victorialogs"] = source.NewVictoriaLogs(
-			cfg.VLURL, cfg.Credentials["HEIMDALL_VL_USER"], cfg.Credentials["HEIMDALL_VL_PASS"], nil)
+	sources, err := buildSources(cfg)
+	if err != nil {
+		return err
 	}
 	checks := map[string]detect.Check{
 		"c1-deadman":   detect.DeadMan,
@@ -267,4 +259,46 @@ func logRunSummary(now time.Time, findings []contract.Finding, dg contract.Diges
 	if unknown > 0 {
 		log.Printf("%d check(s) returned unknown — a source failed, timed out or was unreachable; unknown is alertable by design", unknown)
 	}
+}
+
+// buildSources wires ONE sources map, keyed by manifest backend, serving
+// both tiers: Prometheus always; VictoriaLogs, PBS and each installed source
+// plugin ("plugin:<id>") when configured. A backend the manifest names but
+// nothing here serves still resolves to an explicit, alertable Unknown per
+// expectation (engine) and per spec (Tier-2 loop), never a silent skip.
+//
+// A PBS source that cannot be built fails the run (config.Load already
+// vetted it; this is belt and braces). A broken PLUGIN install does not: it
+// is third-party code in a directory an operator edits, and one bad plugin
+// must not stop every other check. Its backend answers Unknown with the load
+// error (plugin.LoadSourceDir), and each problem is logged here.
+func buildSources(cfg config.Config) (map[string]source.Source, error) {
+	sources := map[string]source.Source{
+		"prometheus": source.NewProm(cfg.PromURL, nil),
+	}
+	if cfg.VLURL != "" {
+		sources["victorialogs"] = source.NewVictoriaLogs(
+			cfg.VLURL, cfg.Credentials["HEIMDALL_VL_USER"], cfg.Credentials["HEIMDALL_VL_PASS"], nil)
+	}
+	if cfg.PBSURL != "" {
+		pbs, err := source.NewPBS(cfg.PBSURL, cfg.Credentials[config.PBSTokenIDKey],
+			cfg.Credentials[config.PBSTokenSecretKey], cfg.PBSCA, nil)
+		if err != nil {
+			return nil, err
+		}
+		sources["pbs"] = pbs
+	}
+	if cfg.PluginDir != "" {
+		plugins, problems := plugin.LoadSourceDir(cfg.PluginDir, func(key string) (string, bool) {
+			v, ok := cfg.Credentials[key]
+			return v, ok
+		})
+		for _, p := range problems {
+			log.Printf("plugin: %v (its expectations read Unknown)", contract.Safe(p))
+		}
+		for id, p := range plugins {
+			sources[manifest.PluginBackendPrefix+id] = p
+		}
+	}
+	return sources, nil
 }

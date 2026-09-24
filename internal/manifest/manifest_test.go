@@ -81,13 +81,27 @@ func TestLoadRejectsInvalid(t *testing.T) {
 		{"bad severity", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"panic","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`, "severity_on_miss"},
 		{"pipe in check id", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
-			{"id":"a","check":"c1|deadman","group":"g","target":"t","node":"n","grace_seconds":60,"severity_on_miss":"info","verify":{"backend":"prometheus","query":"up"}}]}`, "reserved"},
+			{"id":"a","check":"c1|deadman","group":"g","target":"t","node":"n","grace_seconds":60,"severity_on_miss":"info","verify":{"backend":"prometheus","query":"up"}}]}`, "single hyphens"},
 		{"deadman without grace", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c1-deadman","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up"}}]}`, "grace_seconds"},
 		{"threshold without min_count", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up"}}]}`, "min_count"},
 		{"unknown backend", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
 			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"carrier-pigeon","query":"up","min_count":1}}]}`, "verify.backend"},
+		{"plugin backend with no id", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"plugin:","query":"up","min_count":1}}]}`, "verify.backend"},
+		{"plugin backend with a malformed id", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"plugin:../x","query":"up","min_count":1}}]}`, "verify.backend"},
+		{"group with an edge hyphen", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4-signature","group":"node-","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`, "single hyphens"},
+		{"check containing a double hyphen", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4--signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`, "single hyphens"},
+		{"uppercase group", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4-signature","group":"Node","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`, "single hyphens"},
+		{"tier2 group with a double hyphen", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
+			{"id":"a","signal":"quantile","check":"c6-quantile-creep","group":"no--de","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "single hyphens"},
+		{"group--check longer than the tracker's 64-char key", `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+			{"id":"a","check":"c4-signature-disk-latency","group":"storage-array-controller-health-primary","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"prometheus","query":"up","min_count":1}}]}`, "at most together"},
 		{"garbage json", `{nope`, "parse"},
 		{"tier2 missing id", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
 			{"signal":"quantile","check":"c6-quantile-creep","group":"node","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "required"},
@@ -98,7 +112,7 @@ func TestLoadRejectsInvalid(t *testing.T) {
 		{"tier2 missing group", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
 			{"id":"a","signal":"quantile","check":"c6-quantile-creep","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "required"},
 		{"tier2 pipe in check id", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
-			{"id":"a","signal":"quantile","check":"c6|creep","group":"node","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "reserved"},
+			{"id":"a","signal":"quantile","check":"c6|creep","group":"node","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "single hyphens"},
 		{"tier2 unknown signal", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
 			{"id":"a","signal":"vibes","check":"c6-quantile-creep","group":"node","target":"t","backend":"prometheus","query":"up",` + v + `}]}`, "unknown signal"},
 		{"tier2 unknown backend", `{"generated_at":"2026-07-19T00:00:00Z","tier2":[
@@ -164,5 +178,19 @@ func TestLoadAcceptsThresholdOrderPerDirection(t *testing.T) {
 		{"id":"b","signal":"slope","check":"c8-exhaustion-slope","group":"node","target":"t","feature":"disk_days","backend":"prometheus","query":"up","baseline_window_seconds":604800,"graduate_threshold":7,"clear_threshold":14}]}`
 	if _, err := manifest.Load(writeTemp(t, body)); err != nil {
 		t.Fatalf("Load: %v", err)
+	}
+}
+
+// A Tier-1 expectation may name a source plugin as its backend,
+// "plugin:<id>" with the plugin manifest's id grammar. Whether the plugin is
+// installed is checked by the detector at startup, not here.
+func TestLoadAcceptsPluginBackend(t *testing.T) {
+	m, err := manifest.Load(writeTemp(t, `{"generated_at":"2026-07-19T00:00:00Z","expectations":[
+		{"id":"a","check":"c4-signature","group":"g","target":"t","node":"n","severity_on_miss":"info","verify":{"backend":"plugin:refsrc","query":"up","min_count":1}}]}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := m.Expectations[0].Verify.Backend; got != "plugin:refsrc" {
+		t.Errorf("backend = %q, want plugin:refsrc", got)
 	}
 }

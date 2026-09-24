@@ -74,6 +74,14 @@ Tier-2 spec must also have:
 - A unique `(target, feature)`. That pair is the baseline store's key, so two
   specs sharing it would read each other's history as their own.
 
+Every `group` and `check`, in expectations and Tier-2 specs alike, must be
+lowercase words joined by single hyphens (`^[a-z0-9]+(-[a-z0-9]+)*$`), and
+the two together at most 62 characters. They form the ticket key
+`<group>--<check>` (64 characters at most), and the notifier splits that key
+on the first `--`. A name outside this grammar used to be refused by the bridge
+with a `400` that Alertmanager never retries, so its tickets silently never
+opened.
+
 Check the rendered manifest against these rules **before** upgrading: a
 violation stops the detector at load, and `HeimdallDetectorStale` pages.
 
@@ -93,7 +101,21 @@ HEIMDALL_VL_URL=https://victorialogs.example.invalid   # only if LogsQL specs ex
 HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_QUERY_LIMIT=8
 HEIMDALL_CRED_FILE=/run/credentials/heimdall/creds    # k=v lines
+HEIMDALL_PBS_URL=https://pbs.example.invalid:8007      # only if PBS expectations exist
+HEIMDALL_PBS_CA_FILE=/etc/heimdall/pbs-ca.pem          # required with PBS_URL: the pinned CA
+HEIMDALL_PLUGIN_DIR=/usr/lib/heimdall/plugins          # only if plugin:<id> backends are used
 ```
+
+**PBS** is all-or-nothing. With `HEIMDALL_PBS_URL` set (it must be `https`),
+the pinned CA file and the token pair `HEIMDALL_PBS_TOKEN_ID` /
+`HEIMDALL_PBS_TOKEN_SECRET` in the cred file are all required, or the detector
+refuses to start. Without `HEIMDALL_PBS_URL`, a `pbs` expectation is an
+explicit Unknown ("no source wired"). **Plugins** go under
+`HEIMDALL_PLUGIN_DIR/<id>/{plugin.json,plugin}` and serve the backend
+`plugin:<id>`. A plugin's credential, if it declares one, is the cred-file key
+`HEIMDALL_PLUGIN_CRED_<ID>`, whatever env var name its manifest declares. A
+broken install turns only that plugin's expectations Unknown, with the
+reason, and is logged. See `contract/PLUGIN_SCHEMA.md`, "Installing a plugin".
 
 `HEIMDALL_PROM_URL` and `HEIMDALL_VL_URL` must be absolute `http(s)` URLs with
 a host, or the detector refuses to start. The error names the variable, never
