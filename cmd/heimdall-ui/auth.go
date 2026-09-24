@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -95,18 +98,40 @@ type loginState struct {
 	Expiry   int64  `json:"exp"`
 }
 
-// sign returns payload.signature, base64url-encoded, HMAC-SHA256 over the
-// payload with the session key.
-func sign(key []byte, payload []byte) string {
+// Signing purposes. Both cookies are signed with the ONE session key, so the
+// MAC must also bind which kind of value it covers. Without that, the login
+// cookie — which /login mints for anyone who asks, unauthenticated — verified
+// as a session cookie, and json.Unmarshal happily read its `exp` into a
+// session: a signed read session with no login at all. The purpose is part
+// of the MAC input, so a value signed for one purpose cannot verify as the
+// other no matter what its payload decodes to.
+const (
+	purposeSession = "session"
+	purposeLogin   = "login"
+)
+
+// macFor is HMAC-SHA256 over purpose, a NUL separator, then the payload. The
+// purposes are fixed constants that contain no NUL, so the framing is
+// unambiguous.
+func macFor(key []byte, purpose string, payload []byte) []byte {
 	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
 	mac.Write(payload)
-	return base64.RawURLEncoding.EncodeToString(payload) + "." +
-		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return mac.Sum(nil)
 }
 
-// unsign verifies and returns the payload. The comparison is constant-time,
-// and a malformed value is indistinguishable from a forged one.
-func unsign(key []byte, value string) ([]byte, error) {
+// sign returns payload.signature, base64url-encoded, with the signature
+// bound to purpose.
+func sign(key []byte, purpose string, payload []byte) string {
+	return base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(macFor(key, purpose, payload))
+}
+
+// unsign verifies a value signed for purpose and returns the payload. The
+// comparison is constant-time, and a malformed value, a forged one and one
+// signed for a different purpose are all indistinguishable.
+func unsign(key []byte, purpose, value string) ([]byte, error) {
 	parts := strings.Split(value, ".")
 	if len(parts) != 2 {
 		return nil, errors.New("malformed signed value")
@@ -119,12 +144,26 @@ func unsign(key []byte, value string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("malformed signed value")
 	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(payload)
-	if subtle.ConstantTimeCompare(got, mac.Sum(nil)) != 1 {
+	if subtle.ConstantTimeCompare(got, macFor(key, purpose, payload)) != 1 {
 		return nil, errors.New("signature mismatch")
 	}
 	return payload, nil
+}
+
+// decodeSigned decodes a verified payload STRICTLY: an unknown field or
+// trailing data is an error. The purpose binding above is what actually
+// separates the two cookie kinds; this is the second wall, so a payload shaped
+// for one struct can never be read leniently as the other.
+func decodeSigned(payload []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return errors.New("trailing data after signed value")
+	}
+	return nil
 }
 
 // randomToken returns n bytes of cryptographic randomness, base64url encoded.
@@ -173,7 +212,16 @@ func (s *server) identify(r *http.Request) (Identity, bool) {
 		if err != nil {
 			return Identity{}, false
 		}
-		return Identity{Subject: sess.Subject, Display: sess.Display, Operator: sess.Operator}, true
+		id := Identity{Subject: sess.Subject, Display: sess.Display}
+		// The operator recorded in the cookie is re-checked against the
+		// CURRENT allow-list on every request. The cookie only says who was
+		// allowed at login; removing someone from HEIMDALL_UI_OPERATORS and
+		// restarting must take their writes away now, not when an 8-hour
+		// cookie happens to expire.
+		if sess.Operator != "" && s.operators[sess.Operator] {
+			id.Operator = sess.Operator
+		}
+		return id, true
 
 	default:
 		// An unknown mode must never fall open.
@@ -192,13 +240,19 @@ func (s *server) readSession(r *http.Request) (session, error) {
 	if err != nil {
 		return session{}, err
 	}
-	payload, err := unsign(s.sessionKey, c.Value)
+	payload, err := unsign(s.sessionKey, purposeSession, c.Value)
 	if err != nil {
 		return session{}, err
 	}
 	var sess session
-	if err := json.Unmarshal(payload, &sess); err != nil {
+	if err := decodeSigned(payload, &sess); err != nil {
 		return session{}, err
+	}
+	// Every real session is minted from a verified ID token, and
+	// VerifyIDToken refuses one without a subject. A signed value with no
+	// subject is therefore not a session this console issued.
+	if sess.Subject == "" {
+		return session{}, errors.New("session names no subject")
 	}
 	if sess.Expiry == 0 || s.now().After(time.Unix(sess.Expiry, 0)) {
 		return session{}, errors.New("session expired")
@@ -214,7 +268,7 @@ func (s *server) writeSession(w http.ResponseWriter, sess session) error {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
-		Value:    sign(s.sessionKey, payload),
+		Value:    sign(s.sessionKey, purposeSession, payload),
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   s.secureCookies,
@@ -258,7 +312,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     loginCookie,
-		Value:    sign(s.sessionKey, payload),
+		Value:    sign(s.sessionKey, purposeLogin, payload),
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   s.secureCookies,
@@ -282,13 +336,21 @@ func (s *server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearCookie(w, loginCookie)
 
-	payload, err := unsign(s.sessionKey, c.Value)
+	payload, err := unsign(s.sessionKey, purposeLogin, c.Value)
 	if err != nil {
 		http.Error(w, "login state is not valid", http.StatusBadRequest)
 		return
 	}
 	var ls loginState
-	if err := json.Unmarshal(payload, &ls); err != nil {
+	if err := decodeSigned(payload, &ls); err != nil {
+		http.Error(w, "login state is not valid", http.StatusBadRequest)
+		return
+	}
+	// handleLogin always fills all three. An empty one would make the checks
+	// below vacuous — ConstantTimeCompare("", "") is 1, and an empty nonce
+	// or verifier binds nothing — so it is refused outright rather than
+	// trusted because it happens to carry a valid signature.
+	if ls.State == "" || ls.Nonce == "" || ls.Verifier == "" {
 		http.Error(w, "login state is not valid", http.StatusBadRequest)
 		return
 	}
@@ -338,7 +400,10 @@ func (s *server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("login: %s (writes=%t)", sess.Display, sess.Operator != "")
-	http.Redirect(w, r, ls.Return, http.StatusSeeOther)
+	// Re-sanitised even though handleLogin already did it and the cookie is
+	// signed: the redirect target is the one place this flow hands a
+	// browser a URL, so it is checked where it is used.
+	http.Redirect(w, r, safeReturnPath(ls.Return), http.StatusSeeOther)
 }
 
 // handleLogout clears the session.
@@ -360,12 +425,33 @@ func displayName(c IDClaims) string {
 // safeReturnPath sanitises a post-login redirect target. Only a same-site
 // absolute PATH is allowed: anything else — a scheme, a host, a
 // protocol-relative "//evil" — would make the console an open redirect.
+//
+// Browsers are more lenient than a prefix check. Per the WHATWG URL parser a
+// backslash is a path separator in an http(s) URL, so "/\evil" is read as
+// "//evil"; and ASCII tab/newline are stripped before parsing, so "/<TAB>/evil"
+// is too. Both passed the old prefix test and redirected off-site after a
+// real login. So: any backslash or control byte is refused outright, the
+// value must PARSE as a path-only reference, and what is returned is
+// rebuilt from the parsed form rather than echoed.
 func safeReturnPath(p string) string {
 	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
 		return "/"
 	}
-	if strings.Contains(p, "://") || strings.ContainsAny(p, "\r\n") {
+	for i := 0; i < len(p); i++ {
+		if c := p[i]; c < 0x20 || c == 0x7f || c == '\\' {
+			return "/"
+		}
+	}
+	u, err := url.Parse(p)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.User != nil || u.Opaque != "" {
 		return "/"
 	}
-	return p
+	if !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") {
+		return "/"
+	}
+	out := u.EscapedPath()
+	if u.RawQuery != "" {
+		out += "?" + u.RawQuery
+	}
+	return out
 }

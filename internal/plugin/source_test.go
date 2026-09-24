@@ -226,3 +226,32 @@ func TestSourcePluginQueryMalformedJSONIsUnknownWithErr(t *testing.T) {
 		t.Errorf("State = %v, want StateUnknown", sig.State)
 	}
 }
+
+// Plugin-authored error text reaches finding evidence through Signal.Err:
+// a per-query err the plugin wrote, or an unrecognized state string the
+// adapter quotes for diagnosis. Either may carry the plugin's own
+// credential; the adapter knows that exact value and scrubs it.
+func TestSourcePluginQueryScrubsSecretFromSignalErr(t *testing.T) {
+	const secret = "k3y-9f8e7d6c5b4a" // arbitrary shape: no redaction pattern matches it
+	for _, mode := range []string{"errsecret", "statesecret"} {
+		t.Run(mode, func(t *testing.T) {
+			sp, err := NewSourcePlugin(testSourceManifest("badsrc"), badsrcPath, secret)
+			if err != nil {
+				t.Fatalf("NewSourcePlugin: %v", err)
+			}
+			sig, err := sp.Query(context.Background(), source.Query{ID: "q1", Expr: mode + ":x"})
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if sig.State != contract.StateUnknown {
+				t.Errorf("State = %v, want StateUnknown", sig.State)
+			}
+			if strings.Contains(sig.Err, secret) {
+				t.Fatalf("Signal.Err leaked the injected credential: %q", sig.Err)
+			}
+			if !strings.Contains(sig.Err, scrubbedSecret) {
+				t.Errorf("Signal.Err = %q, want the credential replaced by %q", sig.Err, scrubbedSecret)
+			}
+		})
+	}
+}

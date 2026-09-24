@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -164,11 +165,14 @@ func (s *PBSSource) once(ctx context.Context, q Query, spec pbsSpec) (Signal, in
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	// The datastore is escaped as ONE path segment: a "/" or "?" in a manifest
+	// value must not walk the request to another API endpoint or add a query.
+	ds := url.PathEscape(spec.datastore)
 	var path string
 	if spec.mode == "gc" {
-		path = fmt.Sprintf("/api2/json/admin/datastore/%s/gc", spec.datastore)
+		path = fmt.Sprintf("/api2/json/admin/datastore/%s/gc", ds)
 	} else {
-		path = fmt.Sprintf("/api2/json/admin/datastore/%s/snapshots", spec.datastore)
+		path = fmt.Sprintf("/api2/json/admin/datastore/%s/snapshots", ds)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.base+path, nil)
 	if err != nil {

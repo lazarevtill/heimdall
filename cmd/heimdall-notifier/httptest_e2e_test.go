@@ -133,7 +133,7 @@ func TestEndToEndOverHTTPTestFakes(t *testing.T) {
 		Notify: nd, Silence: sc, Suppress: sup,
 		TextfileDir: t.TempDir(), TG: tg, MainChatID: fakeMainChatID,
 	}
-	if err := runCycle(context.Background(), fixedNow, cd, dispatchErrors); err != nil {
+	if err := runCycle(context.Background(), fixedNow, cd, pollStatus{DispatchErrors: dispatchErrors}); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 

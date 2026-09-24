@@ -10,6 +10,7 @@ package digest
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,21 @@ const SchemaVersion = 1
 // the digest well under this; this is a last-resort safety net for
 // pathologically long target/feature strings.
 const maxDigestBytes = 32 << 10
+
+// MaxEchoItems bounds each top-level echo list (unknown_markers, flaps,
+// new_templates, suppressed, open_tier1_findings) in Build. Without it the
+// lists are unbounded: a Prometheus outage turns EVERY Tier-1 expectation
+// into an open finding at once, and those alone could fill the byte budget,
+// leaving the byte cap nothing to drop but every feature row. A capped string
+// list ends in a truncatedFmt entry so the reader is told it is partial;
+// open_tier1_findings is a cross-link aid only (the findings themselves page
+// from the .prom), so it is cut without a marker.
+const MaxEchoItems = 50
+
+// truncatedFmt is the entry that closes a partial echo list: "[truncated: N
+// more]" (contract.EchoTruncatedFmt, which readers parse with
+// contract.EchoLen). Never a real marker (those are "<target>/<feature>"-shaped).
+const truncatedFmt = contract.EchoTruncatedFmt
 
 // historyRetention is how long dated history files under <dir>/history/ are
 // kept; Write GCs anything older on every call.
@@ -63,18 +79,52 @@ func Build(now, manifestGeneratedAt time.Time, results []tier2.Result,
 		}
 	}
 	kept, truncated := contract.CapRows(rows, contract.MaxDigestRows)
+	if len(openTier1) > MaxEchoItems {
+		openTier1 = openTier1[:MaxEchoItems:MaxEchoItems]
+	}
 	return contract.Digest{
 		SchemaVersion:       SchemaVersion,
 		GeneratedAt:         now,
 		ManifestGeneratedAt: manifestGeneratedAt,
 		Rows:                kept,
-		UnknownMarkers:      dedupSorted(unknowns),
-		NewTemplates:        dedupSorted(templates),
-		Flaps:               dedupSorted(flaps),
+		UnknownMarkers:      capEcho(dedupSorted(unknowns)),
+		NewTemplates:        capEcho(dedupSorted(templates)),
+		Flaps:               capEcho(dedupSorted(flaps)),
 		OpenTier1Findings:   openTier1,
-		Suppressed:          suppressed,
+		Suppressed:          capEcho(suppressed),
 		RowsTruncated:       truncated,
 	}
+}
+
+// capEcho keeps the first MaxEchoItems entries of an echo list and closes a
+// longer one with a truncatedFmt entry counting what was cut.
+func capEcho(in []string) []string {
+	if len(in) <= MaxEchoItems {
+		return in
+	}
+	out := make([]string, 0, MaxEchoItems+1)
+	out = append(out, in[:MaxEchoItems]...)
+	return append(out, fmt.Sprintf(truncatedFmt, len(in)-MaxEchoItems))
+}
+
+// truncatedCount parses a truncatedFmt entry.
+func truncatedCount(s string) (int, bool) { return contract.EchoTruncated(s) }
+
+// dropEcho removes the last REAL entry of an echo list, keeping (or adding)
+// the closing truncatedFmt entry with its count bumped. ok is false when the
+// list holds no real entry left to drop.
+func dropEcho(in []string) (out []string, ok bool) {
+	n, k := 0, len(in)
+	if k > 0 {
+		if c, isMarker := truncatedCount(in[k-1]); isMarker {
+			n, k = c, k-1
+		}
+	}
+	if k == 0 {
+		return in, false
+	}
+	out = append(in[:k-1:k-1], fmt.Sprintf(truncatedFmt, n+1))
+	return out, true
 }
 
 func dedupSorted(in []string) []string {
@@ -94,8 +144,9 @@ func dedupSorted(in []string) []string {
 }
 
 // Write redacts a COPY of dg (the mandatory 4th egress), enforces the 32KB
-// post-redaction byte cap by dropping the lowest-priority row and
-// re-marshaling until under budget, then atomically writes <dir>/latest.json
+// post-redaction byte cap by dropping the lowest-priority row (then, only if
+// the rows are gone, echo entries — see capToByteBudget) and re-marshaling
+// until under budget, then atomically writes <dir>/latest.json
 // AND a dated history file <dir>/history/<RFC3339-compact>.json, and GCs
 // history files older than 14 days. Returns the count of redaction failures
 // (the caller folds this into heimdall_redaction_failures_total). A
@@ -108,26 +159,93 @@ func dedupSorted(in []string) []string {
 // nil for them); only a failed latest.json write is a hard error, since that
 // is the artifact Tier 3 actually reads.
 func Write(dir string, dg contract.Digest, now time.Time) (redactionFailures int, err error) {
-	redacted, failures := redact(dg)
+	rep, err := WriteAndReport(dir, dg, now)
+	return rep.RedactionFailures, err
+}
+
+// Report is what one WriteAndReport did, for the caller's metrics.
+type Report struct {
+	// RedactionFailures feeds heimdall_redaction_failures_total.
+	RedactionFailures int
+	// RowsTruncated is the run's TOTAL row truncation — Build's 200-row cap
+	// plus Write's byte cap — i.e. the rows_truncated latest.json records.
+	// The caller emits it as heimdall_digest_rows_truncated_total.
+	RowsTruncated int
+}
+
+// WriteAndReport is Write, additionally reporting the final row truncation.
+// Before redaction it rewrites any row holding a non-finite float as an
+// unknown row with its floats zeroed (and echoes it in unknown_markers):
+// encoding/json refuses NaN/±Inf, and a digest that cannot be marshalled
+// fails the whole detector run, Tier 1 included. tier2.Eval already refuses
+// to build such a row; this is the last line, whatever the producer.
+func WriteAndReport(dir string, dg contract.Digest, now time.Time) (Report, error) {
+	redacted, failures := redact(finiteRows(dg))
+	rep := Report{RedactionFailures: failures}
 	data, err := capToByteBudget(&redacted)
 	if err != nil {
-		return failures, fmt.Errorf("digest: marshal: %w", err)
+		return rep, fmt.Errorf("digest: marshal: %w", err)
 	}
+	rep.RowsTruncated = redacted.RowsTruncated
 
 	latestPath := filepath.Join(dir, "latest.json")
 	if err := emit.WriteFileAtomic(latestPath, data); err != nil {
-		return failures, fmt.Errorf("digest: write %s: %w", latestPath, err)
+		return rep, fmt.Errorf("digest: write %s: %w", latestPath, err)
 	}
 
 	histDir := filepath.Join(dir, "history")
 	histPath := filepath.Join(histDir, now.UTC().Format(historyTimeFormat)+".json")
 	if err := emit.WriteFileAtomic(histPath, data); err != nil {
-		return failures, fmt.Errorf("digest: write %s: %w", histPath, err)
+		return rep, fmt.Errorf("digest: write %s: %w", histPath, err)
 	}
 
 	gcHistory(histDir, now) // best-effort; failures never fail the run
 
-	return failures, nil
+	return rep, nil
+}
+
+// finiteRows returns dg with every row that holds a NaN/±Inf float rewritten
+// as unknown (floats zeroed) and its "<target>/<feature>" echoed in
+// unknown_markers. It copies the slices it changes; dg is not mutated.
+func finiteRows(dg contract.Digest) contract.Digest {
+	var rows []contract.DigestRow
+	for i, r := range dg.Rows {
+		if finite(r.Value) && finite(r.Baseline7d) && finite(r.ZScore) {
+			continue
+		}
+		if rows == nil {
+			rows = append([]contract.DigestRow(nil), dg.Rows...)
+		}
+		r.Value, r.Baseline7d, r.ZScore, r.Status = 0, 0, 0, contract.StatusUnknown
+		rows[i] = r
+		dg.UnknownMarkers = addMarker(dg.UnknownMarkers, r.Target+"/"+r.Feature)
+	}
+	if rows != nil {
+		dg.Rows = rows
+	}
+	return dg
+}
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// addMarker inserts m into a sorted echo list (copying it) unless present,
+// keeping any closing truncatedFmt entry last.
+func addMarker(in []string, m string) []string {
+	k := len(in)
+	var tail []string
+	if k > 0 {
+		if _, isMarker := truncatedCount(in[k-1]); isMarker {
+			tail, k = in[k-1:], k-1
+		}
+	}
+	for _, s := range in[:k] {
+		if s == m {
+			return in
+		}
+	}
+	out := append(append([]string(nil), in[:k]...), m)
+	sort.Strings(out)
+	return append(out, tail...)
 }
 
 // redact walks a COPY of dg, passing every free-text/identifier string
@@ -183,20 +301,54 @@ func redact(dg contract.Digest) (contract.Digest, int) {
 // capToByteBudget marshals dg to indented JSON; if the result exceeds
 // maxDigestBytes it drops the lowest-priority row (the last one — dg.Rows is
 // already in contract.CapRows priority order: non-ok rows first, then
-// descending |zscore|) and re-marshals, repeating until under budget or out
-// of rows. Each drop increments dg.RowsTruncated. Deterministic.
+// descending |zscore|) and re-marshals, repeating until under budget. Each
+// row drop increments dg.RowsTruncated. Deterministic.
+//
+// The cap ALWAYS holds: once the rows are gone, echo entries are dropped one
+// at a time, lowest priority first — suppressed, new_templates, flaps,
+// open_tier1_findings, and unknown_markers last (a blind spot is the thing
+// the analyst most needs to be told about) — each shrunk string list keeping
+// its closing truncatedFmt entry. The empty skeleton is a few hundred bytes,
+// so the final error is unreachable in practice; it exists so an impossible
+// state fails the run (and pages) rather than writing an oversized digest.
 func capToByteBudget(dg *contract.Digest) ([]byte, error) {
 	for {
 		data, err := json.MarshalIndent(dg, "", "  ")
 		if err != nil {
 			return nil, err
 		}
-		if len(data) <= maxDigestBytes || len(dg.Rows) == 0 {
+		if len(data) <= maxDigestBytes {
 			return data, nil
 		}
-		dg.Rows = dg.Rows[:len(dg.Rows)-1]
-		dg.RowsTruncated++
+		if len(dg.Rows) > 0 {
+			dg.Rows = dg.Rows[:len(dg.Rows)-1]
+			dg.RowsTruncated++
+			continue
+		}
+		if !dropLowestEcho(dg) {
+			return nil, fmt.Errorf("%d bytes with every row and echo entry dropped exceeds the %d-byte cap", len(data), maxDigestBytes)
+		}
 	}
+}
+
+// dropLowestEcho drops one entry from the lowest-priority echo list that
+// still has one; false when none has.
+func dropLowestEcho(dg *contract.Digest) bool {
+	for _, list := range []*[]string{&dg.Suppressed, &dg.NewTemplates, &dg.Flaps} {
+		if out, ok := dropEcho(*list); ok {
+			*list = out
+			return true
+		}
+	}
+	if n := len(dg.OpenTier1Findings); n > 0 {
+		dg.OpenTier1Findings = dg.OpenTier1Findings[:n-1]
+		return true
+	}
+	if out, ok := dropEcho(dg.UnknownMarkers); ok {
+		dg.UnknownMarkers = out
+		return true
+	}
+	return false
 }
 
 // gcHistory deletes history files older than 14 days. Best-effort: any

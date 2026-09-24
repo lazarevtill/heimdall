@@ -2,7 +2,12 @@ package notify_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/lazarevtill/heimdall/internal/notify"
 	"github.com/lazarevtill/heimdall/internal/suppress"
@@ -177,8 +182,10 @@ func TestDispatchRepressExtendsSameKeyedRecordNotTwoRows(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("len(rows) = %d, want 1 (re-press must extend, not duplicate)", len(rows))
 	}
-	if rows[0].CumulativeDays != 14 {
-		t.Errorf("CumulativeDays = %d, want 14 (two 7-day mutes cumulative)", rows[0].CumulativeDays)
+	// The second press a day later moves until out by one day, and that one
+	// day is all it costs (suppress.AddMute's extend semantics).
+	if rows[0].CumulativeDays != 8 {
+		t.Errorf("CumulativeDays = %d, want 8 (7 days, extended by 1)", rows[0].CumulativeDays)
 	}
 }
 
@@ -201,6 +208,105 @@ func TestDispatchExplainAndOpenTicketWriteNothing(t *testing.T) {
 		}
 		if len(tg.answers) != 1 {
 			t.Errorf("Dispatch(%q): len(answers) = %d, want 1", data, len(tg.answers))
+		}
+	}
+}
+
+// A refused or failed press must SAY so to the presser. Before, Dispatch
+// returned the error without answering the callback, so the button's
+// spinner simply timed out and the operator could believe the mute took.
+func TestDispatchRefusalsAreToastedBack(t *testing.T) {
+	cases := []struct {
+		name string
+		// setup runs before the press under test and returns the Deps to use.
+		setup     func(t *testing.T, d notify.Deps, sup *suppress.Store) notify.Deps
+		data      string
+		at        time.Duration
+		wantToast string // substring of the LAST toast
+		wantIs    error  // errors.Is target for the returned error; nil = only non-nil
+	}{
+		{
+			name: "cap spent",
+			setup: func(t *testing.T, d notify.Deps, _ *suppress.Store) notify.Deps {
+				if _, err := notify.Dispatch(context.Background(), fixedNow, d, cqFor("n|node--c1-deadman")); err != nil {
+					t.Fatalf("first press: %v", err)
+				}
+				return d
+			},
+			data: "n|node--c1-deadman", at: 24 * time.Hour,
+			wantToast: "30-day cap", wantIs: suppress.ErrCapExceeded,
+		},
+		{
+			name: "store fault",
+			setup: func(t *testing.T, d notify.Deps, sup *suppress.Store) notify.Deps {
+				sup.Close()
+				return d
+			},
+			data: "m|node--c1-deadman", wantToast: "not recorded",
+		},
+		{
+			name:  "malformed subject",
+			setup: func(t *testing.T, d notify.Deps, _ *suppress.Store) notify.Deps { return d },
+			data:  "m|no-separator-here", wantToast: "malformed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, tg, sup := testDeps(t)
+			d = tc.setup(t, d, sup)
+			_, err := notify.Dispatch(context.Background(), fixedNow.Add(tc.at), d, cqFor(tc.data))
+			if err == nil {
+				t.Fatal("Dispatch: want an error returned for the daemon to log, got nil")
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("error = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if len(tg.answers) == 0 {
+				t.Fatal("no toast: the presser is left with a spinner that just times out")
+			}
+			if last := tg.answers[len(tg.answers)-1]; !strings.Contains(last, tc.wantToast) {
+				t.Errorf("toast = %q, want it to contain %q", last, tc.wantToast)
+			}
+		})
+	}
+}
+
+// A shorter button on a longer mute changes nothing (suppress.AddMute), so
+// the toast must not claim it did: "Acked 1d" on a 7-day mute would be a lie.
+func TestDispatchShorterPressReportsTheExistingMute(t *testing.T) {
+	d, tg, sup := testDeps(t)
+	if _, err := notify.Dispatch(context.Background(), fixedNow, d, cqFor("m|node--c1-deadman")); err != nil {
+		t.Fatalf("Mute 7d: %v", err)
+	}
+	if _, err := notify.Dispatch(context.Background(), fixedNow.Add(time.Hour), d, cqFor("a|node--c1-deadman")); err != nil {
+		t.Fatalf("Ack 1d: %v", err)
+	}
+	wantUntil := fixedNow.Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if diff := cmp.Diff([]string{"Muted 7d", "Already muted until " + wantUntil}, tg.answers); diff != "" {
+		t.Errorf("toasts (-want +got):\n%s", diff)
+	}
+	rows, err := sup.ListRuntime()
+	if err != nil {
+		t.Fatalf("ListRuntime: %v", err)
+	}
+	if rows[0].Until != wantUntil || rows[0].CumulativeDays != 7 {
+		t.Errorf("row = until %s cumulative %d, want the 7-day mute untouched", rows[0].Until, rows[0].CumulativeDays)
+	}
+}
+
+// Every answer runs under its own deadline: a hung answerCallbackQuery must
+// not stall the poll loop.
+func TestDispatchAnswersUnderADeadline(t *testing.T) {
+	for _, data := range []string{"n|node--c1-deadman", "u|t3-fp1234", "ex|x", "ot|x", "zz|x"} {
+		d, tg, _ := testDeps(t)
+		_, _ = notify.Dispatch(context.Background(), fixedNow, d, cqFor(data))
+		for i, ok := range tg.answerDeadlines {
+			if !ok {
+				t.Errorf("Dispatch(%q): answer %d had no deadline", data, i)
+			}
+		}
+		if len(tg.answerDeadlines) == 0 {
+			t.Errorf("Dispatch(%q): never answered", data)
 		}
 	}
 }

@@ -114,8 +114,8 @@ func TestReadRunsMarksDismissedHypotheses(t *testing.T) {
 	writeRun(t, dir, sampleRun("20260823T050000Z", fixedNow,
 		contract.HypothesisFinding{Hypothesis: "h", Fingerprint: "deadbeefdeadbeef"}))
 
-	got := ReadRuns(dir, fixedNow, map[string]contract2Suppression{
-		"deadbeefdeadbeef": {Reason: "not useful"},
+	got := ReadRuns(dir, fixedNow, func(hypFP string) (string, bool) {
+		return "not useful", hypFP == "deadbeefdeadbeef"
 	})
 	h := got.Runs[0].Findings[0]
 	if !h.Muted {
@@ -123,6 +123,45 @@ func TestReadRunsMarksDismissedHypotheses(t *testing.T) {
 	}
 	if h.MuteReason != "not useful" {
 		t.Errorf("MuteReason = %q", h.MuteReason)
+	}
+}
+
+// A corrupt run file is skipped, never rendered as an empty run — and never
+// silently: the count is surfaced, and a directory of nothing but corrupt
+// runs must not read as "no runs".
+func TestReadRunsCountsUnreadableRunFiles(t *testing.T) {
+	good := sampleRun("20260823T060000Z", fixedNow, contract.HypothesisFinding{Hypothesis: "ok", Fingerprint: "aaaabbbbccccdddd"})
+	for _, tc := range []struct {
+		name           string
+		corrupt        []string
+		withGood       bool
+		wantRuns       int
+		wantUnreadable int
+		wantReason     string
+	}{
+		{"all readable", nil, true, 1, 0, ""},
+		{"one corrupt beside a good run", []string{"20260823T070000Z"}, true, 1, 1, ""},
+		{"only corrupt runs", []string{"20260823T050000Z", "20260823T070000Z"}, false, 0, 2, "none could be read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, id := range tc.corrupt {
+				if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte("{not json"), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			}
+			if tc.withGood {
+				writeRun(t, dir, good)
+			}
+			got := ReadRuns(dir, fixedNow, nil)
+			if len(got.Runs) != tc.wantRuns || got.Unreadable != tc.wantUnreadable {
+				t.Errorf("runs=%d unreadable=%d, want runs=%d unreadable=%d",
+					len(got.Runs), got.Unreadable, tc.wantRuns, tc.wantUnreadable)
+			}
+			if !strings.Contains(got.Reason, tc.wantReason) || (tc.wantReason == "" && got.Reason != "") {
+				t.Errorf("Reason = %q, want it to contain %q", got.Reason, tc.wantReason)
+			}
+		})
 	}
 }
 

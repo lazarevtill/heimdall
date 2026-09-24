@@ -1,5 +1,5 @@
 // Package tracker is the BRIDGE's issue-backend seam: the Tracker interface
-// (FindByMarker, Open, Comment, Transition, Tag) plus the YouTrack HTTP
+// (FindByMarker, Get, Open, Comment, Transition, Tag, Priority) plus the YouTrack HTTP
 // implementation (youtrack.go) and the [hb:<key>] marker grammar (marker.go).
 //
 // The reconciliation engine (S6-b) depends on the Tracker INTERFACE only, so

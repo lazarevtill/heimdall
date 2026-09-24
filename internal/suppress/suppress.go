@@ -219,7 +219,10 @@ func (s Suppression) matchesFields(fingerprint, group, check, target string) boo
 	case ScopeGroupCheck:
 		return s.Matcher.Group == group && s.Matcher.Check == check
 	case ScopeTarget:
-		return s.Matcher.Target == target
+		// target arrives raw from the detector's own findings, but REDACTED
+		// from anything that read it off a series (an Alertmanager label at
+		// the bridge; see ActiveSilences) — both forms name the same target.
+		return s.Matcher.Target == target || contract.Redact(s.Matcher.Target) == target
 	default:
 		return false
 	}

@@ -30,6 +30,9 @@ type fakeTG struct {
 	failChatID int64 // 0 means never fail
 	answers    []string
 	answerErr  error
+	// answerDeadlines records, per AnswerCallbackQuery, whether its
+	// context carried a deadline.
+	answerDeadlines []bool
 }
 
 func (f *fakeTG) SendMessage(_ context.Context, req telegram.SendMessageRequest) (int64, error) {
@@ -40,8 +43,10 @@ func (f *fakeTG) SendMessage(_ context.Context, req telegram.SendMessageRequest)
 	return int64(len(f.sends)), nil
 }
 
-func (f *fakeTG) AnswerCallbackQuery(_ context.Context, _, text string) error {
+func (f *fakeTG) AnswerCallbackQuery(ctx context.Context, _, text string) error {
 	f.answers = append(f.answers, text)
+	_, ok := ctx.Deadline()
+	f.answerDeadlines = append(f.answerDeadlines, ok)
 	return f.answerErr
 }
 

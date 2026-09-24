@@ -122,7 +122,7 @@ type recordingPoster struct {
 	posted []contract.HypothesisFinding
 }
 
-func (p *recordingPoster) Post(ctx context.Context, runID string, h contract.HypothesisFinding) error {
+func (p *recordingPoster) Post(ctx context.Context, runID string, h contract.HypothesisFinding) (analyst.Delivery, error) {
 	p.posted = append(p.posted, h)
-	return nil
+	return analyst.DeliveryEnqueued, nil
 }

@@ -85,8 +85,8 @@ then POSTs to the bridge.
 - **Notifier**: drains a channel-typed outbox to **every sink routed for that channel** —
   Telegram (with inline lifecycle buttons), Gotify, and Synology Chat — turns allow-listed button
   presses into runtime suppressions, and reconciles the suppression authority's active silences
-  into Alertmanager (create/list/delete), with a 30-day rolling cap. Delivery is per-sink
-  idempotent: with Telegram up and Gotify down the entry stays pending, and the retry re-sends to
+  into Alertmanager (create/list/delete), with a 30-day cap per continuous mute. Delivery is per-sink
+  and at-least-once: with Telegram up and Gotify down the entry stays pending, and the retry re-sends to
   Gotify *only* — a healthy channel is never spammed because a sibling is broken. Routing is
   declared in an IaC-rendered `sinks.json` that names credentials by env var, never inline.
   Telegram stays the only *interactive* sink; the others are fire-and-forget transports.

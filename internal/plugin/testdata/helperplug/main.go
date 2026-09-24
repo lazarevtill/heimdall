@@ -9,18 +9,31 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"time"
 )
 
 type request struct {
-	Mode string `json:"mode"`
+	Mode    string `json:"mode"`
+	N       int    `json:"n,omitempty"`       // mode bytes: how many bytes to write
+	PIDFile string `json:"pidfile,omitempty"` // modes escape*: where to record the escapee's pid
 }
 
+// sleeperArg is argv[1] for the re-executed escapee: a descendant that has
+// left the plugin's process group (and session) and simply holds the
+// inherited stdout open for a long time.
+const sleeperArg = "sleeper"
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == sleeperArg {
+		time.Sleep(30 * time.Second)
+		return
+	}
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "helperplug: read stdin:", err)
@@ -50,9 +63,33 @@ func main() {
 				return
 			}
 		}
+	case "bytes":
+		os.Stdout.Write(bytes.Repeat([]byte{'x'}, req.N))
 	case "crash":
 		fmt.Fprintln(os.Stderr, "helperplug: simulated crash")
 		os.Exit(1)
+	case "leaksecret":
+		// A plugin that prints its own credential while failing — the
+		// kind of "auth failed for key ..." line a real client emits.
+		fmt.Fprintln(os.Stderr, "helperplug: auth failed with key", os.Getenv("HEIMDALL_PLUGIN_SECRET"))
+		os.Exit(1)
+	case "escape", "escape-hang":
+		// Start a descendant in a NEW SESSION (so outside the process
+		// group the host kills) that inherits stdout and holds it open,
+		// then either exit cleanly with valid output or hang.
+		pid, err := startEscapee()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "helperplug: setsid unavailable:", err)
+			os.Exit(3)
+		}
+		if err := os.WriteFile(req.PIDFile, []byte(strconv.Itoa(pid)), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "helperplug: write pidfile:", err)
+			os.Exit(2)
+		}
+		if req.Mode == "escape-hang" {
+			time.Sleep(10 * time.Second)
+		}
+		os.Stdout.Write([]byte(`{"canned":"heimdall-refplug-fixture"}`))
 	case "leakenv":
 		env := os.Environ()
 		out, err := json.Marshal(env)

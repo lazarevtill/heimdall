@@ -46,9 +46,21 @@ type Matcher struct {
 	IsEqual bool   `json:"isEqual"`
 }
 
+// Silence lifecycle states as Alertmanager reports them in status.state.
+const (
+	StateActive  = "active"
+	StatePending = "pending"
+	// StateExpired silences nothing, but Alertmanager keeps listing it for
+	// its whole --data.retention window (default 120h). A caller that
+	// reconciles against List must not mistake one for a live silence.
+	StateExpired = "expired"
+)
+
 // Silence is a materialized Alertmanager silence. ID is set by AM on create
 // and echoed back on list. StartsAt/EndsAt are RFC3339; CreatedBy/Comment
-// are the provenance ("heimdall-notifier" / the mute reason+actor).
+// are the provenance ("heimdall-notifier" / the mute reason+actor). State is
+// READ-SIDE ONLY: List fills it from status.state, and it is never sent on
+// Create (Alertmanager derives it from the times).
 type Silence struct {
 	ID        string    `json:"id,omitempty"`
 	Matchers  []Matcher `json:"matchers"`
@@ -56,6 +68,7 @@ type Silence struct {
 	EndsAt    string    `json:"endsAt"`
 	CreatedBy string    `json:"createdBy"`
 	Comment   string    `json:"comment"`
+	State     string    `json:"-"`
 }
 
 // createResponse is the shape of POST /api/v2/silences' reply.
@@ -87,11 +100,22 @@ type gettableSilenceStatus struct {
 	State string `json:"state"` // active|pending|expired
 }
 
+// gettableMatcher is the read-side matcher shape. IsEqual is a pointer
+// because Alertmanager before v0.22 omits the field entirely, and its
+// absence means the pre-v0.22 semantics — equality — not "!=". Decoding it
+// as a plain bool would read every such matcher as negated.
+type gettableMatcher struct {
+	Name    string `json:"name"`
+	Value   string `json:"value"`
+	IsRegex bool   `json:"isRegex"`
+	IsEqual *bool  `json:"isEqual"`
+}
+
 // gettableSilence is the read-side shape of one entry in GET
 // /api/v2/silences' array response.
 type gettableSilence struct {
 	ID        string                `json:"id"`
-	Matchers  []Matcher             `json:"matchers"`
+	Matchers  []gettableMatcher     `json:"matchers"`
 	StartsAt  string                `json:"startsAt"`
 	EndsAt    string                `json:"endsAt"`
 	CreatedBy string                `json:"createdBy"`
@@ -100,8 +124,8 @@ type gettableSilence struct {
 }
 
 // List GETs /api/v2/silences and returns active+pending+expired silences
-// as-is (the caller filters by whatever state it needs — this client
-// applies no policy). Fail-closed on transport error, non-2xx status, or a
+// as-is, each carrying its State (the caller filters by whatever state it
+// needs — this client applies no policy). Fail-closed on transport error, non-2xx status, or a
 // decode failure.
 func (c *Client) List(ctx context.Context) ([]Silence, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v2/silences", nil)
@@ -114,13 +138,21 @@ func (c *Client) List(ctx context.Context) ([]Silence, error) {
 	}
 	out := make([]Silence, 0, len(gs))
 	for _, g := range gs {
+		matchers := make([]Matcher, 0, len(g.Matchers))
+		for _, m := range g.Matchers {
+			matchers = append(matchers, Matcher{
+				Name: m.Name, Value: m.Value, IsRegex: m.IsRegex,
+				IsEqual: m.IsEqual == nil || *m.IsEqual,
+			})
+		}
 		out = append(out, Silence{
 			ID:        g.ID,
-			Matchers:  g.Matchers,
+			Matchers:  matchers,
 			StartsAt:  g.StartsAt,
 			EndsAt:    g.EndsAt,
 			CreatedBy: g.CreatedBy,
 			Comment:   g.Comment,
+			State:     g.Status.State,
 		})
 	}
 	return out, nil

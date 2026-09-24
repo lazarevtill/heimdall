@@ -27,8 +27,10 @@ import (
 //
 // For each row, "_hv" becomes the Sample.Value; every OTHER field becomes a
 // string Sample.Labels entry (numbers/bools are stringified). A row missing
-// "_hv" or with an unparseable "_hv" is a malformed response and fails
-// closed (Unknown), never silently dropped or coerced to 0. The time range
+// "_hv", or with a null, unparseable or non-finite "_hv", is a malformed
+// response and fails closed (Unknown), never silently dropped or coerced to
+// 0. A body larger than the read cap is likewise Unknown, never a silently
+// shortened answer. The time range
 // is carried inside the expr itself via "_time:" filters — this source does
 // not add start/end params.
 type VLSource struct {
@@ -37,9 +39,13 @@ type VLSource struct {
 	password  string
 	client    *http.Client
 	timeout   time.Duration // per-attempt budget
+	maxBody   int64         // read cap; a larger body is an error, not a truncation
 	baseDelay time.Duration
 	jitter    func() float64
 }
+
+// vlMaxBody is the default response read cap (and the scanner's max line).
+const vlMaxBody = 8 << 20
 
 func NewVictoriaLogs(baseURL, username, password string, client *http.Client) *VLSource {
 	if client == nil {
@@ -51,6 +57,7 @@ func NewVictoriaLogs(baseURL, username, password string, client *http.Client) *V
 		password:  password,
 		client:    client,
 		timeout:   15 * time.Second,
+		maxBody:   vlMaxBody,
 		baseDelay: 250 * time.Millisecond,
 		jitter:    rand.Float64,
 	}
@@ -109,9 +116,14 @@ func (s *VLSource) once(ctx context.Context, q Query) (Signal, int, error) {
 	}
 
 	sig := Signal{QueryID: q.ID, State: contract.StateOK}
-	limited := io.LimitReader(resp.Body, 8<<20)
+	// Read ONE byte past the cap. A bare LimitReader(cap) ends in a clean EOF,
+	// and when the cut lands on a row boundary every row before it parses:
+	// the answer reads as complete and OK with rows silently missing. With
+	// cap+1, draining the limiter (N==0) proves the body was larger than the
+	// cap, which is reported as an error below.
+	limited := &io.LimitedReader{R: resp.Body, N: s.maxBody + 1}
 	scanner := bufio.NewScanner(limited)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8<<20)
+	scanner.Buffer(make([]byte, 0, 64*1024), int(s.maxBody)+1)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -141,22 +153,33 @@ func (s *VLSource) once(ctx context.Context, q Query) (Signal, int, error) {
 	if err := scanner.Err(); err != nil {
 		return Signal{}, resp.StatusCode, fmt.Errorf("read response: %w", err)
 	}
+	if limited.N == 0 {
+		return Signal{}, resp.StatusCode, fmt.Errorf("response exceeds the %d-byte read cap", s.maxBody)
+	}
 	return sig, http.StatusOK, nil
 }
 
 // parseVLValue accepts _hv encoded as a JSON number or a quoted numeric
 // string (VictoriaLogs commonly quotes stats output); anything else fails
-// closed.
+// closed. JSON null is refused explicitly: json.Unmarshal(null, &float64) is
+// a silent no-op that would read as 0. NaN/±Inf are refused like the
+// Prometheus source refuses them (see promResult.value).
 func parseVLValue(raw json.RawMessage) (float64, error) {
+	if strings.TrimSpace(string(raw)) == "null" {
+		return 0, fmt.Errorf("null value")
+	}
 	var f float64
 	if err := json.Unmarshal(raw, &f); err == nil {
-		return f, nil
+		return f, nil // a JSON number literal is always finite
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return 0, fmt.Errorf("parse %q as float: %w", s, err)
+		}
+		if !finite(v) {
+			return 0, fmt.Errorf("non-finite value %q", s)
 		}
 		return v, nil
 	}

@@ -83,3 +83,45 @@ func TestParseWebhookRejectsMalformedJSON(t *testing.T) {
 		t.Fatal("ParseWebhook: want error for malformed JSON, got nil")
 	}
 }
+
+// TestParseWebhookRejectsUnreconcilablePayloads covers every rule that
+// keeps a payload from being misread: an unknown status (read as "not
+// firing" it would CLOSE the issue), an alert from another group/check
+// (folded in, it could close this group's issue while its own still fires),
+// groupLabels without the marker key, and a negative truncation count.
+func TestParseWebhookRejectsUnreconcilablePayloads(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(w *bridge.AMWebhook)
+	}{
+		{"empty alert status", func(w *bridge.AMWebhook) { w.Alerts[0].Status = "" }},
+		{"unknown alert status", func(w *bridge.AMWebhook) { w.Alerts[0].Status = "pending" }},
+		{"unknown payload status", func(w *bridge.AMWebhook) { w.Status = "" }},
+		{"alert from another group", func(w *bridge.AMWebhook) { w.Alerts[0].Labels["group"] = "net" }},
+		{"alert from another check", func(w *bridge.AMWebhook) { w.Alerts[0].Labels["check"] = "other" }},
+		{"groupLabels without check", func(w *bridge.AMWebhook) { delete(w.GroupLabels, "check") }},
+		{"groupLabels without group", func(w *bridge.AMWebhook) { delete(w.GroupLabels, "group") }},
+		{"negative truncatedAlerts", func(w *bridge.AMWebhook) { w.TruncatedAlerts = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := validAMPayload()
+			tc.mutate(&fixture)
+			if _, err := bridge.ParseWebhook(marshalWebhook(t, fixture)); err == nil {
+				t.Fatal("ParseWebhook: want error, got nil")
+			}
+		})
+	}
+}
+
+func TestParseWebhookKeepsTruncatedAlerts(t *testing.T) {
+	fixture := validAMPayload()
+	fixture.TruncatedAlerts = 4
+	w, err := bridge.ParseWebhook(marshalWebhook(t, fixture))
+	if err != nil {
+		t.Fatalf("ParseWebhook: %v", err)
+	}
+	if w.TruncatedAlerts != 4 {
+		t.Errorf("TruncatedAlerts = %d, want 4", w.TruncatedAlerts)
+	}
+}

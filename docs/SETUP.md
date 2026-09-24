@@ -62,7 +62,20 @@ cannot be diagnosed while an earlier one is broken.
 
 The manifest is validated fail-loud: duplicate ids, duplicate
 `(check, target)` fingerprints, and a Tier-2 spec with `severity: critical`
-are all refused at load. That is deliberate — Tier 2 can never page.
+are all refused at load. That is deliberate — Tier 2 can never page. Each
+Tier-2 spec must also have:
+
+- `baseline_window_seconds > 0`. There is no default, and 0 made every row
+  read `ok`/zscore 0 forever.
+- A real hysteresis band, ordered for the signal's direction:
+  `clear_threshold < graduate_threshold` for `quantile`, `flap` and
+  `template_surprise`, and `clear_threshold > graduate_threshold` for `slope`.
+  Omitted (0/0) or equal thresholds are refused.
+- A unique `(target, feature)`. That pair is the baseline store's key, so two
+  specs sharing it would read each other's history as their own.
+
+Check the rendered manifest against these rules **before** upgrading: a
+violation stops the detector at load, and `HeimdallDetectorStale` pages.
 
 ### 2. `heimdall-detect` — Tier 1 + Tier 2
 
@@ -81,6 +94,13 @@ HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_QUERY_LIMIT=8
 HEIMDALL_CRED_FILE=/run/credentials/heimdall/creds    # k=v lines
 ```
+
+`HEIMDALL_PROM_URL` and `HEIMDALL_VL_URL` must be absolute `http(s)` URLs with
+a host, or the detector refuses to start. The error names the variable, never
+the value, because these URLs may carry credentials. A malformed cred-file
+line is reported by line number only, for the same reason. A Tier-1
+expectation may use `victorialogs` as well as `prometheus` once
+`HEIMDALL_VL_URL` is set.
 
 **Verify** — do not move on until all three are true:
 
@@ -104,11 +124,13 @@ HEIMDALL_ENGINE_STATE_DB=/var/lib/heimdall/state.db   # SAME FILE as HEIMDALL_ST
 HEIMDALL_YOUTRACK_URL=https://tracker.example.invalid
 HEIMDALL_YOUTRACK_TOKEN=...                            # via LoadCredential, never inline
 HEIMDALL_YOUTRACK_PROJECT=HEIM
+HEIMDALL_TEXTFILE_DIR=/var/lib/node_exporter           # heimdall-bridge.prom (sweep heartbeat + counters)
+HEIMDALL_BRIDGE_TOKEN=...                              # ≥24 chars, via LoadCredential; or HEIMDALL_BRIDGE_AUTH=none
 # optional
 HEIMDALL_SPOOL_DIR=/var/lib/heimdall/findings   # richer ticket bodies; falls back to annotations
 HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_STORM_FUSE_PER_HOUR=10                 # default 10
-HEIMDALL_ANALYST_TICKET_POLICY=telegram-only    # default
+HEIMDALL_ANALYST_TICKET_POLICY=telegram_only    # default
 HEIMDALL_YOUTRACK_ASSIGNEE=someone
 ```
 
@@ -117,7 +139,58 @@ sub-field tells you whether the tracker credential works. `/healthz` never
 fails on YouTrack being down — it asserts the bridge and its own db, so read
 the sub-field rather than the status code.
 
-Then point Alertmanager at `POST /am`.
+Then point Alertmanager at `POST /am`, sending the bearer token. Route **only**
+`source="heimdall"` alerts to it, grouped by **exactly** `[group, check]`: the
+bridge keeps one ticket per `(group, check)`.
+- A delivery grouped by more labels (a `severity`, or `'...'`) splits one
+  ticket's targets across several Alertmanager groups. The bridge treats each
+  such delivery as a partial view: it merges the targets but never closes the
+  ticket, so the ticket will not auto-close.
+- Anything else routed to it (the `source="heimdall-meta"` alerts, other
+  apps' alerts) is refused with a `400`, which Alertmanager does not retry.
+  Those alerts must reach a native receiver.
+
+```yaml
+route:
+  receiver: operators              # your native receiver: meta-rules and everything else
+  routes:
+    - matchers: [source="heimdall"]
+      receiver: heimdall-bridge
+      group_by: [group, check]
+      # how a finding's first page reaches people alongside its ticket
+      # (e.g. `continue: true` plus a native route) is your routing choice
+receivers:
+  - name: heimdall-bridge
+    webhook_configs:
+      - url: http://bridge.example.invalid:9098/am
+        send_resolved: true          # the ONE resolve trigger (invariant 8)
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/heimdall-bridge.token
+```
+
+**Authentication.** `/am` and `/hypothesis` require
+`Authorization: Bearer <HEIMDALL_BRIDGE_TOKEN>` and `Content-Type:
+application/json`; `/healthz` stays open. There is no silent default. With no
+token the bridge refuses to start unless `HEIMDALL_BRIDGE_AUTH=none` is set
+explicitly, which it warns about loudly: `/am` can close any auto-managed
+ticket. The analyst sends the same `HEIMDALL_BRIDGE_TOKEN`.
+
+**Metrics.** The bridge writes `heimdall-bridge.prom` atomically after every
+request and sweep: `heimdall_bridge_sweep_last_success_timestamp_seconds`,
+`heimdall_bridge_escalation_errors_total`, `heimdall_bridge_storm_fused_total`
+and `heimdall_redaction_failures_total{plane="bridge"}`. The meta-rules
+watch them.
+
+**Shutdown.** `SIGTERM` lets in-flight reconciles finish, for up to 75 s, so
+give the unit `TimeoutStopSec=` of at least 80 s.
+
+**Episodes.** A group that fires again after its ticket was resolved gets a
+**new** ticket, with its own escalation clock. The resolved one is never
+commented on or re-escalated. A ticket a human owns stays open, but when the
+group recovers the bridge still records it, so the escalation sweep stops
+paging for a group that is no longer firing.
 
 ### 4. `heimdall-notifier` — delivery
 
@@ -155,14 +228,27 @@ Routing validation is fail-fast at boot and every rule maps to a way messages
 would otherwise vanish quietly: an unrouted channel, a route naming an
 undeclared sink, a declared-but-never-routed sink, a missing credential.
 
+The console may be pointed at the same `HEIMDALL_SINKS_FILE` for its delivery
+view. It reads only the routing topology, so it does **not** need the sink
+credentials. Keep `HEIMDALL_GOTIFY_TOKEN` and the Synology URL out of the
+console's environment.
+
+Every outbound call (a sink send, a button answer, an Alertmanager request)
+has a 15 s deadline, so one hung endpoint cannot wedge the loop. `SIGTERM`
+stops the notifier cleanly between sends.
+
 **Verify:** the boot line lists the sinks it built. Then check
 `heimdall-notifier.prom` for `heimdall_notifier_sink_oldest_pending_seconds`
 — one sample per routed `(sink, channel)` pair, `0` when clear.
 
 ### 5. `heimdall-analyst` — Tier 3 (optional)
 
-A oneshot, scheduled. Skip this entirely if you do not want an LLM tier;
-nothing else depends on it.
+A oneshot, scheduled **at least once a day** — the `HeimdallAnalystStale`
+meta-rule fires after two days plus the 5-minute run timeout without a
+successful run (so one failed daily run is tolerated), and should be tightened
+if you run it more often. Skip this entirely if you do not want an
+LLM tier; nothing else depends on it — but then drop the three
+`HeimdallAnalyst*` rules from the meta-rules rather than silencing them.
 
 ```
 HEIMDALL_DIGEST_DIR=/var/lib/heimdall/digest          # written by the detector
@@ -173,11 +259,19 @@ HEIMDALL_ANALYST_RUN_DIR=/var/lib/heimdall/analyst
 HEIMDALL_TEXTFILE_DIR=/var/lib/node_exporter
 # optional
 HEIMDALL_ANALYST_DRY_RUN=true    # analyse and persist, post nothing — use this first
+HEIMDALL_BRIDGE_TOKEN=...        # the bridge's bearer token, via LoadCredential, never inline
 ```
 
 Run it with `HEIMDALL_ANALYST_DRY_RUN=true` first and read a run file. It
 still writes the full run, so you can see exactly what the model produced
-before anything reaches a channel.
+before anything reaches a channel — and it writes the heartbeat, which is
+what clears `HeimdallAnalystAbsent` after a fresh deploy.
+
+A POST the bridge refuses (down, or a wrong `HEIMDALL_BRIDGE_TOKEN`) does not
+fail the run. The hypothesis stays in the run file and is counted in
+`heimdall_analyst_hypotheses_post_failed_total`, which
+`HeimdallAnalystPostFailing` watches. It is not re-sent from the file, but no
+cooldown starts for it, so it posts again if a later run produces it again.
 
 ### 6. `heimdall-ui` — the console (optional)
 
@@ -226,6 +320,20 @@ the provider exactly as configured — a mismatch fails at the provider, not
 here. Discovery runs at boot, so a bad issuer stops the daemon rather than
 surfacing as a broken login later.
 
+Each cookie's signature is bound to its purpose (session vs in-flight login),
+so one can never be replayed as the other. The operator allow-list is
+re-checked on every request, so removing someone from `HEIMDALL_UI_OPERATORS`
+and restarting takes their writes away immediately rather than when their
+8-hour session expires.
+
+**Cross-origin writes are refused.** Every POST (mute, action) goes through
+Go's `http.CrossOriginProtection`: a browser request marked as coming from
+another origin — including a sibling subdomain or another port on the same
+host — gets 403 before any handler runs. A reverse proxy in front must
+preserve the `Host` header, because browsers too old to send `Sec-Fetch-Site`
+are checked by comparing `Origin` with `Host`. Non-browser clients (no
+`Sec-Fetch-Site`, no `Origin`) are unaffected.
+
 **`none`** is a LAN dashboard and is **read-only by default**. Writes need
 `HEIMDALL_UI_ANONYMOUS_WRITES=true`, and then the suppression ledger records
 the actor as plainly unauthenticated — because a mute with no identity has
@@ -238,7 +346,12 @@ nothing from a request ever reaches it.
 ```
 HEIMDALL_UI_ACTION_RERUN_DETECT=/bin/systemctl start heimdall-detect.service
 HEIMDALL_UI_ACTION_FORCE_DRAIN=/bin/systemctl start heimdall-drain.service
+HEIMDALL_UI_ACTION_RERUN_DETECT_TIMEOUT_SECONDS=30   # default 30; must be < 55
 ```
+
+An action's timeout must stay below 55 s, the 60 s server write deadline less
+5 s of headroom. The daemon refuses to boot on a larger value rather than risk
+cutting the response that reports the action's result.
 
 Granting the unit permission to start those units is a PolicyKit/sudoers
 decision made outside this repo. If you would rather not, leave the variables
@@ -248,8 +361,18 @@ unset — do not run the console as root to work around it.
 
 Load [`../deploy/alerts/heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml)
 into Prometheus. **This is not optional polish.** Until it is loaded, a
-crashed detector, a dead notifier and a stuck delivery channel are all
-silent — the alerts that watch the watcher live in that file.
+crashed detector, a dead notifier, a stuck delivery channel, a dead analyst
+and a bridge Alertmanager cannot reach are all silent — the alerts that watch
+the watcher live in that file.
+
+Every `source="heimdall-meta"` alert must be **routed to a native Alertmanager
+receiver** (Telegram, email), never to the bridge. The bridge accepts only
+`source="heimdall"` findings and refuses the rest with a `400`, which is
+never retried. So a meta-alert routed there is simply lost, and the alert that
+says "the bridge is down" could not arrive through the bridge anyway.
+`HeimdallBridgeUnreachable` also needs this Prometheus to scrape
+Alertmanager's own metrics (it reads
+`alertmanager_notifications_failed_total`).
 
 Confirm the rules actually loaded:
 

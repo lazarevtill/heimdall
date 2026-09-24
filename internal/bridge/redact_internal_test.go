@@ -19,7 +19,7 @@ func TestBuildDescriptionRedactsAnnotationFallback(t *testing.T) {
 		Annotations: map[string]string{"title": "disk", "evidence": "leaked " + secret},
 	}}
 	// spoolDir "" => no spool file => the annotation fallback path is taken.
-	desc := buildDescription("g", "c", map[string]bool{"node-a": true}, "", alerts)
+	desc := buildDescription("g", "c", map[string]bool{"node-a": true}, "", alerts, &redactor{})
 
 	if strings.Contains(desc, secret) {
 		t.Fatalf("ticket description leaked the unredacted secret:\n%s", desc)

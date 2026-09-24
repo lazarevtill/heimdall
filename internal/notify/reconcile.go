@@ -76,9 +76,8 @@ func keyFromComment(comment string) (key string, ok bool) {
 // as a deterministically-ordered (sorted by name) []silence.Matcher, every
 // entry an IsEqual/non-regex equality match. Sorting makes the created
 // silence's wire shape stable across cycles (no spurious diff from Go's
-// randomized map iteration), which matters for the golden-style assertions
-// in this package's tests even though the reconciler itself never diffs
-// matchers key-for-key (it matches by the embedded authority Key alone).
+// randomized map iteration). sameProjection compares matchers as a set, so
+// Alertmanager reordering them is not drift.
 func matchersFor(m map[string]string) []silence.Matcher {
 	names := make([]string, 0, len(m))
 	for name := range m {
@@ -99,27 +98,30 @@ func matchersFor(m map[string]string) []silence.Matcher {
 //
 //  1. desired := authority.ActiveSilences(now), indexed by Key.
 //  2. existing := client.List(ctx), filtered to CreatedBy==NotifierCreatedBy
-//     with a recoverable Key (keyFromComment) — anything else (foreign
-//     CreatedBy, or a heimdall-notifier-created silence whose comment
-//     doesn't parse, which should not happen but is left untouched
-//     defensively) is never read from again.
-//  3. A desired Key absent from existing -> Create (matchers = the
-//     authority's label=value pairs PLUS {"source":"heimdall"}, sorted by
-//     name; StartsAt=now, EndsAt=desired.EndsAt, both RFC3339;
-//     CreatedBy=NotifierCreatedBy; Comment=commentFor(key, desired.Comment)).
-//     Created++.
-//  4. An existing heimdall-notifier silence whose Key is NOT in desired ->
-//     Delete (the mute expired or was removed from the ledger). Deleted++.
-//  5. Key present in both -> left untouched as-is. Kept++. (Re-creating an
-//     identical silence every cycle would churn AM; matching by Key alone
-//     avoids it. DECISION: this slice does NOT diff/refresh EndsAt on a
-//     Key match — an extended mute keeps the same Key, so if the ledger's
-//     EndsAt moved out, AM's copy will lag until the record eventually
-//     leaves desired (natural expiry) and gets deleted+recreated on its
-//     next active window, or until a future slice adds an explicit
-//     delete+recreate-on-change path. Documented here rather than
-//     silently: KEEP-as-is on a Key match is the accepted trade-off for
-//     this slice.)
+//     with a recoverable Key (keyFromComment) and NOT expired. Anything else
+//     (foreign CreatedBy, a heimdall-notifier-created silence whose comment
+//     doesn't parse) is never read from or touched. Expired silences are
+//     ignored too: Alertmanager keeps listing them for its whole retention
+//     window (default 120h), and one silences nothing — counting it as
+//     "already projected" once meant a re-mute of the same key within five
+//     days was never projected at all, and deleting it again every cycle
+//     was pure churn. Alertmanager garbage-collects them itself.
+//  3. For each desired Key, the live silences carrying it are compared
+//     with the projection the ledger wants (matchers PLUS
+//     {"source":"heimdall"}, compared as a set; EndsAt compared to the
+//     second). The first one that matches is kept (Kept++). If none
+//     matches — the key is new, the mute was extended, a declarative
+//     matcher was edited — a fresh silence is created (StartsAt=now,
+//     EndsAt=desired.EndsAt, both RFC3339; CreatedBy=NotifierCreatedBy;
+//     Comment=commentFor(key, desired.Comment)) BEFORE the stale ones are
+//     deleted, so nothing is unsilenced in between (Created++). Every other
+//     live silence for the key — drifted copies, duplicates — is deleted
+//     (Deleted++).
+//  4. A live heimdall-notifier silence whose Key is NOT in desired is
+//     deleted (the mute expired or was removed from the ledger). Deleted++.
+//
+// Every Alertmanager call runs under its own DefaultCallTimeout deadline,
+// so a hung Alertmanager cannot stall the notifier's loop.
 //
 // A per-silence Create/Delete error stops the pass and is returned
 // immediately alongside the ReconcileResult accumulated so far (the caller
@@ -135,21 +137,37 @@ func ReconcileSilences(ctx context.Context, now time.Time, client SilenceClient,
 		desired[d.Key] = d
 	}
 
-	existingAll, err := client.List(ctx)
+	var existingAll []silence.Silence
+	err := withDeadline(ctx, func(cctx context.Context) error {
+		var err error
+		existingAll, err = client.List(cctx)
+		return err
+	})
 	if err != nil {
 		return result, fmt.Errorf("notify: reconcile silences: list: %w", err)
 	}
 
-	existingByKey := make(map[string]silence.Silence)
+	existingByKey := make(map[string][]silence.Silence)
 	for _, s := range existingAll {
 		if s.CreatedBy != NotifierCreatedBy {
 			continue // foreign: never read from or touched
+		}
+		if s.State == silence.StateExpired {
+			continue // silences nothing; Alertmanager's to garbage-collect
 		}
 		key, ok := keyFromComment(s.Comment)
 		if !ok {
 			continue // can't recover identity: leave alone, defensive
 		}
-		existingByKey[key] = s
+		existingByKey[key] = append(existingByKey[key], s)
+	}
+
+	del := func(key string, s silence.Silence) error {
+		if err := withDeadline(ctx, func(cctx context.Context) error { return client.Delete(cctx, s.ID) }); err != nil {
+			return fmt.Errorf("notify: reconcile silences: delete %s (key=%s): %w", s.ID, key, err)
+		}
+		result.Deleted++
+		return nil
 	}
 
 	desiredKeys := make([]string, 0, len(desired))
@@ -159,28 +177,35 @@ func ReconcileSilences(ctx context.Context, now time.Time, client SilenceClient,
 	sort.Strings(desiredKeys)
 
 	for _, key := range desiredKeys {
-		if _, ok := existingByKey[key]; ok {
-			result.Kept++
-			continue
-		}
-		d := desired[key]
-		labels := make(map[string]string, len(d.Matchers)+1)
-		for name, value := range d.Matchers {
-			labels[name] = value
-		}
-		labels["source"] = "heimdall"
+		want := projection(now, desired[key])
+		live := existingByKey[key]
 
-		newSilence := silence.Silence{
-			Matchers:  matchersFor(labels),
-			StartsAt:  now.UTC().Format(time.RFC3339),
-			EndsAt:    d.EndsAt.UTC().Format(time.RFC3339),
-			CreatedBy: NotifierCreatedBy,
-			Comment:   commentFor(d.Key, d.Comment),
+		keep := -1
+		for i, s := range live {
+			if sameProjection(s, want) {
+				keep = i
+				break
+			}
 		}
-		if _, err := client.Create(ctx, newSilence); err != nil {
-			return result, fmt.Errorf("notify: reconcile silences: create %s: %w", key, err)
+		if keep >= 0 {
+			result.Kept++
+		} else {
+			if err := withDeadline(ctx, func(cctx context.Context) error {
+				_, err := client.Create(cctx, want)
+				return err
+			}); err != nil {
+				return result, fmt.Errorf("notify: reconcile silences: create %s: %w", key, err)
+			}
+			result.Created++
 		}
-		result.Created++
+		for i, s := range live {
+			if i == keep {
+				continue
+			}
+			if err := del(key, s); err != nil {
+				return result, err
+			}
+		}
 	}
 
 	existingKeys := make([]string, 0, len(existingByKey))
@@ -191,14 +216,72 @@ func ReconcileSilences(ctx context.Context, now time.Time, client SilenceClient,
 
 	for _, key := range existingKeys {
 		if _, ok := desired[key]; ok {
-			continue // already counted Kept above
+			continue // handled above
 		}
-		s := existingByKey[key]
-		if err := client.Delete(ctx, s.ID); err != nil {
-			return result, fmt.Errorf("notify: reconcile silences: delete %s (key=%s): %w", s.ID, key, err)
+		for _, s := range existingByKey[key] {
+			if err := del(key, s); err != nil {
+				return result, err
+			}
 		}
-		result.Deleted++
 	}
 
 	return result, nil
+}
+
+// withDeadline runs one Alertmanager call under its own DefaultCallTimeout.
+func withDeadline(ctx context.Context, call func(context.Context) error) error {
+	cctx, cancel := context.WithTimeout(ctx, DefaultCallTimeout)
+	defer cancel()
+	return call(cctx)
+}
+
+// projection is the silence the ledger wants for d: its label=value pairs
+// PLUS {"source":"heimdall"}, sorted by name.
+func projection(now time.Time, d suppress.Silence) silence.Silence {
+	labels := make(map[string]string, len(d.Matchers)+1)
+	for name, value := range d.Matchers {
+		labels[name] = value
+	}
+	labels["source"] = "heimdall"
+	return silence.Silence{
+		Matchers:  matchersFor(labels),
+		StartsAt:  now.UTC().Format(time.RFC3339),
+		EndsAt:    d.EndsAt.UTC().Format(time.RFC3339),
+		CreatedBy: NotifierCreatedBy,
+		Comment:   commentFor(d.Key, d.Comment),
+	}
+}
+
+// sameProjection reports whether a live silence already projects want: the
+// same matcher SET (Alertmanager may reorder them) and the same EndsAt to
+// the second (it echoes times with milliseconds). An unparseable EndsAt is a
+// mismatch, so it is replaced rather than trusted. StartsAt and Comment are
+// not compared: neither changes what is silenced or for how long.
+func sameProjection(live, want silence.Silence) bool {
+	liveEnd, err1 := time.Parse(time.RFC3339, live.EndsAt)
+	wantEnd, err2 := time.Parse(time.RFC3339, want.EndsAt)
+	if err1 != nil || err2 != nil || !liveEnd.Truncate(time.Second).Equal(wantEnd.Truncate(time.Second)) {
+		return false
+	}
+	if len(live.Matchers) != len(want.Matchers) {
+		return false
+	}
+	a, b := sortedMatchers(live.Matchers), sortedMatchers(want.Matchers)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedMatchers(in []silence.Matcher) []silence.Matcher {
+	out := append([]silence.Matcher(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Value < out[j].Value
+	})
+	return out
 }

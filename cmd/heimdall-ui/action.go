@@ -32,9 +32,18 @@ import (
 var ErrActionNotConfigured = errors.New("action not configured")
 
 // maxActionOutputBytes bounds captured output, for diagnostics only. A
-// command that floods stdout must not put that flood in a log line or an
-// HTTP response.
+// command that floods stdout must not put that flood in a log line, an HTTP
+// response — or the console's memory: the cap is applied AS the output
+// arrives (cappedBuffer), not after the whole flood has been buffered.
 const maxActionOutputBytes = 4 << 10
+
+// actionWaitDelay bounds how long Run waits for the command's output pipes to
+// close once the command has exited or its context is done. Without it,
+// exec reads until EOF, and EOF never comes while any descendant that
+// escaped the process group (a daemonising child, `setsid`) still holds the
+// pipe: the handler would block past every deadline and the operator would
+// see a dead connection.
+const actionWaitDelay = 2 * time.Second
 
 // Action is one operator-invocable command.
 type Action struct {
@@ -104,18 +113,21 @@ func (ExecRunner) Run(ctx context.Context, a Action) (ActionResult, error) {
 	cmd.Env = []string{}
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = actionWaitDelay
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// One writer for both streams: exec then runs a single copy goroutine,
+	// so cappedBuffer needs no lock.
+	capture := &cappedBuffer{limit: maxActionOutputBytes}
+	cmd.Stdout = capture
+	cmd.Stderr = capture
 
 	start := time.Now()
 	err := cmd.Run()
 	elapsed := time.Since(start)
 
-	out := buf.String()
-	if len(out) > maxActionOutputBytes {
-		out = out[:maxActionOutputBytes] + "\n… output truncated"
+	out := capture.buf.String()
+	if capture.truncated {
+		out += "\n… output truncated"
 	}
 	res := ActionResult{
 		Name:     a.Name,
@@ -126,6 +138,14 @@ func (ExecRunner) Run(ctx context.Context, a Action) (ActionResult, error) {
 	if ctx.Err() == context.DeadlineExceeded {
 		res.ExitCode = -1
 		return res, fmt.Errorf("action %q: timed out after %s", a.Name, timeout)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The command itself exited 0; something it started kept the output
+		// pipe open past actionWaitDelay. That is a success whose captured
+		// output may be incomplete — reporting it as a failure would tell
+		// the operator an action failed that did not.
+		res.Output = strings.TrimSpace(res.Output + "\n(a background process kept the output open; output may be incomplete)")
+		return res, nil
 	}
 	if err != nil {
 		var ee *exec.ExitError
@@ -139,12 +159,44 @@ func (ExecRunner) Run(ctx context.Context, a Action) (ActionResult, error) {
 	return res, nil
 }
 
+// cappedBuffer keeps the first limit bytes written to it and discards the
+// rest, while reporting every write as complete. Discarding rather than
+// failing matters: a short write would reach the child as EPIPE/SIGPIPE and
+// change the command's own outcome merely because it was chatty.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	room := c.limit - c.buf.Len()
+	switch {
+	case len(p) <= room:
+		c.buf.Write(p)
+	case room > 0:
+		c.buf.Write(p[:room])
+		c.truncated = true
+	default:
+		c.truncated = c.truncated || len(p) > 0
+	}
+	return len(p), nil
+}
+
 // defaultActionTimeout bounds an action that declares none.
 const defaultActionTimeout = 30 * time.Second
 
-// maxActionTimeout is the ceiling for a configured action, set by the
-// server's write deadline. Past it the command still completes in its own
-// process group, but the response carrying its result is cut — so the
-// operator sees a dead connection and cannot tell whether the action ran.
-// Refused at boot rather than shipped as that ambiguity.
-const maxActionTimeout = writeTimeout
+// actionWriteHeadroom is kept between the longest permitted action and the
+// server's write deadline. That deadline runs from when the request's
+// headers were read, and a timed-out action still costs the kill, up to
+// actionWaitDelay for its pipes, and the redirect write. An action allowed
+// the FULL write timeout therefore always lost its response exactly when it
+// timed out — the one run whose outcome the operator most needs to see.
+const actionWriteHeadroom = 5 * time.Second
+
+// actionTimeoutLimit is the EXCLUSIVE ceiling for a configured action
+// timeout. At or past it the command still completes in its own process
+// group, but the response carrying its result may be cut — so the operator
+// sees a dead connection and cannot tell whether the action ran. Refused at
+// boot rather than shipped as that ambiguity.
+const actionTimeoutLimit = writeTimeout - actionWriteHeadroom

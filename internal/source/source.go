@@ -12,6 +12,7 @@ package source
 
 import (
 	"context"
+	"math"
 
 	"github.com/lazarevtill/heimdall/internal/contract"
 )
@@ -40,3 +41,8 @@ type Source interface {
 	ID() string
 	Query(ctx context.Context, q Query) (Signal, error)
 }
+
+// finite reports whether v is a real measurement. Every source rejects NaN
+// and ±Inf at parse time, so a non-finite value surfaces as an Unknown signal
+// instead of travelling on as a number.
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }

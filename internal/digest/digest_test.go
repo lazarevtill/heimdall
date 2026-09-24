@@ -3,6 +3,7 @@ package digest_test
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,5 +233,148 @@ func TestWriteEnforcesByteCap(t *testing.T) {
 	}
 	if len(got.Rows) >= 200 {
 		t.Errorf("len(Rows) = %d, want fewer than 200 after byte-cap trimming", len(got.Rows))
+	}
+}
+
+// Each top-level echo list is bounded up front, so no list can crowd the
+// feature rows out of the byte budget (a Prometheus outage turns EVERY
+// Tier-1 expectation into an open finding at once). A capped string list
+// ends in an explicit "[truncated: N more]" entry: the reader is told the
+// list is partial rather than left to assume it saw everything.
+func TestBuildCapsEchoLists(t *testing.T) {
+	n := digest.MaxEchoItems + 7
+	var results []tier2.Result
+	var openTier1 []contract.OpenTier1Finding
+	var suppressed []string
+	for i := 0; i < n; i++ {
+		results = append(results, tier2.Result{
+			UnknownMarker: fmt.Sprintf("u%03d/f", i),
+			Flap:          fmt.Sprintf("f%03d: 5 changes", i),
+			NewTemplate:   fmt.Sprintf("t%03d/tmpl", i),
+		})
+		openTier1 = append(openTier1, contract.OpenTier1Finding{Fingerprint: fmt.Sprintf("%016x", i), Check: "c1-deadman", Target: "t"})
+		suppressed = append(suppressed, fmt.Sprintf("s%03d", i))
+	}
+	dg := digest.Build(fixedNow, fixedManifestGeneratedAt, results, openTier1, suppressed)
+
+	sentinel := fmt.Sprintf("[truncated: %d more]", n-digest.MaxEchoItems)
+	for name, list := range map[string][]string{
+		"UnknownMarkers": dg.UnknownMarkers, "Flaps": dg.Flaps,
+		"NewTemplates": dg.NewTemplates, "Suppressed": dg.Suppressed,
+	} {
+		if len(list) != digest.MaxEchoItems+1 || list[len(list)-1] != sentinel {
+			t.Errorf("%s: len=%d last=%q, want %d entries ending in %q",
+				name, len(list), list[len(list)-1], digest.MaxEchoItems+1, sentinel)
+		}
+	}
+	if diff := cmp.Diff(openTier1[:digest.MaxEchoItems], dg.OpenTier1Findings); diff != "" {
+		t.Errorf("OpenTier1Findings not capped to the first %d (-want +got):\n%s", digest.MaxEchoItems, diff)
+	}
+}
+
+// The 32KB cap must hold even when the echo lists ALONE exceed it — the row
+// loop used to stop at zero rows and write the oversized document anyway.
+// Once rows are gone, echo entries are dropped (lowest priority first,
+// unknown markers last), each shrunk list ending in its truncation entry.
+func TestWriteByteCapHoldsWhenEchoListsAloneExceedIt(t *testing.T) {
+	long := strings.Repeat("x", 1500) // long but not secret-shaped
+	var results []tier2.Result
+	var openTier1 []contract.OpenTier1Finding
+	for i := 0; i < digest.MaxEchoItems; i++ {
+		results = append(results, tier2.Result{
+			Row:           &contract.DigestRow{RowID: fmt.Sprintf("r%03d", i), Target: long, Status: contract.StatusUnknown},
+			UnknownMarker: fmt.Sprintf("%s-%03d/f", long, i),
+		})
+		openTier1 = append(openTier1, contract.OpenTier1Finding{Fingerprint: fmt.Sprintf("%016x", i), Check: "c1-deadman", Target: long})
+	}
+	dg := digest.Build(fixedNow, fixedManifestGeneratedAt, results, openTier1, nil)
+
+	dir := t.TempDir()
+	if _, err := digest.Write(dir, dg, fixedNow); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "latest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) > 32<<10 {
+		t.Fatalf("written digest = %d bytes, want <= 32KB", len(data))
+	}
+	var got contract.Digest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got.Rows) != 0 || len(got.OpenTier1Findings) != 0 {
+		t.Errorf("rows=%d openTier1=%d, want both sacrificed before unknown markers", len(got.Rows), len(got.OpenTier1Findings))
+	}
+	if k := len(got.UnknownMarkers); k == 0 || !strings.HasPrefix(got.UnknownMarkers[k-1], "[truncated: ") {
+		t.Errorf("UnknownMarkers = %d entries, want a partial list ending in a truncation entry", k)
+	}
+}
+
+// A non-finite float cannot be JSON-encoded; one used to fail Write and with
+// it the whole detector run. Write is the last line: whatever produced the
+// row, it is rewritten as unknown with its floats zeroed, and echoed.
+func TestWriteNeverFailsOnNonFiniteRow(t *testing.T) {
+	dg := digest.Build(fixedNow, fixedManifestGeneratedAt, []tier2.Result{
+		{Row: &contract.DigestRow{RowID: "inf", Target: "node-a", Feature: "disk", Value: math.Inf(1), Baseline7d: 3, ZScore: math.NaN(), Status: contract.StatusOK}},
+		{Row: &contract.DigestRow{RowID: "fine", Target: "node-b", Feature: "cpu", Value: 1, Status: contract.StatusOK}},
+	}, nil, nil)
+	dir := t.TempDir()
+	if _, err := digest.Write(dir, dg, fixedNow); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "latest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got contract.Digest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []contract.DigestRow{
+		{RowID: "inf", Target: "node-a", Feature: "disk", Status: contract.StatusUnknown},
+		{RowID: "fine", Target: "node-b", Feature: "cpu", Value: 1, Status: contract.StatusOK},
+	}
+	if diff := cmp.Diff(want, got.Rows); diff != "" {
+		t.Errorf("rows (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]string{"node-a/disk"}, got.UnknownMarkers); diff != "" {
+		t.Errorf("UnknownMarkers (-want +got):\n%s", diff)
+	}
+}
+
+// WriteAndReport reports the run's TOTAL row truncation — Build's 200-row
+// cap plus Write's byte cap — which the caller emits as
+// heimdall_digest_rows_truncated_total (contract/DIGEST_SCHEMA.md). It must
+// equal what latest.json records.
+func TestWriteAndReportRowsTruncated(t *testing.T) {
+	long := strings.Repeat("x", 500)
+	var results []tier2.Result
+	for i := 0; i < 205; i++ {
+		results = append(results, tier2.Result{Row: &contract.DigestRow{
+			RowID: fmt.Sprintf("r%03d", i), Target: long, ZScore: float64(i), Status: contract.StatusOK,
+		}})
+	}
+	dg := digest.Build(fixedNow, fixedManifestGeneratedAt, results, nil, nil)
+	dir := t.TempDir()
+	rep, err := digest.WriteAndReport(dir, dg, fixedNow)
+	if err != nil {
+		t.Fatalf("WriteAndReport: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "latest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got contract.Digest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsTruncated <= 5 || rep.RowsTruncated != got.RowsTruncated || rep.RowsTruncated != 205-len(got.Rows) {
+		t.Errorf("report RowsTruncated = %d, file = %d, rows kept = %d: want > 5 and all consistent",
+			rep.RowsTruncated, got.RowsTruncated, len(got.Rows))
+	}
+	if rep.RedactionFailures != 0 {
+		t.Errorf("RedactionFailures = %d, want 0", rep.RedactionFailures)
 	}
 }

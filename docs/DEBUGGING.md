@@ -90,6 +90,16 @@ or open the finding in the console, which renders the same document.
 
 Common causes: credential expired, endpoint unreachable, the query returned
 an empty vector, a plugin exited non-zero or blew its deadline or output cap.
+Also, by design:
+- **a NaN or ±Inf sample** (e.g. `histogram_quantile` on an idle series, or a
+  division by a zero derivative). It is not a measurement, so it is refused
+  at the source;
+- **a dead-man timestamp more than 5 minutes in the future**. That is almost
+  always a success metric exported in milliseconds rather than seconds, or
+  clock skew. The evidence says which;
+- **a graduated trend whose signal went blind.** Once a Tier-2 trend has
+  graduated, it stays present as `unknown` rather than resolving when its
+  source fails, and only a measured value below `clear_threshold` resolves it.
 A plugin failure is deliberately whole-batch: `Run` accepts output entirely or
 discards it entirely, so a partly-broken plugin can never look like a calm run.
 
@@ -120,6 +130,16 @@ series that makes a dead destination alertable.
 ```bash
 grep heimdall_notifier_sink_failed_total /var/lib/node_exporter/heimdall-notifier.prom
 ```
+
+This counts sends a sink refused in the last cycle. A sink that is unusable
+right now (unreachable, timed out after the 15 s per-call deadline, throttled
+with a `429`, or answering `5xx`) is **benched for the rest of that pass**, so
+a dead sink shows about one failure per cycle rather than one per pending
+entry. A sink that answered and refused one message is not benched, because
+the oldest entry being unacceptable must not starve everything queued behind
+it. Telegram's `retry_after` is honoured across cycles. The notifier log line
+for each failing sink carries the pass's **first error**. That is where a
+Gotify `401`, a Synology error code or a Telegram `400` shows up.
 
 **Inspect the queue directly:**
 
@@ -153,7 +173,26 @@ header, never the URL, so it will not appear in a timeout or DNS error.
 
 **Telegram** — the only interactive sink. Button presses become suppression
 writes; a press from a user not in `HEIMDALL_ALLOWED_USER_IDS` writes nothing,
-fail-closed and silently by design.
+fail-closed and silently by design. A refused press from an allowed user (the
+cap, a store error) is answered with a toast that says so. A plain-text body
+longer than Telegram's 4096-character limit is sent as ordered chunks, still
+byte-for-byte, with the buttons on the last one, instead of being refused
+forever. The bot token never appears in the log: every Telegram error is
+scrubbed to `[REDACTED:telegram-token]`.
+
+**Buttons stopped working but alerts still arrive** — the Telegram poll is
+failing (`HeimdallNotifierPollStale`). A failed `getUpdates` no longer skips
+the cycle, so drain, silence reconcile and the heartbeat carry on, and the
+other sinks keep delivering. Check
+`heimdall_notifier_last_poll_success_timestamp_seconds` and the log. An HTTP
+`409` means something else holds the bot: a webhook is set, or a second
+notifier is running.
+
+**Alertmanager silences** — the reconciler ignores silences Alertmanager has
+already expired (it keeps them listed for its retention period), and replaces
+a live silence whose matchers or end time have drifted from the ledger. It
+creates the new silence before deleting the old one, so nothing is unsilenced
+in between. It never touches a silence it did not create.
 
 ---
 
@@ -171,9 +210,15 @@ jq '{generated_at, rows: (.rows|length), unknown_markers, rows_truncated}' \
 - **Rows all `baseline_warming`** → Tier 2 needs its 7-day warm-up. A
   never-seen `(check, target)` is warming by default, fail-closed. This is
   expected on a fresh install and resolves itself.
-- **`rows_truncated` persistently non-zero** → the 200-row cap is biting. The
-  cap keeps non-ok rows preferentially, so what was dropped was calm, but
-  sustained truncation is worth raising.
+- **`rows_truncated` persistently non-zero** → the 200-row or 32 KB cap is
+  biting (`heimdall_digest_rows_truncated_total`). The caps keep non-ok rows
+  preferentially, so what was dropped was calm, but sustained truncation is
+  worth raising.
+- **An echo list ends in `"[truncated: N more]"`** → more than 50 entries;
+  the entry counts the rest, and the console and run logs include it in their
+  totals. During a wide outage that is expected for `unknown_markers`.
+  `open_tier1_findings` is capped at 50 too, but cut without a marker (it is
+  only a cross-link aid; the findings themselves page from the `.prom`).
 
 Dated history lives in `digest/history/` and is GC'd after 14 days.
 
@@ -196,7 +241,12 @@ Four things that look like bugs and are not:
   `heimdall_analyst_hypotheses_{hallucinated,deduped,capped,invalid}_total`.
 - **A hypothesis is in the file but nobody received it.** `persist` runs
   *before* any POST, runs under dry-run with zero posts, and survives a POST
-  failure. The file is a strict superset of what was delivered.
+  failure. The file is a strict superset of what was delivered. A POST the
+  bridge refused is counted in `heimdall_analyst_hypotheses_post_failed_total`.
+  It is not re-sent from the run file, but no cooldown starts for it, so it is
+  posted again if a later run produces the same `hyp_fp`. One the bridge
+  already held is logged as `bridge_deduped`, and one an operator muted as
+  `bridge_suppressed`. Neither is counted as posted.
 - **A citation vanished.** Every `evidence_row` is verified against the digest
   the analyst read; a row id that did not exist is dropped as a hallucination
   and counted. That is the wrapper working.
@@ -209,7 +259,10 @@ a `make` gate keeps `internal/llm` off both the detector's and the console's
 dependency graphs. If something LLM-shaped ever pages you, that is a serious
 bug — not a tuning problem.
 
-Analyst not running at all: check `heimdall_analyst_last_success_timestamp_seconds`.
+Analyst not running at all: `HeimdallAnalystStale` / `HeimdallAnalystAbsent`
+fire on `heimdall_analyst_last_success_timestamp_seconds`, and the journal names
+the hard failure — the LLM health gate, the model call, or a reply outside the
+schema's shape (`{}` is refused, not read as an all-clear).
 
 ---
 
@@ -221,10 +274,31 @@ sqlite3 /var/lib/heimdall/bridge.db \
 ```
 
 - **No ticket** → is the storm fuse tripped? The bridge caps issues per hour
-  (default 10). Check the console's Tickets page or count recent `opened_at`.
+  (default 10). Check the console's Tickets page, count recent `opened_at`,
+  or read `heimdall_bridge_storm_fused_total`. Otherwise read the bridge's
+  log for the refusal:
+  - `401`: the bearer token is missing or wrong (Alertmanager's
+    `http_config.authorization`, or the analyst's `HEIMDALL_BRIDGE_TOKEN`);
+  - `415`: the request is not `application/json`;
+  - `413`: the body is over 1 MB;
+  - `400`: the payload is malformed, or an alert's `group`/`check` does not
+    match `groupLabels`;
+  - `503`: another reconcile held the lock past this one's deadline.
+    Alertmanager retries it.
+
+  `HeimdallBridgeUnreachable` fires when Alertmanager's deliveries keep
+  failing.
+- **A group fired again but the old ticket stayed closed** → by design. A
+  firing after the ticket was resolved is a new episode and gets a new
+  ticket.
 - **A ticket did not close** → it closes only when the **whole group**
   resolves *and* the issue still carries its own `heimdall-auto` tag. Removing
-  that tag by hand deliberately hands ownership to a human.
+  that tag by hand deliberately hands ownership to a human. A delivery with
+  `truncatedAlerts > 0` never closes anything, because it cannot prove the
+  whole group resolved.
+- **The escalation sweep is failing** → `HeimdallBridgeSweepStale`. The sweep
+  carries on past a failing issue and counts it in
+  `heimdall_bridge_escalation_errors_total`. The log names the issue.
 - **Duplicate tickets** → the marker is the identity. One issue per
   `(group, check)`, keyed by `[hb:<group>--<check>]`. Two tickets means two
   markers.
@@ -242,7 +316,28 @@ including reads. In `oidc` mode a browser is redirected to `/login` instead.
 **Writes 403 with a valid session** — the identity is not on
 `HEIMDALL_UI_OPERATORS`. In OIDC mode the allow-list is matched against `sub`,
 `email` and `preferred_username`; check which one your provider actually
-populates by reading the login line in the journal.
+populates by reading the login line in the journal. The allow-list is
+re-checked on every request, so an operator removed from it loses writes on
+the next restart even with a live session.
+
+**A POST answers 403 before any handler logs anything** — cross-origin
+protection refused it: the browser marked the request as coming from another
+origin (`Sec-Fetch-Site: cross-site` or `same-site`), or an old browser sent an
+`Origin` that does not match `Host`. Behind a reverse proxy, check that the
+proxy preserves `Host`.
+
+**Everyone was logged out after an upgrade** — expected once: session cookies
+signed before cookie signatures were bound to their purpose no longer verify.
+
+**"Suppression state is unavailable"** — the suppression authority could not
+be read (usually a malformed `suppressions.json`, or a state.db error). The
+pages still render, but nothing is marked muted, and the banner says that this
+does NOT mean nothing is. The cause is in the console's journal.
+
+**"group-scoped suppressions cannot be evaluated here"** — a `group_check`
+mute (the scope every Telegram mute button writes) is active, and this
+finding has no spool document to recover its group from. The ledger stores no
+group, so the console cannot tell whether that mute covers this row.
 
 **OIDC login fails** — the daemon does discovery at boot, so a bad issuer
 stops it starting. After that:
@@ -260,7 +355,18 @@ its page explain itself when unset or unreadable, precisely so "empty" and
 **An action returns 501** — that action has no configured command, so it does
 not exist. This is the default; nothing is wrong.
 
-**A mute is refused** — the 30-day rolling cumulative cap. The error names it.
+**A mute is refused** — the 30-day cap on one continuous mute. The error names
+it. How it counts, per mute key:
+- a new mute, or one whose previous mute has **lapsed**, starts a fresh
+  episode that costs the days asked for;
+- extending an **active** mute costs only the days it actually adds;
+- a shorter press on a longer active mute changes nothing and costs nothing.
+  It never shortens the mute, and the console and Telegram both report the
+  expiry actually in force.
+
+Known limitation: the budget is per key, and the Telegram buttons
+(`btn-<group>--<check>`) and the console (`ui-<fingerprint>`) key their
+records differently. So one finding covered by both scopes has two budgets.
 There is deliberately **no un-mute**: no such operation exists anywhere in the
 suppression authority, so mutes expire on their own.
 
@@ -272,16 +378,27 @@ suppression authority, so mutes expire on their own.
 |---|---|
 | `heimdall_last_run_timestamp_seconds{plane="tier1"}` | detector completed |
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
+| `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
+| `heimdall_bridge_sweep_last_success_timestamp_seconds` | bridge escalation sweep completed cleanly |
+| `heimdall_bridge_storm_fused_total` / `heimdall_bridge_escalation_errors_total` | issues held back by the storm fuse / escalations that failed |
+| `heimdall_notifier_last_poll_success_timestamp_seconds` | last successful Telegram poll (0 = none since start) |
 | `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` | per-destination backlog age |
 | `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle |
 | `heimdall_redaction_failures_total` | **content withheld — always investigate** |
 | `heimdall_digest_generated_timestamp_seconds` | digest freshness |
 | `heimdall_finding{check,target,...}` | 1 while firing or unknown |
 
-The bridge has **no heartbeat metric** — its liveness is `/healthz` only. The
-console probes it when `HEIMDALL_UI_BRIDGE_HEALTHZ_URL` is set and reports it
-*absent* rather than healthy when unset. Nothing else scrapes it today.
+The bridge's heartbeat is
+`heimdall_bridge_sweep_last_success_timestamp_seconds` in
+`heimdall-bridge.prom`. It advances on every escalation sweep (every 15 min)
+that completes without errors (`HeimdallBridgeSweepStale` /
+`HeimdallBridgeAbsent`). That proves the process and its sweep are alive, not
+that Alertmanager can reach it. `HeimdallBridgeUnreachable` covers that from
+the sending side, firing when Alertmanager's webhook deliveries keep failing.
+It must be routed to a receiver that does not go through the bridge (see
+SETUP.md, the meta-rules). The console also probes `/healthz` when
+`HEIMDALL_UI_BRIDGE_HEALTHZ_URL` is set.
 
 **`heimdall_redaction_failures_total > 0`** means the redactor failed and
 content was withheld rather than leaked. The finding still fires — content

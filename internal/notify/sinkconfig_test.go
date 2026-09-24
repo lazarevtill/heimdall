@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/lazarevtill/heimdall/internal/notify"
@@ -265,5 +266,93 @@ func TestShippedExampleSinksFileIsValid(t *testing.T) {
 		if len(routes.SinksFor(c)) == 0 {
 			t.Errorf("example leaves channel %q unrouted", c)
 		}
+	}
+}
+
+// The console needs the routing TOPOLOGY (which sink carries which channel)
+// to show per-sink backlogs, and nothing else. Routing gives it that
+// without reading a single credential env var, so the console process never
+// has to hold the Gotify token or the Synology webhook URL.
+func TestRoutingNeedsNoCredentials(t *testing.T) {
+	path := writeSinksFile(t, fullSinksFile)
+	f, err := notify.LoadSinksFile(path)
+	if err != nil {
+		t.Fatalf("LoadSinksFile: %v", err)
+	}
+	got, err := f.Routing() // no Getenv exists to consult
+	if err != nil {
+		t.Fatalf("Routing: %v", err)
+	}
+	want := notify.Routing{
+		"gotify":   {outbox.ChannelMain},
+		"synochat": {outbox.ChannelAnalyst},
+		"telegram": {outbox.ChannelAnalyst, outbox.ChannelMain},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Routing (-want +got):\n%s", diff)
+	}
+}
+
+// Routing refuses every STRUCTURAL fault Build refuses — a console must not
+// accept a routing file the notifier would reject at boot. Only the
+// credential checks are Build's alone.
+func TestRoutingRejectsStructuralFaults(t *testing.T) {
+	cases := []struct{ name, file, wantErr string }{
+		{"channel with no route", `{"sinks":{"telegram":{"type":"telegram"}},"routes":{"main":["telegram"]}}`, "has no route"},
+		{"undeclared sink", `{"sinks":{"telegram":{"type":"telegram"}},"routes":{"main":["telegram","ghost"],"analyst":["telegram"]}}`, "undeclared sink"},
+		{"never routed", `{"sinks":{"telegram":{"type":"telegram"},"synochat":{"type":"synology","webhook_url_env":"W"}},"routes":{"main":["telegram"],"analyst":["telegram"]}}`, "never routed"},
+		{"unknown type", `{"sinks":{"pager":{"type":"pagerduty"}},"routes":{"main":["pager"],"analyst":["pager"]}}`, "unknown type"},
+		{"gotify without url", `{"sinks":{"gotify":{"type":"gotify","token_env":"T"}},"routes":{"main":["gotify"],"analyst":["gotify"]}}`, "requires a non-empty \"url\""},
+		{"bad sink id", `{"sinks":{"Telegram Main":{"type":"telegram"}},"routes":{"main":["Telegram Main"],"analyst":["Telegram Main"]}}`, "id must match"},
+		{"field meaningless for the type", `{"sinks":{"telegram":{"type":"telegram","priority":{"main":8}}},"routes":{"main":["telegram"],"analyst":["telegram"]}}`, "take no"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := notify.LoadSinksFile(writeSinksFile(t, tc.file))
+			if err != nil {
+				t.Fatalf("LoadSinksFile: %v", err)
+			}
+			_, err = f.Routing()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Routing error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+	// ...and an unset credential is NOT a Routing error.
+	f, err := notify.LoadSinksFile(writeSinksFile(t,
+		`{"sinks":{"gotify":{"type":"gotify","url":"https://g.invalid","token_env":"UNSET_IN_THIS_TEST"}},"routes":{"main":["gotify"],"analyst":["gotify"]}}`))
+	if err != nil {
+		t.Fatalf("LoadSinksFile: %v", err)
+	}
+	if _, err := f.Routing(); err != nil {
+		t.Errorf("Routing with an unset credential env var: %v, want nil (credentials are Build's concern)", err)
+	}
+}
+
+func TestDefaultTelegramRoutingMatchesDefaultRoutes(t *testing.T) {
+	got := notify.DefaultTelegramRouting()
+	want := notify.DefaultTelegramRoutes(nil, 0, 0).Routing()
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("DefaultTelegramRouting (-want DefaultTelegramRoutes().Routing() +got):\n%s", diff)
+	}
+}
+
+// BacklogsForRouting is Backlogs for a caller that has only the topology.
+func TestBacklogsForRoutingMatchesBacklogs(t *testing.T) {
+	d := fanoutDeps(t, &fakeTG{}, &fakeGotify{}, &fakeSynology{})
+	if _, err := d.Outbox.Enqueue(fixedNow, outbox.ChannelAnalyst, "analyst", "idem-analyst"); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	later := fixedNow.Add(10 * time.Minute)
+	want, err := notify.Backlogs(later, d)
+	if err != nil {
+		t.Fatalf("Backlogs: %v", err)
+	}
+	got, err := notify.BacklogsForRouting(later, d.Outbox, d.Routes.Routing())
+	if err != nil {
+		t.Fatalf("BacklogsForRouting: %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("BacklogsForRouting (-Backlogs +got):\n%s", diff)
 	}
 }

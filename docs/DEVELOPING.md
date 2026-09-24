@@ -204,9 +204,20 @@ hex and both pass `ValidFingerprint`. They are different namespaces: give
 hypotheses their own routes and labels.
 
 **`OpenStore` writes.** `bridge.OpenStore`, `outbox.Open` and
-`analyst.OpenStore` all run `CREATE TABLE IF NOT EXISTS` on open. A
-"read-only" consumer of those files is not strictly read-only. Idempotent and
-harmless, but do not claim otherwise in a doc comment.
+`analyst.OpenStore` all run `CREATE TABLE IF NOT EXISTS` on open, and
+`bridge.OpenStore` also adds the `auto_tag_pending` column with a guarded
+`ALTER TABLE`. A "read-only" consumer of those files is not strictly
+read-only. Idempotent and harmless, but do not claim otherwise in a doc
+comment.
+
+**`bridge.Reconcile` and `bridge.HandleHypothesis` are not concurrency-safe.**
+Find-by-marker-then-open and the storm fuse's count-then-open are
+check-then-act. Two concurrent Alertmanager deliveries for one group (an HA
+peer, or a retry overlapping a slow first attempt) opened two issues. The
+bridge's HTTP server serialises every call behind one lock. A new caller must
+do the same. `EscalationSweep` takes that lock per candidate
+(`Deps.Serialize`) and re-reads the row under it, so it never escalates a new
+episode using the old episode's age.
 
 **SQLite stores that share a file open their own handle** with the same WAL
 config and **never touch `PRAGMA user_version`** — that counter belongs to
@@ -232,6 +243,18 @@ building through `make`.
 explicit zero for every expected label combination. A sink that has never had
 a backlog must still have a series, or it is indistinguishable from a sink
 that was removed.
+
+### A redaction pattern that crosses a JSON string
+
+`contract.Redact` is also run over serialized JSON (and must stay safe
+there), where `"` ends a string and `\` starts an escape. The old
+url-credentials pattern once matched from one digest row's `https://` to a
+LATER row's `@`. It spliced two rows into one: still valid JSON, zero failures
+counted. So **no repeating character class in a pattern may admit `"` or
+`\`** (use the shared `secretValue` fragment).
+`TestRedactNeverConsumesAQuoteOrBackslash` enforces it for every pattern.
+Where a structured document leaves the process, prefer redacting each
+decoded string, as `internal/llm` does, to redacting the serialized form.
 
 ---
 

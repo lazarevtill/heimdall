@@ -195,3 +195,209 @@ func TestReconcileSilencesNoDesiredNoExistingIsNoop(t *testing.T) {
 		t.Errorf("ReconcileResult = %+v, want zero value", result)
 	}
 }
+
+// gcAuthority is a one-record authority: key gc-noise muting disk/smart-fail
+// until fixedNow+7d.
+func gcAuthority(t *testing.T) (*suppress.Authority, string) {
+	t.Helper()
+	until := fixedNow.Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	a, skipped := suppress.NewAuthority(nil, []suppress.Suppression{{
+		Key: "gc-noise", Scope: suppress.ScopeGroupCheck,
+		Matcher: suppress.Matcher{Group: "disk", Check: "smart-fail"},
+		Until:   until, Reason: "vendor noise", Actor: "ops", Source: suppress.SourceRuntime,
+	}})
+	if skipped != 0 {
+		t.Fatalf("NewAuthority skipped = %d", skipped)
+	}
+	return a, until
+}
+
+func gcMatchers() []silence.Matcher {
+	return []silence.Matcher{
+		{Name: "check", Value: "smart-fail", IsEqual: true},
+		{Name: "group", Value: "disk", IsEqual: true},
+		{Name: "source", Value: "heimdall", IsEqual: true},
+	}
+}
+
+func ours(id, key, endsAt, state string, m []silence.Matcher) silence.Silence {
+	return silence.Silence{
+		ID: id, Matchers: m, EndsAt: endsAt, State: state,
+		StartsAt:  fixedNow.Add(-24 * time.Hour).UTC().Format(time.RFC3339),
+		CreatedBy: notify.NotifierCreatedBy, Comment: "hb-key=" + key + " | r (ops)",
+	}
+}
+
+// Alertmanager keeps an EXPIRED silence in its list for its whole retention
+// window (default 120h). The reconciler used to count one as "already
+// projected": a re-mute of the same key within those five days was never
+// projected at all, and an expired silence whose key had left the ledger
+// was re-DELETEd on every cycle. Expired silences are now invisible to it.
+func TestReconcileSilencesIgnoresExpiredSilences(t *testing.T) {
+	past := fixedNow.Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	cases := []struct {
+		name     string
+		desired  bool
+		existing silence.Silence
+		want     notify.ReconcileResult
+	}{
+		{
+			name: "an expired copy does not stand in for an active mute", desired: true,
+			existing: ours("old", "gc-noise", past, silence.StateExpired, gcMatchers()),
+			want:     notify.ReconcileResult{Created: 1},
+		},
+		{
+			name: "an expired copy of a removed mute is left alone", desired: false,
+			existing: ours("old", "gc-noise", past, silence.StateExpired, gcMatchers()),
+			want:     notify.ReconcileResult{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authority, _ := suppress.NewAuthority(nil, nil)
+			if tc.desired {
+				authority, _ = gcAuthority(t)
+			}
+			client := newFakeSilenceClient()
+			client.silences[tc.existing.ID] = tc.existing
+
+			got, err := notify.ReconcileSilences(context.Background(), fixedNow, client, authority)
+			if err != nil {
+				t.Fatalf("ReconcileSilences: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("ReconcileResult (-want +got):\n%s", diff)
+			}
+			if _, ok := client.silences["old"]; !ok {
+				t.Error("the expired silence was deleted; it is Alertmanager's to garbage-collect")
+			}
+		})
+	}
+}
+
+// Matching on the key alone let a projection drift from the ledger for the
+// life of the record: an extended mute's silence ended early, and an edited
+// declarative matcher kept silencing the OLD labels. A live silence whose
+// matchers or endsAt differ from the ledger's is now replaced (create the
+// new one first, then delete the stale one, so nothing is unsilenced in
+// between); duplicates for one key are collapsed to one.
+func TestReconcileSilencesReplacesDriftAndCollapsesDuplicates(t *testing.T) {
+	_, until := gcAuthority(t)
+	earlier := fixedNow.Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	// Alertmanager echoes times with milliseconds; the same instant must
+	// still count as a match.
+	untilMillis := strings.TrimSuffix(until, "Z") + ".000Z"
+	reversed := []silence.Matcher{gcMatchers()[2], gcMatchers()[1], gcMatchers()[0]}
+	oldTarget := []silence.Matcher{
+		{Name: "check", Value: "smart-fail", IsEqual: true},
+		{Name: "group", Value: "disk-old", IsEqual: true},
+		{Name: "source", Value: "heimdall", IsEqual: true},
+	}
+
+	cases := []struct {
+		name        string
+		existing    []silence.Silence
+		want        notify.ReconcileResult
+		wantDeleted []string
+	}{
+		{
+			name:     "identical (order and time precision aside) is kept",
+			existing: []silence.Silence{ours("s1", "gc-noise", untilMillis, silence.StateActive, reversed)},
+			want:     notify.ReconcileResult{Kept: 1},
+		},
+		{
+			name:        "endsAt drift is replaced",
+			existing:    []silence.Silence{ours("s1", "gc-noise", earlier, silence.StateActive, gcMatchers())},
+			want:        notify.ReconcileResult{Created: 1, Deleted: 1},
+			wantDeleted: []string{"s1"},
+		},
+		{
+			name:        "matcher drift is replaced",
+			existing:    []silence.Silence{ours("s1", "gc-noise", until, silence.StateActive, oldTarget)},
+			want:        notify.ReconcileResult{Created: 1, Deleted: 1},
+			wantDeleted: []string{"s1"},
+		},
+		{
+			name: "a duplicate for one key is collapsed",
+			existing: []silence.Silence{
+				ours("s1", "gc-noise", until, silence.StateActive, gcMatchers()),
+				ours("s2", "gc-noise", until, silence.StatePending, gcMatchers()),
+			},
+			want:        notify.ReconcileResult{Kept: 1, Deleted: 1},
+			wantDeleted: []string{"s2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authority, _ := gcAuthority(t)
+			client := newFakeSilenceClient()
+			for _, s := range tc.existing {
+				client.silences[s.ID] = s
+			}
+			got, err := notify.ReconcileSilences(context.Background(), fixedNow, client, authority)
+			if err != nil {
+				t.Fatalf("ReconcileSilences: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("ReconcileResult (-want +got):\n%s", diff)
+			}
+			for _, id := range tc.wantDeleted {
+				if _, ok := client.silences[id]; ok {
+					t.Errorf("stale silence %s survived", id)
+				}
+			}
+			// Convergence: a second pass changes nothing.
+			again, err := notify.ReconcileSilences(context.Background(), fixedNow, client, authority)
+			if err != nil {
+				t.Fatalf("second ReconcileSilences: %v", err)
+			}
+			if diff := cmp.Diff(notify.ReconcileResult{Kept: 1}, again); diff != "" {
+				t.Errorf("second pass is not a no-op (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// deadlineCheckingClient wraps a SilenceClient and records any call whose
+// context had no deadline.
+type deadlineCheckingClient struct {
+	notify.SilenceClient
+	missing []string
+}
+
+func (c *deadlineCheckingClient) check(ctx context.Context, op string) {
+	if _, ok := ctx.Deadline(); !ok {
+		c.missing = append(c.missing, op)
+	}
+}
+
+func (c *deadlineCheckingClient) Create(ctx context.Context, s silence.Silence) (string, error) {
+	c.check(ctx, "create")
+	return c.SilenceClient.Create(ctx, s)
+}
+
+func (c *deadlineCheckingClient) List(ctx context.Context) ([]silence.Silence, error) {
+	c.check(ctx, "list")
+	return c.SilenceClient.List(ctx)
+}
+
+func (c *deadlineCheckingClient) Delete(ctx context.Context, id string) error {
+	c.check(ctx, "delete")
+	return c.SilenceClient.Delete(ctx, id)
+}
+
+// Every Alertmanager call runs under its own deadline, so a hung
+// Alertmanager cannot stall the notifier's loop.
+func TestReconcileSilencesEveryCallHasADeadline(t *testing.T) {
+	authority, _ := gcAuthority(t)
+	inner := newFakeSilenceClient()
+	inner.silences["orphan"] = ours("orphan", "gone", fixedNow.Add(time.Hour).UTC().Format(time.RFC3339), silence.StateActive, gcMatchers())
+	client := &deadlineCheckingClient{SilenceClient: inner}
+
+	if _, err := notify.ReconcileSilences(context.Background(), fixedNow, client, authority); err != nil {
+		t.Fatalf("ReconcileSilences: %v", err)
+	}
+	if len(client.missing) != 0 {
+		t.Errorf("calls without a deadline: %v", client.missing)
+	}
+}

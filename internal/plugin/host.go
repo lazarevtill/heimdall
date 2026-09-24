@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,6 +16,21 @@ import (
 // to appear in an error message, so it stays small and is never subject to
 // the fail-closed kill that MaxOutputBytes triggers on stdout.
 const stderrCapBytes = 4 << 10
+
+// waitDelay bounds cmd.Wait once the deadline has fired or the child has
+// exited: it waits at most this long more for the goroutine feeding the
+// child's stdin, then closes the pipes and returns. Without it, a descendant
+// that escaped the process group and holds stdin open (never reading it)
+// could keep Wait — and so Run — blocked long after the deadline.
+const waitDelay = 2 * time.Second
+
+// scrubbedSecret is what replaces the injected credential's exact value
+// wherever plugin-authored text (stderr, a per-query err, a quoted state
+// string) is carried into an error. The redaction library only recognises
+// secret SHAPES; a plugin credential can have any shape, but the host knows
+// its exact value, so it removes that value itself — the same stance the
+// in-process transports take for their own credentials.
+const scrubbedSecret = "[REDACTED:plugin-credential]"
 
 // RunOptions carries the per-invocation inputs the host needs beyond the
 // manifest. Secret is the credential VALUE (read by the caller from its
@@ -56,8 +72,12 @@ var ErrStartFailed = errors.New("plugin: failed to start child process")
 //   - manifest.Validate() fails
 //   - exec fails to start (missing/non-executable binary)
 //   - the child exits non-zero
-//   - the deadline elapses (the child AND its process group are killed)
+//   - the deadline elapses (the child AND its process group are killed) —
+//     and the deadline holds even when a descendant has escaped the process
+//     group and still holds stdout/stderr open: the host closes its own read
+//     ends at the deadline instead of waiting for that descendant's exit
 //   - stdout exceeds budget.MaxOutputBytes (child killed, output discarded)
+//   - reading stdout fails for any reason other than EOF
 //
 // Environment is SCRUBBED: the child inherits NOTHING from the host env. The
 // child's env is exactly: nothing, plus (iff kind==source and
@@ -67,7 +87,8 @@ var ErrStartFailed = errors.New("plugin: failed to start child process")
 //
 // stderr is captured (also capped) and, on a non-zero exit or signal, folded
 // into the returned error for diagnostics — but NEVER into the returned
-// stdout.
+// stdout. When opts.Secret is non-empty, its exact value is scrubbed out of
+// that stderr text before it goes anywhere (see scrubbedSecret).
 //
 // Run does NOT validate that stdout is well-formed JSON or that its
 // plugin_api matches — that is the ABI-decode step, done by the typed
@@ -89,6 +110,7 @@ func Run(ctx context.Context, m Manifest, opts RunOptions, stdin []byte) (stdout
 	// direct child) with a process-GROUP kill, so a plugin that forks cannot
 	// outlive the deadline.
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = waitDelay
 
 	if m.Kind == KindSource && m.Capabilities.Credential != "" {
 		cmd.Env = []string{m.Capabilities.Credential + "=" + opts.Secret}
@@ -123,9 +145,30 @@ func Run(ctx context.Context, m Manifest, opts RunOptions, stdin []byte) (stdout
 	}()
 	go func() {
 		defer wg.Done()
-		stderrBuf = readTruncated(stderrPipe, stderrCapBytes)
+		// Capture len(secret) bytes past the cap, so a credential that
+		// straddles the cap is scrubbed whole BEFORE the text is cut —
+		// cutting first would leave its head behind, unrecognisable.
+		stderrBuf = readTruncated(stderrPipe, stderrCapBytes+len(opts.Secret))
+	}()
+
+	// The readers finish at EOF, i.e. when EVERY holder of the pipes' write
+	// ends has closed them. The process-group kill reaches the child and
+	// anything it forked in place — but not a descendant that left the group
+	// (setsid, a double fork), which may hold stdout open for as long as it
+	// likes. Waiting for EOF would then mean waiting for that descendant, not
+	// for the deadline. So at the deadline the host closes its own read
+	// ends, which ends both reads at once, whoever still holds the other end.
+	readersDone := make(chan struct{})
+	go func() {
+		select {
+		case <-runCtx.Done():
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
+		case <-readersDone:
+		}
 	}()
 	wg.Wait()
+	close(readersDone)
 
 	waitErr := cmd.Wait()
 
@@ -135,47 +178,59 @@ func Run(ctx context.Context, m Manifest, opts RunOptions, stdin []byte) (stdout
 	case runCtx.Err() != nil:
 		return nil, fmt.Errorf("plugin: run %s: %w: %v", m.ID, ErrDeadlineExceeded, runCtx.Err())
 	case waitErr != nil:
-		return nil, fmt.Errorf("plugin: run %s: %w: %v: stderr: %s", m.ID, ErrNonZeroExit, waitErr, stderrBuf)
+		stderrText := scrubSecret(string(stderrBuf), opts.Secret)
+		if len(stderrText) > stderrCapBytes {
+			stderrText = stderrText[:stderrCapBytes]
+		}
+		return nil, fmt.Errorf("plugin: run %s: %w: %v: stderr: %s", m.ID, ErrNonZeroExit, waitErr, stderrText)
+	case stdoutRes.err != nil:
+		// A read that ended in anything but EOF: whatever arrived is not
+		// known to be the whole output, and partial output is never
+		// returned.
+		return nil, fmt.Errorf("plugin: run %s: read stdout: %v", m.ID, stdoutRes.err)
 	}
 	return stdoutRes.data, nil
+}
+
+// scrubSecret replaces every occurrence of the injected credential's exact
+// value in s with scrubbedSecret. An empty secret scrubs nothing (there is
+// nothing to find, and ReplaceAll with an empty old string would insert the
+// marker between every byte).
+func scrubSecret(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, scrubbedSecret)
 }
 
 // cappedResult is the outcome of a capped stdout read.
 type cappedResult struct {
 	data     []byte
 	overflow bool
+	err      error // a read failure other than EOF; data is then untrustworthy
 }
 
 // readCapped reads r to EOF or until more than limit bytes have arrived,
-// whichever comes first. On overflow it calls kill (idempotent) so the
-// child cannot keep producing output forever, drains and discards the rest
-// of r so the child is never left blocked on a full pipe, and reports
-// overflow=true with nil data — S3-a's contract is that an oversized output
-// is discarded WHOLE, never partially returned.
+// whichever comes first. It reads through a limit+1 window into a buffer
+// that grows with what actually arrives: memory tracks the output, never the
+// declared cap, so a generous budget costs nothing until a plugin uses it.
+// On overflow it calls kill (idempotent) so the child cannot keep producing
+// output forever, drains and discards the rest of r so the child is never
+// left blocked on a full pipe, and reports overflow=true with nil data —
+// S3-a's contract is that an oversized output is discarded WHOLE, never
+// partially returned.
 func readCapped(r io.Reader, limit int, kill func()) cappedResult {
-	buf := make([]byte, 0, limit+1)
-	chunk := make([]byte, 32*1024)
-	for {
-		n, err := r.Read(chunk)
-		if n > 0 {
-			if len(buf) <= limit {
-				want := n
-				if room := limit + 1 - len(buf); room < want {
-					want = room
-				}
-				buf = append(buf, chunk[:want]...)
-			}
-			if len(buf) > limit {
-				kill()
-				_, _ = io.Copy(io.Discard, r)
-				return cappedResult{overflow: true}
-			}
-		}
-		if err != nil {
-			break
-		}
+	var buf bytes.Buffer
+	n, err := buf.ReadFrom(io.LimitReader(r, int64(limit)+1))
+	if n > int64(limit) {
+		kill()
+		_, _ = io.Copy(io.Discard, r)
+		return cappedResult{overflow: true}
 	}
-	return cappedResult{data: buf}
+	if err != nil {
+		return cappedResult{err: err}
+	}
+	return cappedResult{data: buf.Bytes()}
 }
 
 // readTruncated reads r to EOF, retaining at most the first limit bytes.

@@ -2,6 +2,7 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -85,6 +86,34 @@ type Digest struct {
 	OpenTier1Findings   []OpenTier1Finding `json:"open_tier1_findings"`
 	Suppressed          []string           `json:"suppressed"`
 	RowsTruncated       int                `json:"rows_truncated"`
+}
+
+// EchoTruncatedFmt is the entry that closes an echo list (unknown_markers,
+// flaps, new_templates, suppressed) the digest writer had to cap:
+// "[truncated: N more]". It is never a real entry — those are
+// "<target>/<feature>"-shaped — so a reader can tell the two apart.
+const EchoTruncatedFmt = "[truncated: %d more]"
+
+// EchoTruncated parses an EchoTruncatedFmt entry, returning how many entries
+// it stands for.
+func EchoTruncated(s string) (n int, ok bool) {
+	if _, err := fmt.Sscanf(s, EchoTruncatedFmt, &n); err != nil {
+		return 0, false
+	}
+	return n, fmt.Sprintf(EchoTruncatedFmt, n) == s
+}
+
+// EchoLen is how many entries an echo list STANDS FOR: its real entries plus
+// the count a closing EchoTruncatedFmt entry carries. len() would count that
+// entry as one feature and top out at the cap during exactly the wide outage
+// the count exists to report.
+func EchoLen(list []string) int {
+	if k := len(list); k > 0 {
+		if n, ok := EchoTruncated(list[k-1]); ok {
+			return k - 1 + n
+		}
+	}
+	return len(list)
 }
 
 // MaxDigestRows is the pinned launch bound (G4). Persistent truncation is

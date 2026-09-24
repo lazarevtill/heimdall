@@ -71,7 +71,9 @@ type Entry struct {
 //
 //   - notify_outbox.idem_key is UNIQUE and means "one row per EVENT". It is
 //     the bridge's enqueue-side guarantee: re-enqueueing on every webhook
-//     never duplicates a message.
+//     never duplicates a message. An event that legitimately RECURS under
+//     the same key (EnqueueOrRearm) re-arms its one row in place rather
+//     than adding a second.
 //   - notify_delivery(entry_id, sink_id) is the PRIMARY KEY and means
 //     "at-most-once DELIVERY per sink". It is the notifier's drain-side
 //     guarantee, and it is what makes partial delivery expressible: with
@@ -169,6 +171,94 @@ ON CONFLICT(idem_key) DO NOTHING`,
 	return n > 0, nil
 }
 
+// EnqueueOutcome is what EnqueueOrRearm did with one message.
+type EnqueueOutcome int
+
+const (
+	// Deduped: an entry under this idem_key already exists and was left
+	// exactly as it was (still pending, or sent too recently to re-arm).
+	Deduped EnqueueOutcome = iota
+	// Inserted: no entry existed; a new pending one was created.
+	Inserted
+	// Rearmed: a SENT entry created before the caller's cutoff was reset to
+	// pending with the new body — the same event recurring after its
+	// cooldown, delivered again under the SAME idem_key.
+	Rearmed
+)
+
+// EnqueueOrRearm is Enqueue for events that legitimately RECUR under one
+// stable idem_key: a hypothesis re-posted after the analyst's cooldown, an
+// escalation re-ping for a later episode of the same group. Enqueue's
+// "a repeat key is a no-op forever" would swallow those silently; changing
+// the key instead would break every consumer that parses it (the notifier
+// derives its mute-button subject from "t3-<fp>" / "escalate-[hb:<key>]").
+//
+// In ONE transaction:
+//   - no entry under idemKey: insert a pending one (Inserted);
+//   - an entry that was already SENT and whose created_at is before
+//     rearmIfCreatedBefore: reset it to pending with body and
+//     created_at=now, and delete its per-sink notify_delivery rows so every
+//     routed sink takes it again (Rearmed);
+//   - anything else — still pending, or sent but too recent, or the key
+//     belongs to a different channel: untouched (Deduped).
+//
+// A still-PENDING entry is deliberately never re-armed, even if old: its
+// created_at is what the per-sink backlog gauge ages, and refreshing it
+// would make a dead sink look healthy (invariant 5). The stale body simply
+// delivers when the sink recovers.
+func (s *Store) EnqueueOrRearm(now time.Time, channel Channel, body, idemKey string, rearmIfCreatedBefore time.Time) (EnqueueOutcome, error) {
+	if !channel.Valid() {
+		return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: unknown channel %q", idemKey, channel)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: begin: %w", idemKey, err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
+INSERT INTO notify_outbox (channel, body, idem_key, created_at, sent_at)
+VALUES (?, ?, ?, ?, 0)
+ON CONFLICT(idem_key) DO NOTHING`,
+		string(channel), body, idemKey, now.Unix(),
+	)
+	if err != nil {
+		return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: insert: %w", idemKey, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: insert rows affected: %w", idemKey, err)
+	}
+	outcome := Inserted
+	if n == 0 {
+		res, err := tx.Exec(`
+UPDATE notify_outbox SET body = ?, created_at = ?, sent_at = 0
+WHERE idem_key = ? AND channel = ? AND sent_at != 0 AND created_at < ?`,
+			body, now.Unix(), idemKey, string(channel), rearmIfCreatedBefore.Unix(),
+		)
+		if err != nil {
+			return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: rearm: %w", idemKey, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: rearm rows affected: %w", idemKey, err)
+		}
+		if n == 0 {
+			return Deduped, nil // nothing written; the deferred Rollback is a no-op
+		}
+		if _, err := tx.Exec(`
+DELETE FROM notify_delivery
+WHERE entry_id = (SELECT id FROM notify_outbox WHERE idem_key = ?)`, idemKey); err != nil {
+			return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: clear deliveries: %w", idemKey, err)
+		}
+		outcome = Rearmed
+	}
+	if err := tx.Commit(); err != nil {
+		return Deduped, fmt.Errorf("outbox: enqueue-or-rearm %s: commit: %w", idemKey, err)
+	}
+	return outcome, nil
+}
+
 // Pending returns up to limit unsent entries oldest-first (the notifier
 // drains these). limit<=0 returns all pending.
 func (s *Store) Pending(limit int) ([]Entry, error) {
@@ -252,6 +342,12 @@ type OldestPending struct {
 // forever, and the gauge would alert on a queue that sink was never meant
 // to drain.
 //
+// Only entries still PENDING (sent_at = 0) count. An entry already stamped
+// sent was discharged to every sink routed at the time, and Drain never
+// re-sends it; counting it would make a sink ADDED (or renamed) after the
+// fact inherit the whole sent history as a backlog that can never drain —
+// a permanent HeimdallSinkBacklogCritical page for a healthy sink.
+//
 // Channels with nothing pending are ABSENT from the result rather than
 // reported as zero; the caller emits an explicit 0 for every routed
 // (sink, channel) pair, so the series exists even when the backlog is
@@ -274,7 +370,8 @@ func (s *Store) OldestPendingByChannel(sinkID string, channels []Channel) ([]Old
 	rows, err := s.db.Query(`
 SELECT o.channel, MIN(o.created_at)
 FROM notify_outbox o
-WHERE NOT EXISTS (
+WHERE o.sent_at = 0
+AND NOT EXISTS (
   SELECT 1 FROM notify_delivery d WHERE d.entry_id = o.id AND d.sink_id = ?
 )
 AND o.channel IN (`+strings.Join(placeholders, ",")+`)

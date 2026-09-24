@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/lazarevtill/heimdall/internal/silence"
 )
 
@@ -183,5 +185,74 @@ func TestDeleteNon2xx(t *testing.T) {
 	})
 	if err := c.Delete(context.Background(), "sil-missing"); err == nil {
 		t.Fatal("Delete: want error on 404, got nil")
+	}
+}
+
+// The reconciler must tell an EXPIRED silence from a live one: Alertmanager
+// keeps expired silences in GET /api/v2/silences for its whole retention
+// window (default 120h), and one that silences nothing must neither count as
+// "already projected" nor be re-deleted every cycle.
+func TestListCarriesState(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[
+			{"id":"a","matchers":[],"startsAt":"` + fakeStartsAt + `","endsAt":"` + fakeEndsAt + `","createdBy":"x","comment":"","status":{"state":"active"}},
+			{"id":"p","matchers":[],"startsAt":"` + fakeStartsAt + `","endsAt":"` + fakeEndsAt + `","createdBy":"x","comment":"","status":{"state":"pending"}},
+			{"id":"e","matchers":[],"startsAt":"` + fakeStartsAt + `","endsAt":"` + fakeEndsAt + `","createdBy":"x","comment":"","status":{"state":"expired"}}
+		]`))
+	})
+	sils, err := c.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := map[string]string{}
+	for _, s := range sils {
+		got[s.ID] = s.State
+	}
+	want := map[string]string{"a": silence.StateActive, "p": silence.StatePending, "e": silence.StateExpired}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("State per id (-want +got):\n%s", diff)
+	}
+}
+
+// Alertmanager before v0.22 does not send isEqual at all. Decoding its
+// absence as false would make every equality matcher look like "!=" and
+// the reconciler would delete+recreate each silence on every cycle, so an
+// absent isEqual means the pre-v0.22 semantics: equality.
+func TestListTreatsAbsentIsEqualAsEquality(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":"a","matchers":[
+			{"name":"old","value":"v","isRegex":false},
+			{"name":"neg","value":"v","isRegex":false,"isEqual":false}
+		],"startsAt":"` + fakeStartsAt + `","endsAt":"` + fakeEndsAt + `","createdBy":"x","comment":"","status":{"state":"active"}}]`))
+	})
+	sils, err := c.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []silence.Matcher{
+		{Name: "old", Value: "v", IsEqual: true},
+		{Name: "neg", Value: "v", IsEqual: false},
+	}
+	if diff := cmp.Diff(want, sils[0].Matchers); diff != "" {
+		t.Errorf("Matchers (-want +got):\n%s", diff)
+	}
+}
+
+// State is read-side only: it must never be POSTed back on create.
+func TestCreateNeverSendsState(t *testing.T) {
+	var gotBody map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotBody = decodeBody(t, r)
+		w.Write([]byte(`{"silenceID":"x"}`))
+	})
+	s := testSilence()
+	s.State = silence.StateActive
+	if _, err := c.Create(context.Background(), s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, k := range []string{"state", "State", "status"} {
+		if _, present := gotBody[k]; present {
+			t.Errorf("create body carries %q; it is read-side only", k)
+		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +233,132 @@ func TestRunMissingBinary(t *testing.T) {
 	}
 	if !errors.Is(err, ErrStartFailed) {
 		t.Errorf("Run error = %v, want wrapping ErrStartFailed", err)
+	}
+}
+
+// stdinReq marshals a full helperplug request (mode plus its parameters).
+func stdinReq(t *testing.T, req map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal helperplug request: %v", err)
+	}
+	return b
+}
+
+// 6. The deadline must hold even when a DESCENDANT has escaped the process
+// group. The fixture starts a sleeper in a new session (setsid) that
+// inherits stdout and holds it open for 30s; a process-group kill cannot
+// reach it, so the only thing that can end Run on time is the host itself
+// letting go of the pipes. Both shapes: the plugin exiting cleanly with
+// valid output while the escapee holds its stdout, and the plugin hanging
+// too. Either way Run must return a deadline error within the budget plus
+// slack — never after the escapee's 30s.
+func TestRunDeadlineHoldsWhenDescendantEscapesProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+		t.Skip("setsid is unavailable on " + runtime.GOOS)
+	}
+	for _, mode := range []string{"escape", "escape-hang"} {
+		t.Run(mode, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "escapee.pid")
+			t.Cleanup(func() {
+				// The escapee is, by construction, beyond the host's reach:
+				// reap it here so the test suite leaves nothing behind.
+				raw, err := os.ReadFile(pidFile)
+				if err != nil {
+					return
+				}
+				pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+				if err != nil || pid <= 0 {
+					t.Errorf("escapee pidfile holds %q, want a pid: the escapee cannot be reaped", raw)
+					return
+				}
+				if p, err := os.FindProcess(pid); err == nil {
+					_ = p.Kill()
+				}
+			})
+
+			m := testManifest(KindDetector, 1, 1<<20)
+			type result struct {
+				out []byte
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				out, err := Run(context.Background(), m, RunOptions{ExePath: helperplugPath},
+					stdinReq(t, map[string]any{"mode": mode, "pidfile": pidFile}))
+				done <- result{out, err}
+			}()
+
+			var r result
+			select {
+			case r = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return within 5s of a 1s deadline: an escaped descendant holding stdout kept the host waiting")
+			}
+			if errors.Is(r.err, ErrNonZeroExit) && strings.Contains(r.err.Error(), "setsid unavailable") {
+				t.Skipf("fixture could not setsid here: %v", r.err)
+			}
+			if !errors.Is(r.err, ErrDeadlineExceeded) {
+				t.Fatalf("Run error = %v, want wrapping ErrDeadlineExceeded", r.err)
+			}
+			if len(r.out) != 0 {
+				t.Errorf("stdout = %q, want discarded on deadline", r.out)
+			}
+		})
+	}
+}
+
+// 7. The output cap is exact: max_output_bytes bytes are accepted whole,
+// one byte more is refused whole.
+func TestRunOutputCapBoundary(t *testing.T) {
+	const capBytes = 4096
+	tests := []struct {
+		name     string
+		n        int
+		wantErr  error
+		wantSize int
+	}{
+		{"exactly at the cap is accepted", capBytes, nil, capBytes},
+		{"one byte over the cap is refused", capBytes + 1, ErrOutputTooLarge, 0},
+		{"empty output is accepted", 0, nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testManifest(KindDetector, 5, capBytes)
+			out, err := Run(context.Background(), m, RunOptions{ExePath: helperplugPath},
+				stdinReq(t, map[string]any{"mode": "bytes", "n": tt.n}))
+			if tt.wantErr == nil && err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Run error = %v, want wrapping %v", err, tt.wantErr)
+			}
+			if len(out) != tt.wantSize {
+				t.Errorf("stdout = %d bytes, want %d", len(out), tt.wantSize)
+			}
+		})
+	}
+}
+
+// 8. The one credential the host injected must never come back out of it
+// in an error: a plugin that prints its own key to stderr while failing
+// would otherwise put that key into finding evidence (and from there the
+// spool, a ticket, a chat message) — the pattern redactor only knows
+// secret SHAPES, and this value can have any shape. The host knows the
+// exact value, so it scrubs it.
+func TestRunScrubsInjectedSecretFromStderr(t *testing.T) {
+	const secret = "k3y-9f8e7d6c5b4a" // arbitrary shape: no redaction pattern matches it
+	m := testManifest(KindSource, 5, 1<<20)
+	m.Capabilities.Credential = "HEIMDALL_PLUGIN_SECRET"
+	_, err := Run(context.Background(), m, RunOptions{ExePath: helperplugPath, Secret: secret}, stdinMode("leaksecret"))
+	if !errors.Is(err, ErrNonZeroExit) {
+		t.Fatalf("Run error = %v, want wrapping ErrNonZeroExit", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("Run error leaked the injected credential: %v", err)
+	}
+	if !strings.Contains(err.Error(), "auth failed with key "+scrubbedSecret) {
+		t.Errorf("Run error = %v, want the stderr line kept with the credential replaced by %q", err, scrubbedSecret)
 	}
 }

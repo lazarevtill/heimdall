@@ -2,10 +2,12 @@ package bridge_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lazarevtill/heimdall/internal/bridge"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/suppress"
@@ -217,5 +219,139 @@ func TestEscalationSweepIgnoresNonCriticalAndResolved(t *testing.T) {
 	}
 	if len(ft.priorities) != 0 {
 		t.Errorf("priorities = %v, want none", ft.priorities)
+	}
+}
+
+// TestEscalationSweepAssigneeRule: every bridge-opened issue is assigned to
+// the configured default, so only a DIFFERENT assignee means a human picked
+// it up. Anything else must still escalate.
+func TestEscalationSweepAssigneeRule(t *testing.T) {
+	marker := "[hb:disk--smart-fail]"
+	cases := []struct {
+		name            string
+		defaultAssignee string
+		assignee        string
+		wantEscalated   int
+	}{
+		{"unassigned, no default", "", "", 1},
+		{"a human, no default", "", "opsuser", 0},
+		{"the default assignee", "triage", "triage", 1},
+		{"the default assignee, different case", "triage", "Triage", 1},
+		{"unassigned, with a default", "triage", "", 1},
+		{"a human other than the default", "triage", "opsuser", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, ft := testDeps(t, 10, nil)
+			deps.DefaultAssignee = tc.defaultAssignee
+			seedEscalationCandidate(t, deps, ft, marker, "HEIM-1", "disk", "smart-fail", fixedNow.Add(-5*time.Hour), tc.assignee, false, false)
+			res, err := bridge.EscalationSweep(context.Background(), fixedNow, deps)
+			if err != nil {
+				t.Fatalf("EscalationSweep: %v", err)
+			}
+			if res.Escalated != tc.wantEscalated {
+				t.Errorf("Escalated = %d, want %d", res.Escalated, tc.wantEscalated)
+			}
+		})
+	}
+}
+
+// TestEscalationSweepDefaultAssigneeEndToEnd drives the real path: with a
+// default assignee configured, Reconcile opens the issue ASSIGNED, and the
+// sweep must still escalate it once overdue.
+func TestEscalationSweepDefaultAssigneeEndToEnd(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	deps.DefaultAssignee = "triage"
+	mustReconcile(t, fixedNow, deps, groupWebhook(alert("firing", "192.0.2.10", "critical", "fp-a", fixedNow)))
+	if got := ft.issues["[hb:disk--smart-fail]"].Assignee; got != "triage" {
+		t.Fatalf("opened issue assignee = %q, want triage", got)
+	}
+	res, err := bridge.EscalationSweep(context.Background(), fixedNow.Add(5*time.Hour), deps)
+	if err != nil || res.Escalated != 1 {
+		t.Errorf("sweep = %+v, %v; want 1 escalation", res, err)
+	}
+}
+
+// TestEscalationSweepContinuesPastAFailingIssue: one permanently failing
+// issue (oldest first) must not starve the issues behind it.
+func TestEscalationSweepContinuesPastAFailingIssue(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	seedEscalationCandidate(t, deps, ft, "[hb:disk--smart-fail]", "HEIM-1", "disk", "smart-fail", fixedNow.Add(-9*time.Hour), "", false, false)
+	seedEscalationCandidate(t, deps, ft, "[hb:net--link-flap]", "HEIM-2", "net", "link-flap", fixedNow.Add(-5*time.Hour), "", false, false)
+	ft.priorityErr = map[string]error{"HEIM-1": errors.New("400: unknown enum value")}
+
+	for i, want := range []bridge.SweepResult{
+		{Escalated: 1, Errors: 1},
+		{Skipped: 1, Errors: 1}, // HEIM-2 already escalated; HEIM-1 still failing
+	} {
+		got, err := bridge.EscalationSweep(context.Background(), fixedNow.Add(time.Duration(i)*time.Hour), deps)
+		if err == nil {
+			t.Errorf("sweep %d: want the aggregated error, got nil", i)
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("sweep %d result mismatch (-want +got):\n%s", i, diff)
+		}
+	}
+	if diff := cmp.Diff([]string{"HEIM-2: Show-stopper"}, ft.priorities); diff != "" {
+		t.Errorf("priorities mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestEscalationSweepSkipsAnIssueAHumanResolved: the ledger may still say
+// open, but an issue closed in the tracker is not escalated.
+func TestEscalationSweepSkipsAnIssueAHumanResolved(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	seedEscalationCandidate(t, deps, ft, "[hb:disk--smart-fail]", "HEIM-1", "disk", "smart-fail", fixedNow.Add(-5*time.Hour), "", false, false)
+	ft.issues["[hb:disk--smart-fail]"].Resolved = true
+	res, err := bridge.EscalationSweep(context.Background(), fixedNow, deps)
+	if err != nil {
+		t.Fatalf("EscalationSweep: %v", err)
+	}
+	if diff := cmp.Diff(bridge.SweepResult{Skipped: 1}, res); diff != "" {
+		t.Errorf("result mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// The sweep acts on ListOpen's snapshot, but a resolve + re-fire can land
+// between that read and the escalation, starting a NEW episode (a fresh
+// firing_since, and in production a new issue). Each candidate is therefore
+// re-read and re-qualified under Deps.Serialize — the lock Reconcile runs
+// under — and a changed episode is skipped, never escalated on the old
+// episode's age.
+func TestEscalationSweepSkipsACandidateWhoseEpisodeChangedMidSweep(t *testing.T) {
+	deps, ft := testDeps(t, 10, nil)
+	marker := "[hb:disk--smart-fail]"
+	seedEscalationCandidate(t, deps, ft, marker, "HEIM-1", "disk", "smart-fail", fixedNow.Add(-5*time.Hour), "", false, false)
+
+	locked := 0
+	deps.Serialize = func(ctx context.Context, fn func() error) error {
+		locked++
+		// What a Reconcile holding the lock just before us did: the group
+		// recovered and fired again a minute ago — a new, young episode.
+		if err := deps.Store.StartEpisode(bridge.IssueRow{
+			Marker: marker, IssueID: "HEIM-2", Group: "disk", Check: "smart-fail",
+			Severity: "critical", FiringSince: fixedNow.Add(-time.Minute), OpenedAt: fixedNow.Add(-time.Minute),
+			State: "open",
+		}); err != nil {
+			t.Fatalf("StartEpisode: %v", err)
+		}
+		return fn()
+	}
+
+	result, err := bridge.EscalationSweep(context.Background(), fixedNow, deps)
+	if err != nil {
+		t.Fatalf("EscalationSweep: %v", err)
+	}
+	if locked != 1 {
+		t.Errorf("Serialize called %d times, want once per qualifying candidate", locked)
+	}
+	if result.Escalated != 0 || result.Skipped != 1 {
+		t.Errorf("result = %+v, want the stale candidate skipped", result)
+	}
+	if len(ft.priorities) != 0 || len(ft.comments) != 0 {
+		t.Errorf("priorities = %v, comments = %v; want nothing done to either issue", ft.priorities, ft.comments)
+	}
+	if row := ledgerOf(t, deps, marker); row.Escalated {
+		t.Error("the new episode was marked escalated; its own re-ping would be lost")
 	}
 }

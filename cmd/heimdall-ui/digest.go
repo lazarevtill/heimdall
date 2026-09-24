@@ -65,8 +65,11 @@ type DigestView struct {
 
 	// UnknownMarkers is the blind-spot list: every feature Tier 2 could not
 	// measure this run. It is rendered FIRST and never collapsed — the
-	// digest exists partly to say what it could not see.
+	// digest exists partly to say what it could not see. A capped list ends
+	// in a "[truncated: N more]" entry, so the count shown is UnknownCount
+	// (contract.EchoLen), never len(UnknownMarkers).
 	UnknownMarkers []string
+	UnknownCount   int
 	NewTemplates   []string
 	Flaps          []string
 	Suppressed     []string
@@ -129,6 +132,7 @@ func buildDigestView(now time.Time, dg contract.Digest) DigestView {
 		Present:        true,
 		GeneratedAt:    dg.GeneratedAt,
 		UnknownMarkers: dg.UnknownMarkers,
+		UnknownCount:   contract.EchoLen(dg.UnknownMarkers),
 		NewTemplates:   dg.NewTemplates,
 		Flaps:          dg.Flaps,
 		Suppressed:     dg.Suppressed,

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lazarevtill/heimdall/internal/config"
@@ -107,5 +108,70 @@ func TestLoadCredFile(t *testing.T) {
 	m["HEIMDALL_CRED_FILE"] = filepath.Join(t.TempDir(), "missing.env")
 	if _, err := config.Load(env(m)); err == nil {
 		t.Fatal("want error for unreadable cred file (fail fast)")
+	}
+}
+
+// A malformed credential-file line may BE the secret (a bare token, or
+// "KEY: value" written with a colon). The error is logged, and a log line
+// is an egress, so it names the line NUMBER only — never its content.
+func TestLoadCredFileMalformedLineIsNotEchoed(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "creds.env")
+	body := "# vault-seeded\nHEIMDALL_VL_USER=heimdall\nHEIMDALL_VL_PASS: defanged-hunter2\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := fullEnv()
+	m["HEIMDALL_CRED_FILE"] = p
+	_, err := config.Load(env(m))
+	if err == nil {
+		t.Fatal("want error for a malformed cred-file line")
+	}
+	if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "HEIMDALL_VL_PASS") {
+		t.Errorf("error echoes the line's content: %v", err)
+	}
+	if !strings.Contains(err.Error(), "line 3") {
+		t.Errorf("error = %v, want it to name line 3", err)
+	}
+}
+
+// The backend URLs are parsed at load so a bad one fails fast here, instead
+// of failing every query at run time with an error that embeds the raw URL
+// (url.Parse errors quote it whole, basic-auth password included, and that
+// text used to land in finding evidence). The error names the variable and
+// never the value — not even url.Parse's reason, which quotes part of it.
+func TestLoadRejectsBadBackendURLWithoutEchoingIt(t *testing.T) {
+	cases := []struct{ name, key, val, secret string }{
+		{"prom: slash in password breaks parsing", "HEIMDALL_PROM_URL", "http://heimdall:pa/ss-hunter2@127.0.0.1:9090", "hunter2"},
+		{"prom: space in password", "HEIMDALL_PROM_URL", "http://heimdall:se cret-hunter2@127.0.0.1:9090", "hunter2"},
+		{"prom: no scheme", "HEIMDALL_PROM_URL", "127.0.0.1:9090", "127.0.0.1"},
+		{"prom: non-http scheme", "HEIMDALL_PROM_URL", "ftp://prom.invalid", "prom.invalid"},
+		{"prom: no host", "HEIMDALL_PROM_URL", "http://", ""},
+		{"vl: slash in password breaks parsing", "HEIMDALL_VL_URL", "http://vl:pa/ss-hunter2@127.0.0.1:9428", "hunter2"},
+		{"vl: relative", "HEIMDALL_VL_URL", "/select/logsql", "logsql"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := fullEnv()
+			m[tc.key] = tc.val
+			_, err := config.Load(env(m))
+			if err == nil {
+				t.Fatalf("want error for %s=%q", tc.key, tc.val)
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("error = %v, want it to name %s", err, tc.key)
+			}
+			if tc.secret != "" && strings.Contains(err.Error(), tc.secret) {
+				t.Errorf("error echoes the URL: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsHTTPSAndCredentialedURLs(t *testing.T) {
+	m := fullEnv()
+	m["HEIMDALL_PROM_URL"] = "https://heimdall:defanged@prom.invalid:9090/prefix"
+	m["HEIMDALL_VL_URL"] = "https://vl.invalid"
+	if _, err := config.Load(env(m)); err != nil {
+		t.Fatalf("Load: %v", err)
 	}
 }

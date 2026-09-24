@@ -112,23 +112,20 @@ type SinkDeps struct {
 //     working;
 //   - a missing credential env var would fail on the first real alert
 //     rather than at boot, i.e. exactly when it matters most.
+//
+// Everything but the credential check is shared with Routing, so a console
+// and the notifier can never disagree about whether a file is valid.
 func (f SinksFile) Build(d SinkDeps) (Routes, error) {
 	getenv := d.Getenv
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	if len(f.Sinks) == 0 {
-		return nil, fmt.Errorf("notify: sinks file declares no sinks")
-	}
-	if len(f.Routes) == 0 {
-		return nil, fmt.Errorf("notify: sinks file declares no routes")
+	if _, err := f.topology(); err != nil {
+		return nil, err
 	}
 
 	built := make(map[string]Sink, len(f.Sinks))
 	for _, id := range sortedKeys(f.Sinks) {
-		if !sinkIDRe.MatchString(id) {
-			return nil, fmt.Errorf("notify: sink %q: id must match %s", id, sinkIDRe)
-		}
 		s, err := buildSink(id, f.Sinks[id], d, getenv)
 		if err != nil {
 			return nil, err
@@ -137,7 +134,48 @@ func (f SinksFile) Build(d SinkDeps) (Routes, error) {
 	}
 
 	routes := make(Routes, len(f.Routes))
-	routed := make(map[string]bool, len(built))
+	for _, name := range sortedRouteKeys(f.Routes) {
+		list := make([]Sink, 0, len(f.Routes[name]))
+		for _, id := range f.Routes[name] {
+			list = append(list, built[id])
+		}
+		routes[outbox.Channel(name)] = list
+	}
+	return routes, nil
+}
+
+// Routing validates the document exactly as Build does — every structural
+// rule, every sink's type and field set — EXCEPT that it never reads a
+// credential env var, and returns only the topology. It exists so a process
+// that merely displays delivery state (the console) can learn which sink
+// carries which channel without having to hold the Gotify token or the
+// Synology webhook URL. An unset credential is therefore not a Routing
+// error; it stays Build's, and the notifier's boot, concern.
+func (f SinksFile) Routing() (Routing, error) {
+	return f.topology()
+}
+
+// topology is the credential-free half of Build: it validates the document
+// and returns sink id -> routed channels (sorted).
+func (f SinksFile) topology() (Routing, error) {
+	if len(f.Sinks) == 0 {
+		return nil, fmt.Errorf("notify: sinks file declares no sinks")
+	}
+	if len(f.Routes) == 0 {
+		return nil, fmt.Errorf("notify: sinks file declares no routes")
+	}
+
+	for _, id := range sortedKeys(f.Sinks) {
+		if !sinkIDRe.MatchString(id) {
+			return nil, fmt.Errorf("notify: sink %q: id must match %s", id, sinkIDRe)
+		}
+		if err := validateSink(id, f.Sinks[id]); err != nil {
+			return nil, err
+		}
+	}
+
+	routing := make(Routing, len(f.Sinks))
+	routed := make(map[outbox.Channel]bool, len(f.Routes))
 	for _, name := range sortedRouteKeys(f.Routes) {
 		channel := outbox.Channel(name)
 		if !channel.Valid() {
@@ -148,66 +186,98 @@ func (f SinksFile) Build(d SinkDeps) (Routes, error) {
 			return nil, fmt.Errorf("notify: route %q: names no sinks — an unrouted channel discards its messages silently", name)
 		}
 		seen := make(map[string]bool, len(ids))
-		list := make([]Sink, 0, len(ids))
 		for _, id := range ids {
-			s, ok := built[id]
-			if !ok {
+			if _, ok := f.Sinks[id]; !ok {
 				return nil, fmt.Errorf("notify: route %q: names undeclared sink %q", name, id)
 			}
 			if seen[id] {
 				return nil, fmt.Errorf("notify: route %q: names sink %q twice", name, id)
 			}
 			seen[id] = true
-			routed[id] = true
-			list = append(list, s)
+			routing[id] = append(routing[id], channel)
 		}
-		routes[channel] = list
+		routed[channel] = true
 	}
 
 	for _, channel := range outbox.Channels() {
-		if len(routes[channel]) == 0 {
+		if !routed[channel] {
 			return nil, fmt.Errorf("notify: channel %q has no route — every channel must name at least one sink", channel)
 		}
 	}
 	for _, id := range sortedKeys(f.Sinks) {
-		if !routed[id] {
+		if len(routing[id]) == 0 {
 			return nil, fmt.Errorf("notify: sink %q is declared but never routed — dead configuration", id)
 		}
 	}
-	return routes, nil
+	for id := range routing {
+		sort.Slice(routing[id], func(i, j int) bool { return routing[id][i] < routing[id][j] })
+	}
+	return routing, nil
 }
 
-// buildSink constructs one sink, validating that its field set matches its
-// type.
-func buildSink(id string, c SinkConfig, d SinkDeps, getenv func(string) string) (Sink, error) {
+// validateSink checks that one declaration's field set matches its type,
+// WITHOUT reading any credential.
+func validateSink(id string, c SinkConfig) error {
 	switch c.Type {
 	case SinkTypeTelegram:
-		if err := rejectFields(id, c.Type, map[string]bool{
+		return rejectFields(id, c.Type, map[string]bool{
 			"url":             c.URL != "",
 			"token_env":       c.TokenEnv != "",
 			"titles":          len(c.Titles) > 0,
 			"priority":        len(c.Priority) > 0,
 			"webhook_url_env": c.WebhookURLEnv != "",
+		})
+
+	case SinkTypeGotify:
+		if err := rejectFields(id, c.Type, map[string]bool{
+			"webhook_url_env": c.WebhookURLEnv != "",
 		}); err != nil {
-			return nil, err
+			return err
 		}
+		if c.URL == "" {
+			return fmt.Errorf("notify: sink %q: gotify requires a non-empty \"url\"", id)
+		}
+		if c.TokenEnv == "" {
+			return fmt.Errorf("notify: sink %q: gotify requires \"token_env\" naming the env var holding the application token", id)
+		}
+		if _, err := channelKeyed(id, "titles", c.Titles); err != nil {
+			return err
+		}
+		_, err := channelKeyed(id, "priority", c.Priority)
+		return err
+
+	case SinkTypeSynology:
+		if err := rejectFields(id, c.Type, map[string]bool{
+			"url":       c.URL != "",
+			"token_env": c.TokenEnv != "",
+			"titles":    len(c.Titles) > 0,
+			"priority":  len(c.Priority) > 0,
+		}); err != nil {
+			return err
+		}
+		if c.WebhookURLEnv == "" {
+			return fmt.Errorf("notify: sink %q: synology requires \"webhook_url_env\" naming the env var holding the incoming-webhook URL", id)
+		}
+		return nil
+
+	case "":
+		return fmt.Errorf("notify: sink %q: missing \"type\" (one of %s, %s, %s)", id, SinkTypeTelegram, SinkTypeGotify, SinkTypeSynology)
+	default:
+		return fmt.Errorf("notify: sink %q: unknown type %q (one of %s, %s, %s)", id, c.Type, SinkTypeTelegram, SinkTypeGotify, SinkTypeSynology)
+	}
+}
+
+// buildSink constructs one already-validated sink (validateSink), reading
+// its credential from the environment.
+func buildSink(id string, c SinkConfig, d SinkDeps, getenv func(string) string) (Sink, error) {
+	switch c.Type {
+	case SinkTypeTelegram:
 		if d.Telegram == nil {
 			return nil, fmt.Errorf("notify: sink %q: telegram sink declared but no Telegram client wired", id)
 		}
 		return NewTelegramSink(id, d.Telegram, d.MainChatID, d.AnalystChatID), nil
 
 	case SinkTypeGotify:
-		if err := rejectFields(id, c.Type, map[string]bool{
-			"webhook_url_env": c.WebhookURLEnv != "",
-		}); err != nil {
-			return nil, err
-		}
-		if c.URL == "" {
-			return nil, fmt.Errorf("notify: sink %q: gotify requires a non-empty \"url\"", id)
-		}
-		if c.TokenEnv == "" {
-			return nil, fmt.Errorf("notify: sink %q: gotify requires \"token_env\" naming the env var holding the application token", id)
-		}
 		token := getenv(c.TokenEnv)
 		if token == "" {
 			return nil, fmt.Errorf("notify: sink %q: env var %s is unset or empty", id, c.TokenEnv)
@@ -223,27 +293,14 @@ func buildSink(id string, c SinkConfig, d SinkDeps, getenv func(string) string) 
 		return NewGotifySink(id, gotify.NewClient(c.URL, token, d.HTTPClient), titles, priority), nil
 
 	case SinkTypeSynology:
-		if err := rejectFields(id, c.Type, map[string]bool{
-			"url":       c.URL != "",
-			"token_env": c.TokenEnv != "",
-			"titles":    len(c.Titles) > 0,
-			"priority":  len(c.Priority) > 0,
-		}); err != nil {
-			return nil, err
-		}
-		if c.WebhookURLEnv == "" {
-			return nil, fmt.Errorf("notify: sink %q: synology requires \"webhook_url_env\" naming the env var holding the incoming-webhook URL", id)
-		}
 		webhookURL := getenv(c.WebhookURLEnv)
 		if webhookURL == "" {
 			return nil, fmt.Errorf("notify: sink %q: env var %s is unset or empty", id, c.WebhookURLEnv)
 		}
 		return NewSynologySink(id, synology.NewClient(webhookURL, d.HTTPClient)), nil
 
-	case "":
-		return nil, fmt.Errorf("notify: sink %q: missing \"type\" (one of %s, %s, %s)", id, SinkTypeTelegram, SinkTypeGotify, SinkTypeSynology)
 	default:
-		return nil, fmt.Errorf("notify: sink %q: unknown type %q (one of %s, %s, %s)", id, c.Type, SinkTypeTelegram, SinkTypeGotify, SinkTypeSynology)
+		return nil, validateSink(id, c)
 	}
 }
 
@@ -279,6 +336,15 @@ func channelKeyed[V any](id, field string, in map[string]V) (map[outbox.Channel]
 		out[channel] = in[name]
 	}
 	return out, nil
+}
+
+// DefaultTelegramRouting is DefaultTelegramRoutes' topology — the routing
+// in force when no sinks file is configured — for a caller that needs no
+// live sink.
+func DefaultTelegramRouting() Routing {
+	channels := outbox.Channels()
+	sort.Slice(channels, func(i, j int) bool { return channels[i] < channels[j] })
+	return Routing{SinkTypeTelegram: channels}
 }
 
 // DefaultTelegramRoutes is the routing used when no sinks file is

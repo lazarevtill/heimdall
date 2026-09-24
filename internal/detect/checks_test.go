@@ -1,6 +1,8 @@
 package detect_test
 
 import (
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,16 @@ func TestDeadMan(t *testing.T) {
 		{"newest of several samples wins", okSignal(float64(now.Unix()-7200), float64(now.Unix()-60)), 0, 0},
 		{"no samples ever fires", okSignal(), 1, contract.StateFiring},
 		{"unknown signal is alertable", source.Signal{State: contract.StateUnknown, Err: "boom"}, 1, contract.StateUnknown},
+		// A success timestamp in the future is not "fresh", it is malformed: a
+		// millisecond-unit metric or a skewed exporter clock. Read as a
+		// negative age it used to pass the grace check forever.
+		{"just inside the future-skew tolerance ok", okSignal(float64(now.Unix() + 300)), 0, 0},
+		{"beyond the future-skew tolerance is unknown", okSignal(float64(now.Unix() + 301)), 1, contract.StateUnknown},
+		{"millisecond-unit timestamp is unknown", okSignal(float64(now.Add(-time.Minute).UnixMilli())), 1, contract.StateUnknown},
+		{"future sample beside a fresh one is unknown", okSignal(float64(now.Unix()-60), float64(now.Unix()+7200)), 1, contract.StateUnknown},
+		{"NaN newest is unknown", okSignal(math.NaN()), 1, contract.StateUnknown},
+		{"NaN beside a fresh sample is unknown", okSignal(float64(now.Unix()-60), math.NaN()), 1, contract.StateUnknown},
+		{"+Inf is unknown", okSignal(math.Inf(1)), 1, contract.StateUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,6 +79,20 @@ func TestDeadMan(t *testing.T) {
 	}
 }
 
+// The Unknown evidence must name the likely cause so an operator does not
+// have to rediscover it: a wrong unit (ms vs s) or a skewed clock.
+func TestDeadManFutureEvidenceNamesTheCause(t *testing.T) {
+	fs := detect.DeadMan(now, deadmanExp(), okSignal(float64(now.UnixMilli())))
+	if len(fs) != 1 {
+		t.Fatalf("len(findings) = %d, want 1", len(fs))
+	}
+	for _, want := range []string{"future", "unit", "clock skew"} {
+		if !strings.Contains(fs[0].Evidence, want) {
+			t.Errorf("Evidence = %q, want it to mention %q", fs[0].Evidence, want)
+		}
+	}
+}
+
 func TestThreshold(t *testing.T) {
 	exp := manifest.Expectation{
 		ID: "unit-failures-node-a", Check: "c4-signature", Group: "node-a",
@@ -83,6 +109,14 @@ func TestThreshold(t *testing.T) {
 		{"at threshold fires", okSignal(2), 1, contract.StateFiring},
 		{"summed across samples", okSignal(1, 1), 1, contract.StateFiring},
 		{"unknown signal is alertable", source.Signal{State: contract.StateUnknown, Err: "boom"}, 1, contract.StateUnknown},
+		// NaN makes `total >= min_count` false, so a non-finite sample used to
+		// read as a silent ok even beside a sample that alone crosses the
+		// threshold. It is unmeasurable: Unknown, never ok.
+		{"NaN sample is unknown", okSignal(math.NaN()), 1, contract.StateUnknown},
+		{"NaN beside a crossing sample is unknown", okSignal(5, math.NaN()), 1, contract.StateUnknown},
+		{"-Inf sample is unknown", okSignal(math.Inf(-1), 10), 1, contract.StateUnknown},
+		{"+Inf sample is unknown", okSignal(math.Inf(1)), 1, contract.StateUnknown},
+		{"finite samples overflowing to +Inf is unknown", okSignal(math.MaxFloat64, math.MaxFloat64), 1, contract.StateUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

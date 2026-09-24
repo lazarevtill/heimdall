@@ -15,7 +15,7 @@
 // textfiles.
 //
 // Writes: exactly one to a DECISION authority — a runtime mute, through
-// suppress.AddMute, so the 30-day rolling cap, validation and the feedback
+// suppress.AddMute, so the 30-day per-episode cap, validation and the feedback
 // ledger apply exactly as they do for a Telegram button. It cannot resolve a
 // finding, cannot delete a series, cannot create a hypothesis, and cannot
 // un-mute (no such operation exists in the suppression authority; mutes
@@ -54,7 +54,6 @@ import (
 	"github.com/lazarevtill/heimdall/internal/notify"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 	"github.com/lazarevtill/heimdall/internal/suppress"
-	"github.com/lazarevtill/heimdall/internal/telegram"
 )
 
 // configureLogging pins this binary's log format ONCE, so no call site has to
@@ -270,13 +269,15 @@ func parseActions(getenv func(string) string) (ActionSet, error) {
 				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q must be a positive integer", spec.env, v)
 			}
 			timeout = time.Duration(n) * time.Second
-			// An action may not outlive the server's write deadline: the
-			// command would still finish in its own process group, but the
-			// response carrying its result would be cut, so the operator
-			// sees a dead connection and cannot tell whether it ran.
-			if timeout > maxActionTimeout {
-				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q exceeds the %s server write timeout; the result could not be delivered",
-					spec.env, v, maxActionTimeout)
+			// An action must finish comfortably inside the server's write
+			// deadline: the command would still complete in its own process
+			// group, but the response carrying its result would be cut, so
+			// the operator sees a dead connection and cannot tell whether it
+			// ran. "Comfortably" is actionWriteHeadroom — reaching the
+			// deadline exactly is already too late (see action.go).
+			if timeout >= actionTimeoutLimit {
+				return nil, fmt.Errorf("%s_TIMEOUT_SECONDS %q must be below %s: the %s server write timeout less %s headroom; the result could not be delivered",
+					spec.env, v, actionTimeoutLimit, writeTimeout, actionWriteHeadroom)
 			}
 		}
 		out[spec.name] = Action{Name: spec.name, Label: spec.label, Argv: argv, Timeout: timeout}
@@ -331,18 +332,18 @@ func run() error {
 	// Sink routing is read from the SAME file the notifier uses, so the
 	// console's delivery view cannot disagree with what is actually being
 	// drained. With no file configured this is the Telegram-only default —
-	// matching notify.Drain's own fallback. The console never sends, so the
-	// Telegram client is nil: a sink here is only ever asked for its ID.
-	routes := notify.DefaultTelegramRoutes(nil, 0, 0)
+	// matching notify.Drain's own fallback. Only the TOPOLOGY is read (sink
+	// id -> channels, with the file's structural checks): the console never
+	// sends, so it must not need — and does not read — a single sink
+	// credential. Building live sinks here used to force the Gotify token and
+	// the secret Synology webhook URL into this browser-facing process's env.
+	routing := notify.DefaultTelegramRouting()
 	if cfg.SinksFile != "" {
 		f, err := notify.LoadSinksFile(cfg.SinksFile)
 		if err != nil {
 			return err
 		}
-		routes, err = f.Build(notify.SinkDeps{
-			Telegram: nopTelegram{}, HTTPClient: httpc, Getenv: os.Getenv,
-		})
-		if err != nil {
+		if routing, err = f.Routing(); err != nil {
 			return err
 		}
 	}
@@ -374,7 +375,7 @@ func run() error {
 		tmpl:             tmpl,
 		actions:          cfg.Actions,
 		runner:           ExecRunner{},
-		routes:           routes,
+		routing:          routing,
 		authMode:         cfg.AuthMode,
 		token:            cfg.Token,
 		operators:        cfg.Operators,
@@ -402,20 +403,4 @@ func run() error {
 			cfg.Listen, map[bool]string{true: " AND write suppressions", false: ""}[cfg.AnonymousWrites])
 	}
 	return hs.ListenAndServe()
-}
-
-// nopTelegram satisfies notify.TelegramSender for route CONSTRUCTION only.
-// The console builds routes to learn sink identities and channel mappings
-// for its delivery view; it never drains, so no send can occur. Every method
-// fails loudly rather than silently pretending to have sent something, so a
-// future edit that wires this into a real send path breaks immediately
-// instead of quietly swallowing alerts.
-type nopTelegram struct{}
-
-func (nopTelegram) SendMessage(context.Context, telegram.SendMessageRequest) (int64, error) {
-	return 0, errors.New("the console never sends notifications")
-}
-
-func (nopTelegram) AnswerCallbackQuery(context.Context, string, string) error {
-	return errors.New("the console never answers callbacks")
 }

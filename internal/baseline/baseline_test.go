@@ -1,6 +1,8 @@
 package baseline_test
 
 import (
+	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -328,6 +330,84 @@ func TestClearCrossingThenMarkCrossingStartsFresh(t *testing.T) {
 	}
 	if !since.Equal(t1) {
 		t.Errorf("MarkCrossing after ClearCrossing since = %v, want fresh %v", since, t1)
+	}
+}
+
+// Crossing is the READ-ONLY view of the hysteresis state: tier2 consults it
+// on evaluations that must not advance or reset the hold timer (hold band,
+// unmeasured, warming), so it must never create a row itself.
+func TestCrossingIsReadOnly(t *testing.T) {
+	s, _ := openTest(t)
+	t0 := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
+
+	if _, ok, err := s.Crossing("c6-quantile-creep", "node-a"); err != nil || ok {
+		t.Fatalf("Crossing on absent row = (ok=%v, err=%v), want (false, nil)", ok, err)
+	}
+	// If the read above had inserted a row, this mark would return an
+	// earlier since than t1.
+	t1 := t0.Add(time.Hour)
+	if _, err := s.MarkCrossing(t1, "c6-quantile-creep", "node-a"); err != nil {
+		t.Fatalf("MarkCrossing: %v", err)
+	}
+	since, ok, err := s.Crossing("c6-quantile-creep", "node-a")
+	if err != nil || !ok || !since.Equal(t1) {
+		t.Fatalf("Crossing after mark = (%v, %v, %v), want (%v, true, nil)", since, ok, err, t1)
+	}
+	if err := s.ClearCrossing("c6-quantile-creep", "node-a"); err != nil {
+		t.Fatalf("ClearCrossing: %v", err)
+	}
+	if _, ok, err := s.Crossing("c6-quantile-creep", "node-a"); err != nil || ok {
+		t.Fatalf("Crossing after clear = (ok=%v, err=%v), want (false, nil)", ok, err)
+	}
+}
+
+// A non-finite value is not an observation. NaN cannot be stored at all
+// (SQLite turns it into NULL against a NOT NULL column) and ±Inf would sit in
+// every quantile over the baseline window, so the store refuses both with a
+// named error instead of a constraint failure or a poisoned baseline.
+func TestRecordFeatureRefusesNonFinite(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		t.Run(fmt.Sprint(v), func(t *testing.T) {
+			s, _ := openTest(t)
+			if err := s.RecordFeature(now, "host", "node-a", "f", v); err == nil {
+				t.Fatalf("RecordFeature(%v) = nil, want an error", v)
+			}
+			if _, n, ok, err := s.Quantile(now, "node-a", "f", time.Hour, 0.5); err != nil || ok || n != 0 {
+				t.Errorf("after refused write: Quantile = (n=%d, ok=%v, err=%v), want nothing stored", n, ok, err)
+			}
+		})
+	}
+}
+
+// A state.db written before RecordFeature refused ±Inf can already hold one.
+// Quantile skips such rows so the baseline heals at once instead of pinning
+// p95 at +Inf for a whole baseline window.
+func TestQuantileSkipsNonFiniteRows(t *testing.T) {
+	s, path := openTest(t)
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	for _, v := range []float64{1, 2, 3} {
+		if err := s.RecordFeature(now, "host", "node-a", "f", v); err != nil {
+			t.Fatalf("RecordFeature(%v): %v", v, err)
+		}
+	}
+	raw, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	defer raw.Close()
+	for _, v := range []float64{math.Inf(1), math.Inf(-1)} {
+		if _, err := raw.Exec(`INSERT INTO features (ts, entity, target, feature, value) VALUES (?, 'host', 'node-a', 'f', ?)`,
+			now.Unix(), v); err != nil {
+			t.Fatalf("seed legacy %v row: %v", v, err)
+		}
+	}
+	got, n, ok, err := s.Quantile(now, "node-a", "f", time.Hour, 0.95)
+	if err != nil || !ok {
+		t.Fatalf("Quantile = (ok=%v, err=%v)", ok, err)
+	}
+	if n != 3 || !closeEnough(got, 2.9) {
+		t.Errorf("Quantile = (%v, n=%d), want (2.9, n=3) over the finite rows only", got, n)
 	}
 }
 

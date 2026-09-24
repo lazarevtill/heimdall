@@ -28,7 +28,12 @@ file wins and the guide is wrong.
 - `cmd/heimdall-analyst` — Tier-3 oneshot: digest → health-gate LLM → analyze → verify/dedup/
   cap/redact → persist → POST `/hypothesis`.
 - `cmd/heimdall-bridge` — HTTP daemon: `/am` (Alertmanager webhook → YouTrack), `/hypothesis`,
-  `/healthz`; 15-min escalation sweep. `time.Now()` is allowed in `cmd/`.
+  `/healthz`; 15-min escalation sweep. Both POST routes require a bearer token
+  (`HEIMDALL_BRIDGE_TOKEN`) unless `HEIMDALL_BRIDGE_AUTH=none` is chosen explicitly; every
+  `Reconcile`/`HandleHypothesis` call is serialised (they are check-then-act, not
+  concurrency-safe), and the escalation sweep takes the same lock per candidate, re-reading it
+  first; sweep heartbeat + counters go to `heimdall-bridge.prom`. `time.Now()` is
+  allowed in `cmd/`.
 - `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain
   (fanned out to every routed sink), Alertmanager silence reconcile, weekly digest, own heartbeat.
 - `cmd/heimdall-ui` — operator console (HTTP daemon). READS the finding ledger, the suppression
@@ -64,7 +69,9 @@ file wins and the guide is wrong.
 - `internal/baseline` — Tier-2 SQLite store (features/warmup/template_baseline/crossing) over the
   engine `state.db` (own handle, no `PRAGMA user_version`).
 - `internal/tier2` — Tier-2 C6–C9 evaluation (robust-IQR zscore), graduation with hysteresis +
-  7-day warm-up; unknown/warming never graduates.
+  7-day warm-up; unknown/warming never graduates. A GRADUATED trend is held — Firing in the hold
+  band, Unknown when unmeasurable — until a measured clear, so it never flaps at the threshold or
+  resolves on a backend outage (the `.prom` is replaced whole every run).
 - `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
   `latest.json` + 14-day dated history).
 - `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
@@ -72,7 +79,8 @@ file wins and the guide is wrong.
   replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.
 - `internal/suppress` — the **single suppression authority**: declarative (`suppressions.json`)
-  ∪ runtime (SQLite mutes), five scopes, 30-day rolling cumulative cap, active-silence projection.
+  ∪ runtime (SQLite mutes), five scopes, 30-day cap per continuous mute episode (a lapsed mute
+  starts afresh; a shorter press never shortens), active-silence projection.
 - `internal/plugin` — subprocess plugin host (manifest validate, `plugin_api` version gate,
   scrubbed-env/deadline/pgroup-kill/output-cap runner, capability-scoped credential injection) +
   the `source.Source` adapter that drives a source plugin as a data source.
@@ -81,11 +89,20 @@ file wins and the guide is wrong.
 - `internal/analyst` — the Tier-3 wrapper: health gate, row-id verification (drops hallucinated
   citations), wrapper-computed `hyp_fp`, 7-day dedup + per-run cap, persist-before-POST.
 - `internal/tracker` — the tracker seam + YouTrack REST implementation + `[hb:<key>]` marker
-  grammar (`<group>--<check>` / `t3-<hyp_fp>`) + configurable default assignee.
+  grammar (`<group>--<check>` / `t3-<hyp_fp>`) + configurable default assignee. `FindByMarker`
+  returns only an UNRESOLVED issue whose marker matches exactly (re-checked client-side, never
+  trusting the search); `Get` fetches by id.
 - `internal/outbox` — channel-typed, idempotent `notify_outbox` (bridge's own db).
+  `EnqueueOrRearm` re-arms a SENT entry older than a cutoff back to pending under the same idem
+  key (hypothesis cooldown, per-episode escalation re-ping) — the key shapes the notifier parses
+  never change.
 - `internal/bridge` — AM webhook v4 parse, issue ledger, `Reconcile` (one issue per group,
-  per-target checklist, close-on-group-resolved+`heimdall-auto`, mute-gated recurrence, storm
-  fuse), `HandleHypothesis` (G1: structurally never pages), `EscalationSweep`.
+  per-target checklist, close-on-group-resolved+`heimdall-auto`, per-target mute-gated
+  recurrence, storm fuse; the ledger state tracks the GROUP, and a firing after a recovery is a
+  new EPISODE with a new issue and a fresh escalation clock), `HandleHypothesis` (G1:
+  structurally never pages; hypothesis mutes enforced), `EscalationSweep`. Every tracker-bound
+  free-text field goes through one egress path (`egress.go`: fail-closed redaction, then
+  @-mention neutralising).
 - `internal/telegram` / `internal/gotify` / `internal/synology` — the three delivery transports.
   Pure transport, no policy, no clock. Each is fail-closed and scrubs its own credential out of
   any error text it returns (net/http embeds the request URL in errors; Synology's whole webhook
@@ -125,9 +142,9 @@ file wins and the guide is wrong.
 7. **The console may only ever widen what it READS.** `heimdall-ui` is a display over state the
    other binaries own. Its single write to a DECISION authority goes through `suppress.AddMute`,
    so adding any other such write means changing an authority rather than adding a handler.
-   (It is not a read-only *process*: opening the stores runs their idempotent schema DDL, and
-   `outbox.Open` runs its `notify_delivery` backfill insert — the same migrations its co-tenant
-   daemons run. Stated because "read-only" is the kind of claim that gets relied on later.) Operator actions run a
+   (It is not a read-only *process*: opening the stores runs their idempotent schema DDL,
+   `outbox.Open` runs its `notify_delivery` backfill insert, and `bridge.OpenStore` runs a
+   guarded `ALTER TABLE` — the same migrations its co-tenant daemons run. Stated because "read-only" is the kind of claim that gets relied on later.) Operator actions run a
    FIXED argv parsed from config at boot — nothing from a request reaches a command line, no
    shell is involved, and an unconfigured action answers 501 rather than being a hidden
    capability. A `make` gate keeps `internal/llm` off its dep graph too: the console displays

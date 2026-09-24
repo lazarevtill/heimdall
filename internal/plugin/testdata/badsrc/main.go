@@ -77,6 +77,28 @@ func main() {
 				q.QueryID: map[string]any{"state": "spooky-unrecognized-state", "samples": []any{}},
 			},
 		})
+	case "errsecret":
+		// A plugin-authored per-query err that quotes the plugin's own
+		// credential — plugin text that reaches finding evidence.
+		write(map[string]any{
+			"plugin_api": 1,
+			"signals": map[string]any{
+				q.QueryID: map[string]any{
+					"state":   "unknown",
+					"samples": []any{},
+					"err":     "upstream rejected key " + os.Getenv("HEIMDALL_PLUGIN_SECRET"),
+				},
+			},
+		})
+	case "statesecret":
+		// The credential as an unrecognized state string, which the
+		// adapter quotes into Signal.Err for diagnosis.
+		write(map[string]any{
+			"plugin_api": 1,
+			"signals": map[string]any{
+				q.QueryID: map[string]any{"state": os.Getenv("HEIMDALL_PLUGIN_SECRET"), "samples": []any{}},
+			},
+		})
 	case "malformed":
 		// Not valid JSON at all.
 		fmt.Fprint(os.Stdout, "{this is not json")

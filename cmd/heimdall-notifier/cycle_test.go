@@ -99,7 +99,7 @@ func TestRunCycleDrainsReconcilesAndWritesHeartbeat(t *testing.T) {
 		MainChatID:  fakeMainChatID,
 	}
 
-	if err := runCycle(context.Background(), fixedNow, d, 2); err != nil {
+	if err := runCycle(context.Background(), fixedNow, d, pollStatus{DispatchErrors: 2}); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -166,11 +166,62 @@ func TestRunCycleSurvivesReconcileErrorAndStillWritesHeartbeat(t *testing.T) {
 		MainChatID:  fakeMainChatID,
 	}
 
-	if err := runCycle(context.Background(), fixedNow, d, 0); err != nil {
+	if err := runCycle(context.Background(), fixedNow, d, pollStatus{}); err != nil {
 		t.Fatalf("runCycle: %v, want nil (reconcile errors are logged, not fatal)", err)
 	}
 	if _, err := os.Stat(filepath.Join(textfileDir, heartbeatFilename)); err != nil {
 		t.Errorf("heartbeat file missing after a reconcile error: %v", err)
+	}
+}
+
+// An outbox the notifier cannot read delivers NOTHING, yet the cycle used to
+// write a fresh heartbeat anyway: the critical staleness rule stayed quiet
+// and only the backlog series vanished (a warning). A store fault is now a
+// failed cycle — the heartbeat is withheld so staleness pages — while a
+// sink refusing a send stays the non-fatal, backlog-gauge-visible
+// condition it always was.
+func TestRunCycleWithholdsTheHeartbeatOnAnOutboxStoreFault(t *testing.T) {
+	ob, err := outbox.Open(filepath.Join(t.TempDir(), "bridge.db"))
+	if err != nil {
+		t.Fatalf("outbox.Open: %v", err)
+	}
+	ob.Close() // every query now fails, as a corrupt/unreadable store would
+	sup := openTestSuppress(t)
+	tg := &fakeTG{}
+	dir := t.TempDir()
+	d := cycleDeps{
+		Notify:  notify.Deps{TG: tg, Outbox: ob, Suppress: sup, MainChatID: fakeMainChatID, AnalystChatID: fakeAnalystChatID},
+		Silence: newFakeSilenceClient(), Suppress: sup, TextfileDir: dir, TG: tg, MainChatID: fakeMainChatID,
+	}
+
+	if err := runCycle(context.Background(), fixedNow, d, pollStatus{}); err == nil {
+		t.Fatal("runCycle: want an error for an unreadable outbox, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(dir, heartbeatFilename)); !os.IsNotExist(err) {
+		t.Errorf("heartbeat written despite a store fault (stat err = %v); staleness could never fire", err)
+	}
+}
+
+func TestRunCycleKeepsTheHeartbeatWhenOnlyASinkRefuses(t *testing.T) {
+	ob := openTestOutbox(t)
+	sup := openTestSuppress(t)
+	dir := t.TempDir()
+	if _, err := ob.Enqueue(fixedNow, outbox.ChannelMain, "x", "escalate-[hb:node--c1-deadman]"); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	d := cycleDeps{
+		Notify:  notify.Deps{TG: &failingTG{}, Outbox: ob, Suppress: sup, MainChatID: fakeMainChatID, AnalystChatID: fakeAnalystChatID},
+		Silence: newFakeSilenceClient(), Suppress: sup, TextfileDir: dir, TG: &failingTG{}, MainChatID: fakeMainChatID,
+	}
+	if err := runCycle(context.Background(), fixedNow, d, pollStatus{}); err != nil {
+		t.Fatalf("runCycle: %v, want nil (a refused send is not a failed cycle)", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, heartbeatFilename))
+	if err != nil {
+		t.Fatalf("heartbeat missing: %v", err)
+	}
+	if !strings.Contains(string(data), `heimdall_notifier_sink_failed_total{sink="telegram"} 1`) {
+		t.Errorf("want the refusal counted:\n%s", data)
 	}
 }
 
@@ -250,6 +301,52 @@ func TestMaybeSendDigestSendsOnDueWeekAndReturnsNewWeekKey(t *testing.T) {
 	}
 	if !strings.Contains(tg.sends[0].Text, "weekly digest") {
 		t.Errorf("digest text = %q, want it to look like RenderWeeklyDigest's output", tg.sends[0].Text)
+	}
+}
+
+// The digest's "Active mutes" used to be len(ActiveSilences), which drops
+// the hypothesis/analyst scopes and every unbounded record; it now counts
+// everything in force, and lists records past their review_after.
+func TestMaybeSendDigestCountsEveryActiveRecordAndListsOverdueReviews(t *testing.T) {
+	sup := openTestSuppress(t)
+	tg := &fakeTG{}
+	monday0500 := time.Date(2026, 7, 20, 5, 0, 0, 0, time.UTC)
+
+	// Runtime: one group_check mute (projectable) and one hypothesis mute
+	// (not projectable into Alertmanager).
+	if _, err := sup.AddMute(monday0500, "btn-node--c1-deadman", suppress.ScopeGroupCheck,
+		suppress.Matcher{Group: "node", Check: "c1-deadman"}, 7, "", "", "mute", "ops"); err != nil {
+		t.Fatalf("AddMute: %v", err)
+	}
+	if _, err := sup.AddMute(monday0500, "btn-t3-0123456789abcdef", suppress.ScopeHypothesis,
+		suppress.Matcher{HypFP: "0123456789abcdef"}, 30, "", "", "not useful", "ops"); err != nil {
+		t.Fatalf("AddMute: %v", err)
+	}
+	// Declarative: an unbounded record whose review is overdue.
+	decl := filepath.Join(t.TempDir(), "suppressions.json")
+	if err := os.WriteFile(decl, []byte(`[{"key":"decl-decom","scope":"target","matcher":{"target":"node-z"},
+		"until":"never","review_after":"2026-07-01T00:00:00Z","reason":"pull pending","actor":"iac"}]`), 0o600); err != nil {
+		t.Fatalf("write suppressions: %v", err)
+	}
+
+	d := cycleDeps{Suppress: sup, TG: tg, MainChatID: fakeMainChatID, SuppressionsFile: decl}
+	if _, err := maybeSendDigest(context.Background(), monday0500, d, "2026-W29"); err != nil {
+		t.Fatalf("maybeSendDigest: %v", err)
+	}
+	if len(tg.sends) != 1 {
+		t.Fatalf("sends = %d, want 1", len(tg.sends))
+	}
+	text := tg.sends[0].Text
+	for _, want := range []string{
+		"Active mutes: 3\n",
+		"decl-decom (target) until never, review was due 2026-07-01T00:00:00Z: pull pending",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest missing %q:\n%s", want, text)
+		}
+	}
+	if len(tg.sendDeadlines) != 1 || !tg.sendDeadlines[0] {
+		t.Errorf("the digest send must run under a deadline, got %v", tg.sendDeadlines)
 	}
 }
 

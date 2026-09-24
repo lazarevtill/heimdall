@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,12 +69,21 @@ func (c *Client) Health(ctx context.Context) error {
 }
 
 // Request is one strict-json_schema completion. System is static instructions
-// (not redacted). User is the payload (the redacted digest) — redacted AGAIN
-// here, defense-in-depth, callsite #5. SchemaName/Schema are the strict
-// json_schema forwarded verbatim. MaxTokens>0 caps the completion (0 = omit).
+// (not redacted). The payload is EXACTLY ONE of User or UserJSON, and either
+// way it is redacted AGAIN here, defense-in-depth, callsite #5:
+//
+//   - User is plain text, redacted as one field.
+//   - UserJSON is a JSON document (the analyst's digest), redacted string by
+//     string (see redactJSON) and sent as its re-encoded text. It must be
+//     valid JSON and fit maxUserJSONBytes after redaction, or the request is
+//     refused before anything is sent — a JSON payload is never truncated.
+//
+// SchemaName/Schema are the strict json_schema forwarded verbatim.
+// MaxTokens>0 caps the completion (0 = omit).
 type Request struct {
 	System     string
 	User       string
+	UserJSON   json.RawMessage
 	SchemaName string          // response_format.json_schema.name (^[a-z0-9_-]+$ recommended)
 	Schema     json.RawMessage // response_format.json_schema.schema — the JSON Schema object
 	MaxTokens  int
@@ -130,22 +140,43 @@ type chatResponse struct {
 }
 
 // Analyze performs one strict-json_schema chat completion at temperature 0.
-// It redacts req.User via contract.EvidenceOrWithheld before sending (counting
-// failures into Result.RedactionFailures — a redaction FAILURE withholds that
+// It redacts the payload via contract.EvidenceOrWithheld before sending —
+// req.User as one field, req.UserJSON one string at a time — counting
+// failures into Result.RedactionFailures. A redaction FAILURE withholds that
 // content but the request STILL proceeds with the withheld sentinel, matching
 // the content-fail-closed/signal-fail-open rule: we never send unredacted
-// evidence, but a redactor bug does not silently skip the analysis).
+// evidence, but a redactor bug does not silently skip the analysis.
 //
-// Fail-closed: a transport error, non-200 status, an empty choices array, a
-// missing/empty message.content, or a body that does not decode all return a
-// non-nil error and a zero Result — never a partial or fabricated answer. The
-// returned Content is NOT validated against Schema here (the server enforces
-// the schema; the caller unmarshals+validates semantically).
+// Fail-closed: a payload that is not usable as given (both fields set,
+// UserJSON not valid JSON, or over maxUserJSONBytes once redacted) is
+// refused before any request is made; a transport error, non-200 status, an
+// empty choices array, a missing/empty message.content, or a body that does
+// not decode all return a non-nil error and a zero Result — never a partial
+// or fabricated answer. The returned Content is NOT validated against Schema
+// here (the server enforces the schema; the caller unmarshals+validates
+// semantically).
 func (c *Client) Analyze(ctx context.Context, req Request) (Result, error) {
-	user, failed := contract.EvidenceOrWithheld(req.User)
+	var user string
 	redactionFailures := 0
-	if failed {
-		redactionFailures = 1
+	switch {
+	case len(req.UserJSON) > 0 && req.User != "":
+		return Result{}, errors.New("llm analyze: set User or UserJSON, not both")
+	case len(req.UserJSON) > 0:
+		doc, failures, err := redactJSON(req.UserJSON, contract.EvidenceOrWithheld)
+		if err != nil {
+			return Result{}, fmt.Errorf("llm analyze: user JSON: %w", err)
+		}
+		if len(doc) > maxUserJSONBytes {
+			return Result{}, fmt.Errorf("llm analyze: user JSON is %d bytes after redaction, over the %d-byte cap (a JSON payload is refused, never truncated)",
+				len(doc), maxUserJSONBytes)
+		}
+		user, redactionFailures = string(doc), failures
+	default:
+		var failed bool
+		user, failed = contract.EvidenceOrWithheld(req.User)
+		if failed {
+			redactionFailures = 1
+		}
 	}
 
 	body := chatRequest{

@@ -10,23 +10,92 @@ const Withheld = "[redaction failed — evidence withheld]"
 
 const maxEvidenceBytes = 32 << 10
 
+// redactPatterns are applied in order, each replacing its whole match with
+// repl (default "[REDACTED:<kind>]"; a repl keeps a named prefix group where
+// the context around the secret is worth preserving).
+//
+// JSON SAFETY — a hard rule for every pattern here. Redact is also run over
+// whole serialized JSON documents, where a '"' ends a string and a '\' starts
+// an escape. So no character class that can repeat may admit '"' or '\':
+// a match that crosses a '"' splices two fields together (the old
+// url-credentials class once ran from one field's "https://" to a later
+// field's "@", deleting everything between), and one that consumes a '\'
+// can split an escape, leaving a dangling backslash or a bare quote.
+// TestRedactNeverConsumesAQuoteOrBackslash checks every pattern against a
+// serialized corpus. The cost is accepted knowingly: a secret whose shape
+// spans a JSON escape (a PEM body's "\n" line breaks) is only partly masked
+// in serialized form — which is why internal/llm redacts each DECODED
+// string, not the serialized document.
+//
+// Value classes that end at quotes, backslashes and whitespace share the
+// fragment secretValue.
+const secretValue = `[^\s"'\\]`
+
 var redactPatterns = []struct {
 	kind string
 	re   *regexp.Regexp
+	repl string
 }{
-	{"gitlab-pat", regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`)},
-	{"pbs-token", regexp.MustCompile(`PBSAPIToken=\S+`)},
-	{"vault-token", regexp.MustCompile(`hvs\.[A-Za-z0-9_\-]{20,}`)},
-	{"bearer", regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]{16,}`)},
-	// net/http error strings embed full request URLs; a basic-auth PromURL
-	// would otherwise leak into finding evidence via sig.Err.
-	{"url-credentials", regexp.MustCompile(`https?://[^/\s@]+:[^/\s@]+@`)},
+	// A PEM private key: header, base64 body over real newlines, footer. The
+	// footer is optional so a key cut short (a 32 KB evidence cap, a
+	// truncated log line) is still masked from the header on. '-' is not in
+	// the body class, so the match stops at the footer instead of running
+	// into the text after it.
+	{kind: "private-key", re: regexp.MustCompile(`-----BEGIN[A-Z ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*(?:-----END[A-Z ]*PRIVATE KEY-----)?`)},
+	// Userinfo in ANY scheme's URL (postgres://, redis://, amqp://…), user
+	// or password or both. The class admits '@' so a password containing
+	// one is consumed up to the LAST '@' before the host; it excludes '/',
+	// '?' and '#' so an '@' in a path (an image digest) or query never
+	// reads as userinfo, and whitespace/quotes so it never reaches into the
+	// next word or field. net/http masks passwords in its own errors, but
+	// url.Parse errors quote the raw URL whole.
+	{kind: "url-credentials", re: regexp.MustCompile(`(?i)([a-z][a-z0-9+.\-]*://)[^\s/?#"'\\]+@`), repl: "${1}[REDACTED:url-credentials]@"},
+	{kind: "jwt", re: regexp.MustCompile(`eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*`)},
+	// Standard base64 carries + / and = padding; the old class stopped at
+	// the first of them and leaked the rest of the token.
+	{kind: "bearer", re: regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/\-]{16,}=*`)},
+	// Basic credentials only in an Authorization context: "basic
+	// authentication failed" is ordinary evidence. \[? covers a Go header
+	// dump (map[Authorization:[Basic …]]).
+	{kind: "basic-auth", re: regexp.MustCompile(`(?i)(authorization:\s*\[?)basic\s+[A-Za-z0-9+/]{4,}=*`), repl: "${1}[REDACTED:basic-auth]"},
+	// Proxmox API tokens, "=" form (either product) and the SPACE form that
+	// internal/source's own PBS client sends. The space form requires the
+	// token-id punctuation (user@realm!name:secret) so prose that merely
+	// names the scheme is left alone.
+	{kind: "pbs-token", re: regexp.MustCompile(`P(?:BS|VE)APIToken=` + secretValue + `+|P(?:BS|VE)APIToken\s+` + secretValue + `*[@!:]` + secretValue + `*`)},
+	{kind: "gitlab-pat", re: regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`)},
+	// The other GitLab token prefixes: pipeline-trigger, deploy, runner,
+	// CI-build, incoming-mail, feed, SCIM/OAuth, feature-flag, agent.
+	{kind: "gitlab-token", re: regexp.MustCompile(`gl(?:ptt|dt|rt|cbt|imt|ft|soat|ffct|agent|oas)-[A-Za-z0-9_\-]{20,}`)},
+	{kind: "vault-token", re: regexp.MustCompile(`hv[sbr]\.[A-Za-z0-9_\-]{20,}`)},
+	// Legacy (pre-1.10) Vault service token: "s." + exactly 24 alphanumerics.
+	{kind: "vault-token", re: regexp.MustCompile(`\bs\.[A-Za-z0-9]{24}\b`)},
+	{kind: "aws-access-key", re: regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)},
+	// A Telegram bot token is <bot id>:<secret>; in the Bot API it sits in
+	// the PATH as /bot<id>:<secret>/, where \b cannot match between "bot"
+	// and the digits — so the pattern carries no leading boundary at all.
+	{kind: "telegram-token", re: regexp.MustCompile(`\d{6,12}:[A-Za-z0-9_\-]{30,}`)},
+	// key=value secrets in query strings, flags and env-style dumps. The key
+	// starts at a word boundary ("bypass=" is not "pass=") and may carry
+	// "word_"/"word-" qualifiers (access_token, aws_secret_access_key). The
+	// boundary is zero-width, so nothing before the key — least of all a
+	// JSON string's opening quote — is consumed. The one exception is a
+	// literal "u0026": json.Marshal escapes '&' as \u0026, so a serialized
+	// "…\u0026password=x" has no boundary before the key; the "u0026" (never
+	// its backslash) is matched and written back unchanged. Only the value
+	// is replaced.
+	{kind: "secret-param", re: regexp.MustCompile(`(?i)(\b|u0026)((?:[a-z0-9]+[_-])*(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|client[_-]?secret))=[^\s&"'\\]+`),
+		repl: "${1}${2}=[REDACTED:secret-param]"},
 }
 
 // Redact replaces every secret-shaped substring with a typed marker.
 func Redact(s string) string {
 	for _, p := range redactPatterns {
-		s = p.re.ReplaceAllString(s, "[REDACTED:"+p.kind+"]")
+		repl := p.repl
+		if repl == "" {
+			repl = "[REDACTED:" + p.kind + "]"
+		}
+		s = p.re.ReplaceAllString(s, repl)
 	}
 	return s
 }

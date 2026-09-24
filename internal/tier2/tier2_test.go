@@ -1,6 +1,9 @@
 package tier2_test
 
 import (
+	"database/sql"
+	"encoding/json"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -309,15 +312,27 @@ func TestEvalHysteresisHoldBandThenClearThenFreshEntry(t *testing.T) {
 		t.Fatal("expected graduation before hold-band test")
 	}
 
-	// Drop into the HOLD band (0.7 < 0.8 < 0.9): crossing must persist
-	// (no clear), no new finding.
+	// Drop into the HOLD band (0.7 < 0.8 < 0.9): crossing must persist (no
+	// clear) AND the graduated finding must keep being emitted, still firing.
+	//
+	// This assertion used to be the opposite ("no finding in the hold band").
+	// That pinned a flap: emission is state-based — the .prom is rewritten
+	// whole each run, so a finding that is not returned is a series that
+	// disappears, and Alertmanager resolves it (the bridge then auto-closes
+	// the ticket). A metric hovering at 0.89/0.91 fired and resolved on
+	// alternate runs — the exact flap the hold band exists to prevent. The
+	// band now holds the ALERT, not just the crossing row.
 	hold := graduated.Add(time.Minute)
 	resHold, err := tier2.Eval(hold, spec, okSignal(0.8), s)
 	if err != nil {
 		t.Fatalf("Eval (hold band): %v", err)
 	}
-	if resHold.Finding != nil {
-		t.Errorf("Finding minted in hold band: %+v, want nil", resHold.Finding)
+	if resHold.Finding == nil {
+		t.Fatal("Finding = nil in hold band after graduation, want it held (a vanished series resolves the alert)")
+	}
+	if resHold.Finding.State != contract.StateFiring || resHold.Finding.Fingerprint != res.Finding.Fingerprint {
+		t.Errorf("hold-band finding = (%v, %s), want (firing, %s): same series, still firing",
+			resHold.Finding.State, resHold.Finding.Fingerprint, res.Finding.Fingerprint)
 	}
 
 	// Re-enter immediately: since crossing was never cleared, this should
@@ -466,4 +481,238 @@ func TestEvalZScoreDeterministicAndEpsilonGuarded(t *testing.T) {
 	if res3.Row.ZScore != 0 {
 		t.Errorf("ZScore = %v, want 0 for a tight (IQR≈0) baseline", res3.Row.ZScore)
 	}
+}
+
+// graduate drives spec through warm-up into a graduated (firing) trend
+// finding and returns the instant it graduated plus the finding.
+func graduate(t *testing.T, s *baseline.Store, spec manifest.Tier2Spec) (time.Time, contract.Finding) {
+	t.Helper()
+	for i, v := range []float64{0.1, 0.2, 0.3, 0.4, 0.5} {
+		if _, err := tier2.Eval(t0.Add(time.Duration(i)*time.Hour), spec, okSignal(v), s); err != nil {
+			t.Fatalf("Eval seed %d: %v", i, err)
+		}
+	}
+	enter := t0.Add(tier2.WarmupWindow).Add(time.Hour)
+	if _, err := tier2.Eval(enter, spec, okSignal(0.95), s); err != nil {
+		t.Fatalf("Eval (enter): %v", err)
+	}
+	at := enter.Add(61 * time.Minute)
+	res, err := tier2.Eval(at, spec, okSignal(0.95), s)
+	if err != nil {
+		t.Fatalf("Eval (graduate): %v", err)
+	}
+	if res.Finding == nil || res.Finding.State != contract.StateFiring {
+		t.Fatalf("graduate: Finding = %+v, want a firing trend finding", res.Finding)
+	}
+	return at, *res.Finding
+}
+
+// The hold band holds an alert only once the crossing has served its
+// min_hold: a crossing that entered the zone 30 minutes ago has never
+// graduated, so dipping into the band must not mint one.
+func TestEvalHoldBandBeforeMinHoldEmitsNothing(t *testing.T) {
+	s := openStore(t)
+	spec := quantileSpec()
+	for i, v := range []float64{0.1, 0.2, 0.3, 0.4, 0.5} {
+		if _, err := tier2.Eval(t0.Add(time.Duration(i)*time.Hour), spec, okSignal(v), s); err != nil {
+			t.Fatalf("Eval seed %d: %v", i, err)
+		}
+	}
+	enter := t0.Add(tier2.WarmupWindow).Add(time.Hour)
+	if _, err := tier2.Eval(enter, spec, okSignal(0.95), s); err != nil {
+		t.Fatalf("Eval (enter): %v", err)
+	}
+	res, err := tier2.Eval(enter.Add(30*time.Minute), spec, okSignal(0.8), s)
+	if err != nil {
+		t.Fatalf("Eval (hold band, mid-hold): %v", err)
+	}
+	if res.Finding != nil {
+		t.Errorf("Finding = %+v in hold band before min_hold elapsed, want nil", res.Finding)
+	}
+}
+
+// Once a trend has graduated, an evaluation that cannot see the metric must
+// not make its series vanish: a vanished series is a RESOLVE, so a backend
+// outage used to close the trend's ticket — a false all-clear. The finding
+// is held as Unknown (same fingerprint, so the same series), while the
+// crossing itself stays untouched, and a later measured clear still resolves.
+func TestEvalGraduatedTrendHeldAsUnknownWhenUnmeasurable(t *testing.T) {
+	cases := []struct {
+		name string
+		sig  source.Signal
+	}{
+		{"backend unknown", source.Signal{QueryID: "q", State: contract.StateUnknown, Err: "backend timeout"}},
+		{"empty vector", source.Signal{QueryID: "q", State: contract.StateOK}},
+		{"non-finite sample", okSignal(math.NaN())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			spec := quantileSpec()
+			at, graduated := graduate(t, s, spec)
+
+			res, err := tier2.Eval(at.Add(5*time.Minute), spec, tc.sig, s)
+			if err != nil {
+				t.Fatalf("Eval (unmeasurable): %v", err)
+			}
+			if res.Finding == nil {
+				t.Fatal("Finding = nil, want the graduated trend held as Unknown (its series must not vanish)")
+			}
+			got := struct {
+				State       contract.State
+				Class       contract.Class
+				Fingerprint string
+			}{res.Finding.State, res.Finding.Class, res.Finding.Fingerprint}
+			want := struct {
+				State       contract.State
+				Class       contract.Class
+				Fingerprint string
+			}{contract.StateUnknown, contract.ClassTrend, graduated.Fingerprint}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("held finding mismatch (-want +got):\n%s", diff)
+			}
+			if res.Row == nil || res.Row.Status != contract.StatusUnknown || res.UnknownMarker == "" {
+				t.Errorf("Row = %+v, marker = %q: want an unknown row AND a marker", res.Row, res.UnknownMarker)
+			}
+
+			// A measured value below clear_threshold still resolves.
+			resClear, err := tier2.Eval(at.Add(10*time.Minute), spec, okSignal(0.5), s)
+			if err != nil {
+				t.Fatalf("Eval (clear): %v", err)
+			}
+			if resClear.Finding != nil {
+				t.Errorf("Finding = %+v after a measured clear, want nil", resClear.Finding)
+			}
+		})
+	}
+}
+
+// Warming (e.g. the warmup table was lost in a state.db restore while the
+// crossing row survived) is not a measurement the graduation can trust, so
+// the held finding is Unknown — never Firing, and never silently absent.
+func TestEvalWarmingWithServedCrossingHoldsUnknown(t *testing.T) {
+	s := openStore(t)
+	spec := quantileSpec()
+	if _, err := s.MarkCrossing(t0, spec.Check, spec.Target); err != nil {
+		t.Fatalf("MarkCrossing: %v", err)
+	}
+	res, err := tier2.Eval(t0.Add(2*time.Hour), spec, okSignal(0.95), s)
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if res.Row == nil || res.Row.Status != contract.StatusBaselineWarming {
+		t.Fatalf("Row = %+v, want status=BaselineWarming", res.Row)
+	}
+	if res.Finding == nil || res.Finding.State != contract.StateUnknown {
+		t.Fatalf("Finding = %+v, want a held Unknown trend (warming never graduates, never fires)", res.Finding)
+	}
+}
+
+// A current value, stored baseline or zscore that is not a finite number
+// can be neither shown as a measurement nor JSON-encoded (a single ±Inf
+// used to fail digest.Write and with it the WHOLE detector run). The row is
+// forced to unknown with every float zeroed, and it always marshals.
+func TestEvalNonFiniteNeverReachesTheRow(t *testing.T) {
+	flat := func(t *testing.T, s *baseline.Store, spec manifest.Tier2Spec) {
+		t.Helper()
+		for i := 0; i < 8; i++ {
+			if _, err := tier2.Eval(t0.Add(time.Duration(i)*time.Hour), spec, okSignal(0), s); err != nil {
+				t.Fatalf("Eval seed %d: %v", i, err)
+			}
+		}
+	}
+	cases := []struct {
+		name string
+		sig  source.Signal
+	}{
+		{"NaN sample", okSignal(math.NaN())},
+		{"+Inf sample", okSignal(math.Inf(1))},
+		{"-Inf beside a finite sample", okSignal(0.2, math.Inf(-1))},
+		// Finite in, infinite out: (1e300 - 0) / epsilon overflows.
+		{"zscore overflows on a flat baseline", okSignal(1e300)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			spec := quantileSpec()
+			flat(t, s, spec)
+			res, err := tier2.Eval(t0.Add(tier2.WarmupWindow).Add(time.Hour), spec, tc.sig, s)
+			if err != nil {
+				t.Fatalf("Eval: %v", err)
+			}
+			if res.Row == nil {
+				t.Fatal("Row = nil, want an unknown row")
+			}
+			want := contract.DigestRow{
+				RowID: res.Row.RowID, Entity: spec.Entity, Target: spec.Target,
+				Feature: spec.Feature, Unit: spec.Unit, Status: contract.StatusUnknown,
+			}
+			if diff := cmp.Diff(want, *res.Row); diff != "" {
+				t.Errorf("row mismatch (-want +got):\n%s", diff)
+			}
+			if res.UnknownMarker != spec.Target+"/"+spec.Feature {
+				t.Errorf("UnknownMarker = %q, want %q", res.UnknownMarker, spec.Target+"/"+spec.Feature)
+			}
+			if _, err := json.Marshal(res.Row); err != nil {
+				t.Errorf("row does not marshal: %v", err)
+			}
+		})
+	}
+}
+
+// Every store failure used to return Result{}: no row, no marker, and any
+// graduated finding gone — the spec vanished from the digest and its trend
+// resolved, with nothing but a log line. Now each early error path returns an
+// explicit unknown row + marker (and the held Unknown finding when the
+// crossing is still readable), alongside the error for the caller to log.
+func TestEvalStoreErrorIsAnUnknownRowNotAVanishing(t *testing.T) {
+	t.Run("broken write path keeps the held finding", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.db")
+		s, err := baseline.Open(path)
+		if err != nil {
+			t.Fatalf("baseline.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		spec := quantileSpec()
+		at, graduated := graduate(t, s, spec)
+
+		raw, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatalf("raw open: %v", err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(`DROP TABLE features`); err != nil {
+			t.Fatalf("drop features: %v", err)
+		}
+
+		res, err := tier2.Eval(at.Add(5*time.Minute), spec, okSignal(0.95), s)
+		if err == nil {
+			t.Fatal("err = nil, want the store failure surfaced for the caller to log")
+		}
+		if res.Row == nil || res.Row.Status != contract.StatusUnknown {
+			t.Fatalf("Row = %+v, want an explicit unknown row", res.Row)
+		}
+		if res.UnknownMarker != spec.Target+"/"+spec.Feature {
+			t.Errorf("UnknownMarker = %q, want %q", res.UnknownMarker, spec.Target+"/"+spec.Feature)
+		}
+		if res.Finding == nil || res.Finding.State != contract.StateUnknown || res.Finding.Fingerprint != graduated.Fingerprint {
+			t.Errorf("Finding = %+v, want the graduated trend held as Unknown", res.Finding)
+		}
+	})
+	t.Run("closed store still yields the unknown row", func(t *testing.T) {
+		s := openStore(t)
+		spec := quantileSpec()
+		spec.Digest = false // an unknown row surfaces regardless
+		s.Close()
+		res, err := tier2.Eval(t0, spec, okSignal(0.5), s)
+		if err == nil {
+			t.Fatal("err = nil on a closed store")
+		}
+		if res.Row == nil || res.Row.Status != contract.StatusUnknown || res.UnknownMarker == "" {
+			t.Errorf("Result = %+v, want an unknown row + marker", res)
+		}
+		if res.Finding != nil {
+			t.Errorf("Finding = %+v, want nil (no readable crossing)", res.Finding)
+		}
+	})
 }

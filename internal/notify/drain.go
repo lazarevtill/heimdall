@@ -2,7 +2,9 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"time"
 
@@ -10,6 +12,15 @@ import (
 	"github.com/lazarevtill/heimdall/internal/suppress"
 	"github.com/lazarevtill/heimdall/internal/telegram"
 )
+
+// DefaultCallTimeout bounds every single outbound call on the notifier's
+// delivery and control path: one sink Send, one answerCallbackQuery, one
+// Alertmanager request. The daemon runs on a background context and its
+// shared HTTP client deliberately has no client-wide Timeout (that would
+// cut the Telegram long-poll), so without a per-call deadline one endpoint
+// that accepts the connection and never answers wedged the whole loop —
+// every other sink, the poller and the heartbeat with it.
+const DefaultCallTimeout = 15 * time.Second
 
 // TelegramSender is the subset of *telegram.Client the notifier needs, so
 // tests inject a fake instead of driving a real Bot API.
@@ -38,6 +49,14 @@ type Deps struct {
 	// deployment that has not yet been given a sinks file keeps working
 	// unchanged instead of silently delivering nothing.
 	Routes Routes
+	// CallTimeout is the deadline for each sink Send and each
+	// answerCallbackQuery; <= 0 means DefaultCallTimeout.
+	CallTimeout time.Duration
+	// Backoff, when set, carries a sink's server-imposed retry_after across
+	// drain passes, so a throttled sink is left alone until it has elapsed
+	// rather than retried on the next cycle. nil still benches a throttled
+	// sink for the rest of the current pass.
+	Backoff *SinkBackoff
 }
 
 // resolveRoutes returns d.Routes, or the Telegram-only default when unset.
@@ -48,10 +67,99 @@ func (d Deps) resolveRoutes() Routes {
 	return DefaultTelegramRoutes(d.TG, d.MainChatID, d.AnalystChatID)
 }
 
+// callTimeout resolves d.CallTimeout's default.
+func (d Deps) callTimeout() time.Duration {
+	if d.CallTimeout > 0 {
+		return d.CallTimeout
+	}
+	return DefaultCallTimeout
+}
+
 // SinkOutcome is one sink's tally for a drain pass.
+//
+// Failed counts sends the sink actually refused; Skipped counts deliveries
+// not attempted this pass because the sink was benched (see Drain). Err is
+// the FIRST error of the pass — the refusal's reason, or why the sink was
+// benched — kept so the daemon can log what went wrong rather than a bare
+// count. This package does not log; cmd/ does, through contract.Safe.
 type SinkOutcome struct {
 	Delivered int
 	Failed    int
+	Skipped   int
+	Err       error
+}
+
+// SinkBackoff remembers, across drain passes, sinks that told the notifier
+// when they will accept again (Telegram's 429 parameters.retry_after). It
+// holds deadlines computed from the injected now — this package never
+// reads the clock. Not safe for concurrent use: the notifier's single loop
+// goroutine owns it. A nil *SinkBackoff is valid and remembers nothing.
+type SinkBackoff struct {
+	until map[string]time.Time
+}
+
+// NewSinkBackoff returns an empty SinkBackoff.
+func NewSinkBackoff() *SinkBackoff { return &SinkBackoff{until: map[string]time.Time{}} }
+
+// heldUntil reports whether sinkID is still inside a retry_after window at
+// now, forgetting a window that has elapsed.
+func (b *SinkBackoff) heldUntil(sinkID string, now time.Time) (time.Time, bool) {
+	if b == nil {
+		return time.Time{}, false
+	}
+	until, ok := b.until[sinkID]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !now.Before(until) {
+		delete(b.until, sinkID)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// hold extends sinkID's window to until (never shortens it).
+func (b *SinkBackoff) hold(sinkID string, until time.Time) {
+	if b == nil {
+		return
+	}
+	if until.After(b.until[sinkID]) {
+		b.until[sinkID] = until
+	}
+}
+
+// retryAfterer is implemented by a transport error carrying a
+// server-imposed backoff (*telegram.APIError on a 429).
+type retryAfterer interface {
+	RetryAfter() time.Duration
+}
+
+// benches reports whether a send failure means the SINK is unusable right
+// now — unreachable, timed out, throttled, or failing server-side — as
+// opposed to a server that answered and refused this one message.
+//
+// Only the former benches the sink for the rest of the pass. Retrying an
+// unusable sink for every pending entry multiplies the timeouts (a hung
+// endpoint would cost one full CallTimeout PER PENDING ENTRY, every pass)
+// and the hammering.
+// But benching on a plain refusal would be a trap: Pending is oldest-first,
+// so a message the sink will never accept is the first one tried on every
+// pass, and benching on it would starve every entry queued behind it,
+// forever. A refusal is fast, so retrying the rest costs little.
+func benches(err error) bool {
+	var netErr net.Error // every net/http transport error, and a per-call deadline
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var ra retryAfterer
+	if errors.As(err, &ra) && ra.RetryAfter() > 0 {
+		return true
+	}
+	var apiErr *telegram.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == 429 || apiErr.StatusCode >= 500
+	}
+	return false
 }
 
 // DrainResult reports one drain pass.
@@ -72,19 +180,26 @@ type DrainResult struct {
 // routed for its channel, then stamps sent_at once all of them have taken
 // it.
 //
-// Delivery is per-sink idempotent: an entry already recorded in
+// Delivery is AT-LEAST-ONCE per sink. An entry already recorded in
 // notify_delivery for a sink is skipped, so a retry after a partial failure
-// re-sends ONLY to the sinks that refused. Telegram never receives a
-// duplicate because Gotify was down.
+// re-sends ONLY to the sinks that refused — Telegram never receives a
+// duplicate because Gotify was down. But the delivery row is written AFTER
+// the send succeeds: a crash, or a failed MarkDelivered, between the two
+// means the next pass sends that entry to that sink again. That is the
+// deliberate direction to fail — a duplicate alert, never a lost one.
 //
-// Failure handling is per-sink and non-blocking, preserving the original
-// contract: a send failure is counted and the entry is LEFT undischarged so
-// the next pass retries it — one bad sink never blocks the others and never
-// loses a message. Reading Pending or writing a delivery/sent mark is a
-// genuine STORE fault rather than a delivery fault and is returned
-// immediately (fail-fast, matching internal/bridge's sweep idiom): a
-// message that was actually sent but whose mark failed to write is a bug
-// worth surfacing loudly, not silently retrying — which would re-send it.
+// Failure handling is per-sink and non-blocking: a send failure is counted
+// and the entry is LEFT undischarged so the next pass retries it — one bad
+// sink never blocks the others and never loses a message. Every Send runs
+// under its own deadline (Deps.CallTimeout), so a hung sink cannot stall the
+// pass. A sink whose failure means it is unusable right now (see benches) is
+// not attempted again for the rest of the pass, and one that answered with
+// a retry_after is additionally left alone across passes until it elapses
+// (Deps.Backoff); its skipped deliveries are counted in SinkOutcome.Skipped.
+//
+// Reading Pending or writing a delivery/sent mark is a genuine STORE fault
+// rather than a delivery fault and is returned immediately (fail-fast,
+// matching internal/bridge's sweep idiom), alongside the tally so far.
 //
 // limit bounds the batch (limit<=0 drains everything pending).
 func Drain(ctx context.Context, now time.Time, d Deps, limit int) (DrainResult, error) {
@@ -96,6 +211,17 @@ func Drain(ctx context.Context, now time.Time, d Deps, limit int) (DrainResult, 
 	}
 
 	result := DrainResult{PerSink: map[string]SinkOutcome{}}
+
+	// benched is the set of sinks not to attempt again this pass, with the
+	// reason recorded against each skipped delivery. A sink still inside a
+	// retry_after window from an earlier pass starts benched.
+	benched := map[string]error{}
+	for _, s := range routes.All() {
+		if until, held := d.Backoff.heldUntil(s.ID(), now); held {
+			benched[s.ID()] = fmt.Errorf("notify: sink %s: in retry_after backoff until %s", s.ID(), until.UTC().Format(time.RFC3339))
+		}
+	}
+
 	for _, e := range entries {
 		sinks := routes.SinksFor(e.Channel)
 		if len(sinks) == 0 {
@@ -108,22 +234,39 @@ func Drain(ctx context.Context, now time.Time, d Deps, limit int) (DrainResult, 
 
 		allDelivered := true
 		for _, s := range sinks {
-			already, err := d.Outbox.DeliveredTo(e.ID, s.ID())
+			id := s.ID()
+			already, err := d.Outbox.DeliveredTo(e.ID, id)
 			if err != nil {
 				return result, fmt.Errorf("notify: drain: delivery lookup: %w", err)
 			}
 			if already {
 				continue
 			}
-			if err := s.Send(ctx, e); err != nil {
+			if reason, ok := benched[id]; ok {
 				allDelivered = false
-				bump(result.PerSink, s.ID(), false)
+				tally(result.PerSink, id, func(o *SinkOutcome) { o.Skipped++ }, reason)
 				continue
 			}
-			if err := d.Outbox.MarkDelivered(now, e.ID, s.ID()); err != nil {
+
+			sendCtx, cancel := context.WithTimeout(ctx, d.callTimeout())
+			err = s.Send(sendCtx, e)
+			cancel()
+			if err != nil {
+				allDelivered = false
+				tally(result.PerSink, id, func(o *SinkOutcome) { o.Failed++ }, err)
+				if benches(err) {
+					benched[id] = err
+				}
+				var ra retryAfterer
+				if errors.As(err, &ra) && ra.RetryAfter() > 0 {
+					d.Backoff.hold(id, now.Add(ra.RetryAfter()))
+				}
+				continue
+			}
+			if err := d.Outbox.MarkDelivered(now, e.ID, id); err != nil {
 				return result, fmt.Errorf("notify: drain: mark delivered %d: %w", e.ID, err)
 			}
-			bump(result.PerSink, s.ID(), true)
+			tally(result.PerSink, id, func(o *SinkOutcome) { o.Delivered++ }, nil)
 		}
 
 		if !allDelivered {
@@ -138,13 +281,13 @@ func Drain(ctx context.Context, now time.Time, d Deps, limit int) (DrainResult, 
 	return result, nil
 }
 
-// bump records one delivery outcome against a sink's tally.
-func bump(m map[string]SinkOutcome, id string, ok bool) {
+// tally applies one outcome to a sink's SinkOutcome, keeping the FIRST
+// non-nil error of the pass.
+func tally(m map[string]SinkOutcome, id string, apply func(*SinkOutcome), err error) {
 	o := m[id]
-	if ok {
-		o.Delivered++
-	} else {
-		o.Failed++
+	apply(&o)
+	if o.Err == nil && err != nil {
+		o.Err = err
 	}
 	m[id] = o
 }
@@ -174,12 +317,24 @@ type SinkBacklog struct {
 // (Seconds 0), so the series always exists. Results are ordered by
 // (sink, channel) for deterministic rendering.
 func Backlogs(now time.Time, d Deps) ([]SinkBacklog, error) {
-	routes := d.resolveRoutes()
+	return BacklogsForRouting(now, d.Outbox, d.resolveRoutes().Routing())
+}
+
+// BacklogsForRouting is Backlogs for a caller that holds only the routing
+// TOPOLOGY (SinksFile.Routing, DefaultTelegramRouting) and no live sinks —
+// the console, which must be able to show per-sink backlogs without ever
+// holding a sink credential. Same contract as Backlogs.
+func BacklogsForRouting(now time.Time, ob *outbox.Store, routing Routing) ([]SinkBacklog, error) {
+	ids := make([]string, 0, len(routing))
+	for id := range routing {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
 
 	var out []SinkBacklog
-	for _, s := range routes.All() {
-		channels := routes.ChannelsFor(s.ID())
-		oldest, err := d.Outbox.OldestPendingByChannel(s.ID(), channels)
+	for _, id := range ids {
+		channels := routing[id]
+		oldest, err := ob.OldestPendingByChannel(id, channels)
 		if err != nil {
 			return nil, fmt.Errorf("notify: backlogs: %w", err)
 		}
@@ -194,7 +349,7 @@ func Backlogs(now time.Time, d Deps) ([]SinkBacklog, error) {
 					seconds = int64(age.Seconds())
 				}
 			}
-			out = append(out, SinkBacklog{SinkID: s.ID(), Channel: c, Seconds: seconds})
+			out = append(out, SinkBacklog{SinkID: id, Channel: c, Seconds: seconds})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

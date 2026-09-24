@@ -97,6 +97,23 @@ func (r Routes) ChannelsFor(sinkID string) []outbox.Channel {
 	return out
 }
 
+// Routing is the credential-free view of a routing configuration: each sink
+// id mapped to the channels it is routed for, channels sorted. It carries
+// no sink, client or secret — only the topology — so a process that merely
+// DISPLAYS delivery state (the console) can hold it without holding any
+// credential. Produced by SinksFile.Routing, DefaultTelegramRouting and
+// Routes.Routing; consumed by BacklogsForRouting.
+type Routing map[string][]outbox.Channel
+
+// Routing returns r's topology.
+func (r Routes) Routing() Routing {
+	out := make(Routing)
+	for _, s := range r.All() {
+		out[s.ID()] = r.ChannelsFor(s.ID())
+	}
+	return out
+}
+
 // ── Telegram ────────────────────────────────────────────────────────────
 
 // TelegramSink delivers to Telegram with the channel-appropriate inline

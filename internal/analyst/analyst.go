@@ -3,8 +3,8 @@ package analyst
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -20,13 +20,50 @@ type Analyzer interface {
 }
 
 // Poster delivers ONE vetted, wrapper-fingerprinted hypothesis to the
-// bridge. HTTPPoster (poster.go) is the real implementation; tests inject a
-// fake. DryRun does not need a distinct no-op implementation: Run itself
-// short-circuits posting entirely when Params.DryRun is true (step 10), so
-// main can always construct the real HTTPPoster and let DryRun govern
-// whether it is ever called.
+// bridge and reports what the bridge did with it. HTTPPoster (poster.go) is
+// the real implementation; tests inject a fake. DryRun does not need a
+// distinct no-op implementation: Run itself short-circuits posting entirely
+// when Params.DryRun is true (step 10), so main can always construct the
+// real HTTPPoster and let DryRun govern whether it is ever called.
+//
+// A nil error MUST come with a known Delivery; Run treats anything else as a
+// failed POST rather than guess.
 type Poster interface {
-	Post(ctx context.Context, runID string, h contract.HypothesisFinding) error
+	Post(ctx context.Context, runID string, h contract.HypothesisFinding) (Delivery, error)
+}
+
+// Delivery is what the bridge reported doing with one accepted POST. The
+// zero value is deliberately not a Delivery.
+type Delivery int
+
+const (
+	// DeliveryEnqueued: the bridge routed the hypothesis to the analyst
+	// channel as a NEW message. Only this counts as Posted.
+	DeliveryEnqueued Delivery = iota + 1
+	// DeliveryDeduped: the bridge already held this hyp_fp and sent nothing
+	// new. The hypothesis is accepted (the bridge has it, so the cooldown
+	// starts) but it is not a delivery, and counting it as one would make
+	// the posted counter claim messages nobody received.
+	DeliveryDeduped
+	// DeliverySuppressed: the bridge accepted it and deliberately sent
+	// nothing, because an operator has an active hypothesis-scope mute on
+	// this hyp_fp (the [Not useful] button, or a declarative record). That
+	// is the mute working, not a failed POST: counted apart from both, and
+	// the cooldown starts, so a muted hypothesis is not re-posted every run.
+	DeliverySuppressed
+)
+
+func (d Delivery) String() string {
+	switch d {
+	case DeliveryEnqueued:
+		return "enqueued"
+	case DeliveryDeduped:
+		return "deduped"
+	case DeliverySuppressed:
+		return "suppressed"
+	default:
+		return fmt.Sprintf("Delivery(%d)", int(d))
+	}
 }
 
 // maxBoundedItems caps Targets/SuggestedQuery/EvidenceRows slice lengths
@@ -51,14 +88,24 @@ type Params struct {
 // Outcome reports what one Run did, for the heartbeat counters.
 type Outcome struct {
 	Run               contract.AnalystRun // what was persisted
-	Posted            int
-	Hallucinated      int // dropped: cited a nonexistent (or zero) evidence row_id
-	InvalidDropped    int // dropped: bad kind/confidence
-	Deduped           int // dropped: within cooldown
-	CapDropped        int // dropped: over MaxPerRun
-	RedactionFailures int // llm-call + egress redaction failures summed
+	Posted            int                 // the bridge enqueued it as a NEW message
+	BridgeDeduped     int                 // accepted, but the bridge already held this hyp_fp
+	BridgeSuppressed  int                 // accepted, but an operator's hypothesis mute held it back
+	PostFailed        int                 // the bridge did not accept it; eligible again next run
+	Hallucinated      int                 // dropped: cited a nonexistent (or zero) evidence row_id
+	InvalidDropped    int                 // dropped: bad kind/confidence
+	Deduped           int                 // dropped: within cooldown, or a repeat of an earlier hyp_fp in this run
+	CapDropped        int                 // dropped: over MaxPerRun
+	RedactionFailures int                 // llm-call + egress redaction failures summed
 	PromptTokens      int
 	CompletionTokens  int
+
+	// Errors are the run's NON-FATAL failures — a POST the bridge did not
+	// accept, a cooldown bookkeeping write that failed — returned for the
+	// caller to log. This package never logs (docs/DEVELOPING.md): writing
+	// them to stderr from here bypassed the binary's log prefix and its
+	// contract.Safe scrubbing of error text.
+	Errors []error
 }
 
 // confidenceRank orders survivors high->medium->low for the deterministic
@@ -95,6 +142,64 @@ func boundSlice(ss []string, max int) []string {
 	return out
 }
 
+// uniqueSorted returns the distinct values of ss in ascending order, as a new
+// slice. evidence_rows pass through it BEFORE the slice bound, so which rows
+// are kept — and the hyp_fp computed from them — depend only on the set the
+// model cited, never on its ordering or repetition.
+func uniqueSorted(ss []string) []string {
+	seen := make(map[string]struct{}, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// wireOutput mirrors contract.AnalystOutput with pointer fields, so that a
+// MISSING required key is distinguishable from its zero value. Decoding
+// straight into contract.AnalystOutput made `{}` and `null` indistinguishable
+// from a well-formed empty answer.
+type wireOutput struct {
+	SchemaVersion  *int                          `json:"schema_version"`
+	NothingNotable *bool                         `json:"nothing_notable"`
+	Findings       *[]contract.HypothesisFinding `json:"findings"`
+}
+
+// decodeOutput decodes the model's reply and checks it has the schema's
+// top-level shape: every required key present (findings as an array, not
+// null) and schema_version == 1. The server is supposed to enforce the
+// schema; this is where the wrapper finds out that it did not (a llama.cpp
+// build that ignores response_format, a model that answered `{}`). Without
+// it, such a reply read as a clean, empty run: the only sanctioned all-clear
+// is an explicit nothing_notable:true with an empty findings array
+// (contract.AnalystOutput).
+func decodeOutput(content []byte) (contract.AnalystOutput, error) {
+	var w wireOutput
+	if err := json.Unmarshal(content, &w); err != nil {
+		return contract.AnalystOutput{}, err
+	}
+	switch {
+	case w.SchemaVersion == nil:
+		return contract.AnalystOutput{}, errors.New(`required field "schema_version" is missing`)
+	case w.NothingNotable == nil:
+		return contract.AnalystOutput{}, errors.New(`required field "nothing_notable" is missing`)
+	case w.Findings == nil:
+		return contract.AnalystOutput{}, errors.New(`required field "findings" is missing or null`)
+	case *w.SchemaVersion != 1:
+		return contract.AnalystOutput{}, fmt.Errorf("schema_version = %d, want 1", *w.SchemaVersion)
+	}
+	return contract.AnalystOutput{
+		SchemaVersion:  *w.SchemaVersion,
+		NothingNotable: *w.NothingNotable,
+		Findings:       *w.Findings,
+	}, nil
+}
+
 // Run executes one analyst cycle: health-gate the LLM, ask it for
 // hypotheses over the digest, then verify/fingerprint/dedup/cap/redact in Go
 // before persisting and (unless DryRun) posting. persist is called with the
@@ -102,8 +207,10 @@ func boundSlice(ss []string, max int) []string {
 // returns its error before posting anything.
 //
 // Run returns a non-nil error ONLY for hard failures: the health gate, the
-// LLM call, decoding the model's output, marshaling the digest, or persist.
-// Per-finding drops are counted in Outcome, never returned as errors. A
+// LLM call, decoding the model's output (or an output outside the schema's
+// shape), marshaling the digest, or persist. Per-finding drops are counted in
+// Outcome, never returned as errors, and POST-stage failures are collected in
+// Outcome.Errors for the caller to log. A
 // failure in the analyst's OWN dedup store (RecentlyPosted) is also treated
 // as a hard failure and returned BEFORE persist — nothing has been posted or
 // persisted yet at that point, so failing closed here costs nothing beyond
@@ -125,14 +232,17 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 		return Outcome{}, fmt.Errorf("analyst: health gate: %w", err)
 	}
 
-	// 2. Marshal the digest and ask the model for hypotheses.
+	// 2. Marshal the digest and ask the model for hypotheses. The digest
+	// travels as UserJSON, so the LLM egress redacts it one string at a
+	// time; redacting it as one serialized string let a pattern match
+	// across field boundaries and splice rows together.
 	digestJSON, err := json.Marshal(p.Digest)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("analyst: marshal digest: %w", err)
 	}
 	res, err := a.Analyze(ctx, llm.Request{
 		System:     p.SystemPrompt,
-		User:       string(digestJSON),
+		UserJSON:   digestJSON,
 		SchemaName: p.SchemaName,
 		Schema:     p.Schema,
 		MaxTokens:  p.MaxTokens,
@@ -145,10 +255,11 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 	out.CompletionTokens = res.CompletionTokens
 
 	// 3. Decode the strict-schema response. The schema is supposed to
-	// guarantee valid JSON; a decode failure here is a real, visible
-	// failure, not a per-finding drop.
-	var aout contract.AnalystOutput
-	if err := json.Unmarshal(res.Content, &aout); err != nil {
+	// guarantee valid JSON of the right shape; a decode failure, or a reply
+	// missing a required key or carrying the wrong schema_version, is a
+	// real, visible failure, not a per-finding drop.
+	aout, err := decodeOutput(res.Content)
+	if err != nil {
 		return Outcome{}, fmt.Errorf("analyst: decode analyst output: %w", err)
 	}
 
@@ -189,13 +300,12 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 				continue
 			}
 
-			// 6c. bound free text and slice lengths. The model does not get
-			// to hand the wrapper unbounded data just because its evidence
-			// checked out. suggested_check stays opaque text: it is never
-			// parsed or executed anywhere (invariant 10).
-			f.Hypothesis = truncateRunes(f.Hypothesis, contract.HypMaxText)
-			f.SuggestedCheck = truncateRunes(f.SuggestedCheck, contract.HypMaxText)
-			f.EvidenceRows = boundSlice(f.EvidenceRows, maxBoundedItems)
+			// 6c. bound slice lengths. The model does not get to hand the
+			// wrapper unbounded data just because its evidence checked
+			// out. evidence_rows are made canonical (distinct, sorted)
+			// BEFORE the bound, so the rows kept are a function of the set
+			// the model cited, not of its ordering or repetition.
+			f.EvidenceRows = boundSlice(uniqueSorted(f.EvidenceRows), maxBoundedItems)
 			f.Targets = boundSlice(f.Targets, maxBoundedItems)
 			f.SuggestedQuery = boundSlice(f.SuggestedQuery, maxBoundedItems)
 
@@ -205,39 +315,42 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 			f.Fingerprint = contract.HypFingerprint(f.EvidenceRows)
 
 			// 6e. fail-closed redaction at the egress, every free-text
-			// field (invariant 6). A redaction failure withholds that one
-			// field's text but the hypothesis still flows (content-fail
-			// closed / signal-fail-open) — each failure is counted into the
-			// same total the heartbeat surfaces.
-			var failed bool
-			f.Hypothesis, failed = contract.EvidenceOrWithheld(f.Hypothesis)
-			if failed {
-				out.RedactionFailures++
-			}
-			f.SuggestedCheck, failed = contract.EvidenceOrWithheld(f.SuggestedCheck)
-			if failed {
-				out.RedactionFailures++
-			}
-			for i, tgt := range f.Targets {
-				f.Targets[i], failed = contract.EvidenceOrWithheld(tgt)
+			// field (invariant 6), and only THEN the rune bound: truncating
+			// first could cut a secret's tail and leave a head too short
+			// for its pattern to recognise (contract.EvidenceOrWithheld).
+			// Truncating redacted text can at worst clip a marker.
+			// suggested_check stays opaque text: it is never parsed or
+			// executed anywhere (invariant 10). A redaction failure
+			// withholds that one field's text but the hypothesis still
+			// flows (content-fail-closed / signal-fail-open) — each failure
+			// is counted into the same total the heartbeat surfaces.
+			redact := func(s string) string {
+				r, failed := contract.EvidenceOrWithheld(s)
 				if failed {
 					out.RedactionFailures++
 				}
+				return r
+			}
+			f.Hypothesis = truncateRunes(redact(f.Hypothesis), contract.HypMaxText)
+			f.SuggestedCheck = truncateRunes(redact(f.SuggestedCheck), contract.HypMaxText)
+			for i, tgt := range f.Targets {
+				f.Targets[i] = redact(tgt)
 			}
 			for i, q := range f.SuggestedQuery {
-				f.SuggestedQuery[i], failed = contract.EvidenceOrWithheld(q)
-				if failed {
-					out.RedactionFailures++
-				}
+				f.SuggestedQuery[i] = redact(q)
 			}
 
 			vetted = append(vetted, f)
 		}
 	}
 
-	// 7. Dedup: drop anything posted within the cooldown window. In DryRun
-	// this still queries the store (so Deduped stays an honest count) but
-	// nothing is ever recorded (step 10 short-circuits before RecordPosted).
+	// 7. Dedup: drop a repeat of a hyp_fp already seen earlier in THIS run
+	// (two wordings citing the same rows are one hypothesis; the first, in
+	// the model's order, is kept — without this both took a MaxPerRun slot
+	// and the bridge silently collapsed the second), then anything posted
+	// within the cooldown window. In DryRun this still queries the store (so
+	// Deduped stays an honest count) but nothing is ever recorded (step 10
+	// short-circuits before RecordPosted).
 	//
 	// A store error here is treated as a hard failure: nothing has been
 	// persisted or posted yet, so returning now costs nothing beyond a
@@ -246,7 +359,13 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 	// "recent" (which would silently drop a real hypothesis with no visible
 	// cause).
 	var deduped []contract.HypothesisFinding
+	seen := make(map[string]struct{}, len(vetted))
 	for _, f := range vetted {
+		if _, dup := seen[f.Fingerprint]; dup {
+			out.Deduped++
+			continue
+		}
+		seen[f.Fingerprint] = struct{}{}
 		recent, err := store.RecentlyPosted(p.Now, f.Fingerprint, p.Cooldown)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("analyst: dedup check %s: %w", f.Fingerprint, err)
@@ -300,19 +419,36 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 		return out, nil
 	}
 	for _, f := range survivors {
-		if err := poster.Post(ctx, p.RunID, f); err != nil {
-			// Log-and-continue: the run is already persisted (invariant 7),
-			// so a single bridge/network failure loses nothing — the
-			// persisted file is itself the retry path (an operator or a
-			// future run can replay it), and one POST failing must not
-			// abort delivery of the other, unrelated survivors in the same
-			// run. Do NOT RecordPosted for a failed Post, so it is eligible
-			// to post again next cycle instead of silently vanishing behind
-			// a phantom cooldown.
-			fmt.Fprintf(os.Stderr, "analyst: post %s: %v\n", f.Fingerprint, err)
+		delivery, err := poster.Post(ctx, p.RunID, f)
+		if err == nil && delivery != DeliveryEnqueued && delivery != DeliveryDeduped && delivery != DeliverySuppressed {
+			err = fmt.Errorf("poster reported no delivery outcome (%v)", delivery)
+		}
+		if err != nil {
+			// Count-and-continue: the run is already persisted (invariant
+			// 7), so a single bridge/network failure loses nothing, and one
+			// POST failing must not abort delivery of the other, unrelated
+			// survivors in the same run. It is COUNTED (PostFailed, which
+			// the heartbeat exports) and handed back for the caller to log:
+			// a bridge that refuses every POST must not look like a quiet
+			// model. Do NOT RecordPosted for a failed Post, so it is
+			// eligible to post again next cycle instead of silently
+			// vanishing behind a phantom cooldown.
+			out.PostFailed++
+			out.Errors = append(out.Errors, fmt.Errorf("analyst: post %s: %w", f.Fingerprint, err))
 			continue
 		}
-		out.Posted++
+		switch delivery {
+		case DeliveryEnqueued:
+			out.Posted++
+		case DeliveryDeduped:
+			out.BridgeDeduped++
+		default:
+			out.BridgeSuppressed++
+		}
+		// Every accepted outcome means the bridge now holds (or has
+		// deliberately refused) this hyp_fp, so the cooldown starts either
+		// way; re-POSTing a deduped or muted hypothesis every run would
+		// only spend MaxPerRun slots on something nobody will be sent.
 		if err := store.RecordPosted(p.Now, f.Fingerprint); err != nil {
 			// The POST already succeeded — the bridge has the hypothesis.
 			// Failing the whole Run here would misreport a successful
@@ -321,8 +457,9 @@ func Run(ctx context.Context, a Analyzer, store *Store, poster Poster,
 			// The only cost of losing this bookkeeping write is one
 			// possible duplicate POST next cycle, which is bounded by the
 			// same gates and MaxPerRun cap — strictly preferable to a false
-			// failure. Log and continue, same as a Post error above.
-			fmt.Fprintf(os.Stderr, "analyst: record posted %s: %v\n", f.Fingerprint, err)
+			// failure. Collected for the caller to log, same as a Post
+			// error above.
+			out.Errors = append(out.Errors, fmt.Errorf("analyst: record posted %s: %w", f.Fingerprint, err))
 		}
 	}
 	return out, nil

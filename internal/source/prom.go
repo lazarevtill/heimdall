@@ -74,12 +74,25 @@ type promResult struct {
 	Value  [2]json.RawMessage `json:"value"` // [unix_ts, "value-string"]
 }
 
+// value parses the sample value. NaN and ±Inf parse cleanly as floats but are
+// rejected here: they are "unmeasurable", not measurements. NaN makes every
+// comparison false (a Threshold sum over it silently reads as ok) and ±Inf
+// cannot be JSON-encoded into the digest, so letting either through turns one
+// bad sample into a silent ok or a failed run. histogram_quantile over an
+// idle series and a ratio over a zero denominator both produce them.
 func (r promResult) value() (float64, error) {
 	var s string
 	if err := json.Unmarshal(r.Value[1], &s); err != nil {
 		return 0, fmt.Errorf("sample value: %w", err)
 	}
-	return strconv.ParseFloat(s, 64)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if !finite(v) {
+		return 0, fmt.Errorf("non-finite sample value %q", s)
+	}
+	return v, nil
 }
 
 // once returns status 0 for transport-level failures.
