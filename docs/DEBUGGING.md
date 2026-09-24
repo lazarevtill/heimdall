@@ -270,10 +270,31 @@ sqlite3 /var/lib/heimdall/bridge.db \
 ```
 
 - **No ticket** → is the storm fuse tripped? The bridge caps issues per hour
-  (default 10). Check the console's Tickets page or count recent `opened_at`.
+  (default 10). Check the console's Tickets page, count recent `opened_at`,
+  or read `heimdall_bridge_storm_fused_total`. Otherwise read the bridge's
+  log for the refusal:
+  - `401`: the bearer token is missing or wrong (Alertmanager's
+    `http_config.authorization`, or the analyst's `HEIMDALL_BRIDGE_TOKEN`);
+  - `415`: the request is not `application/json`;
+  - `413`: the body is over 1 MB;
+  - `400`: the payload is malformed, or an alert's `group`/`check` does not
+    match `groupLabels`;
+  - `503`: another reconcile held the lock past this one's deadline.
+    Alertmanager retries it.
+
+  `HeimdallBridgeUnreachable` fires when Alertmanager's deliveries keep
+  failing.
+- **A group fired again but the old ticket stayed closed** → by design. A
+  firing after the ticket was resolved is a new episode and gets a new
+  ticket.
 - **A ticket did not close** → it closes only when the **whole group**
   resolves *and* the issue still carries its own `heimdall-auto` tag. Removing
-  that tag by hand deliberately hands ownership to a human.
+  that tag by hand deliberately hands ownership to a human. A delivery with
+  `truncatedAlerts > 0` never closes anything, because it cannot prove the
+  whole group resolved.
+- **The escalation sweep is failing** → `HeimdallBridgeSweepStale`. The sweep
+  carries on past a failing issue and counts it in
+  `heimdall_bridge_escalation_errors_total`. The log names the issue.
 - **Duplicate tickets** → the marker is the identity. One issue per
   `(group, check)`, keyed by `[hb:<group>--<check>]`. Two tickets means two
   markers.
@@ -355,6 +376,8 @@ suppression authority, so mutes expire on their own.
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
 | `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
+| `heimdall_bridge_sweep_last_success_timestamp_seconds` | bridge escalation sweep completed cleanly |
+| `heimdall_bridge_storm_fused_total` / `heimdall_bridge_escalation_errors_total` | issues held back by the storm fuse / escalations that failed |
 | `heimdall_notifier_last_poll_success_timestamp_seconds` | last successful Telegram poll (0 = none since start) |
 | `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` | per-destination backlog age |
 | `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle |
@@ -362,12 +385,16 @@ suppression authority, so mutes expire on their own.
 | `heimdall_digest_generated_timestamp_seconds` | digest freshness |
 | `heimdall_finding{check,target,...}` | 1 while firing or unknown |
 
-The bridge has **no heartbeat metric** — its liveness is `/healthz` only. The
-console probes it when `HEIMDALL_UI_BRIDGE_HEALTHZ_URL` is set and reports it
-*absent* rather than healthy when unset. Nothing scrapes it; instead
-`HeimdallBridgeUnreachable` watches it from the sending side, firing when
-Alertmanager's webhook deliveries keep failing. That alert must be routed to a
-receiver that does not go through the bridge (see SETUP.md, the meta-rules).
+The bridge's heartbeat is
+`heimdall_bridge_sweep_last_success_timestamp_seconds` in
+`heimdall-bridge.prom`. It advances on every escalation sweep (every 15 min)
+that completes without errors (`HeimdallBridgeSweepStale` /
+`HeimdallBridgeAbsent`). That proves the process and its sweep are alive, not
+that Alertmanager can reach it. `HeimdallBridgeUnreachable` covers that from
+the sending side, firing when Alertmanager's webhook deliveries keep failing.
+It must be routed to a receiver that does not go through the bridge (see
+SETUP.md, the meta-rules). The console also probes `/healthz` when
+`HEIMDALL_UI_BRIDGE_HEALTHZ_URL` is set.
 
 **`heimdall_redaction_failures_total > 0`** means the redactor failed and
 content was withheld rather than leaked. The finding still fires — content

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/lazarevtill/heimdall/internal/tracker"
 )
 
@@ -481,5 +483,136 @@ func TestOpenSetsAssignee(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("Open body missing SingleUserIssueCustomField Assignee; customFields=%v", body["customFields"])
+	}
+}
+
+// TestFindByMarkerQueryShape pins the live query: unresolved-only, marker
+// quoted as one phrase, scoped to the project, with an explicit page size.
+func TestFindByMarkerQueryShape(t *testing.T) {
+	marker := "[hb:disk--smart-fail]"
+	var gotQuery, gotTop string
+	y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("query")
+		gotTop = r.URL.Query().Get("$top")
+		w.Write([]byte(`[]`))
+	})
+	if _, err := y.FindByMarker(ctxWithDeadline(t), marker); err != nil {
+		t.Fatalf("FindByMarker: %v", err)
+	}
+	want := `project: ` + fakeProject + ` #Unresolved "` + marker + `"`
+	if diff := cmp.Diff(want, gotQuery); diff != "" {
+		t.Errorf("query mismatch (-want +got):\n%s", diff)
+	}
+	if gotTop != "100" {
+		t.Errorf("$top = %q, want 100", gotTop)
+	}
+}
+
+// TestFindByMarkerFiltersToExactUnresolved: the server's answer is never
+// trusted blindly. A resolved hit (past episode) and a hit that only SHARES
+// words with the marker must both be skipped; the exact unresolved one wins
+// regardless of its position, and none at all is (nil, nil).
+func TestFindByMarkerFiltersToExactUnresolved(t *testing.T) {
+	marker := "[hb:node--c1-deadman]"
+	resolvedExact := `{"idReadable":"HEIM-1","summary":"s","description":"d\n\n` + marker + `","resolved":1753000000000,"tags":[]}`
+	nearMiss := `{"idReadable":"HEIM-2","summary":"s","description":"node-a c1 deadman\n\n[hb:service--c1-deadman]","resolved":null,"tags":[]}`
+	prefixMiss := `{"idReadable":"HEIM-3","summary":"s","description":"[hb:node--c1-deadman-x]","tags":[]}`
+	exact := `{"idReadable":"HEIM-4","summary":"s","description":"d\n\n` + marker + `","resolved":null,"tags":[{"name":"heimdall-auto"}]}`
+
+	cases := []struct {
+		name   string
+		body   string
+		wantID string // "" = want (nil, nil)
+	}{
+		{"exact unresolved alone", `[` + exact + `]`, "HEIM-4"},
+		{"exact behind resolved and near misses", `[` + resolvedExact + `,` + nearMiss + `,` + prefixMiss + `,` + exact + `]`, "HEIM-4"},
+		{"only a resolved exact match", `[` + resolvedExact + `]`, ""},
+		{"only near misses", `[` + nearMiss + `,` + prefixMiss + `]`, ""},
+		{"empty", `[]`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(tc.body))
+			})
+			issue, err := y.FindByMarker(ctxWithDeadline(t), marker)
+			if err != nil {
+				t.Fatalf("FindByMarker: %v", err)
+			}
+			gotID := ""
+			if issue != nil {
+				gotID = issue.ID
+				if issue.Marker != marker || issue.Resolved {
+					t.Errorf("issue = %+v, want Marker=%q Resolved=false", issue, marker)
+				}
+			}
+			if diff := cmp.Diff(tc.wantID, gotID); diff != "" {
+				t.Errorf("issue id mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestFindByMarkerRejectsMalformedMarker: the marker is quoted into a
+// YouTrack query, so anything but one well-formed marker is refused before
+// any request is made.
+func TestFindByMarkerRejectsMalformedMarker(t *testing.T) {
+	for _, bad := range []string{``, `[hb:a"b]`, `[hb:x] OR project: OTHER`, `hb:x`, `[hb:UPPER]`} {
+		t.Run(bad, func(t *testing.T) {
+			y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("server called for malformed marker %q", bad)
+			})
+			if _, err := y.FindByMarker(ctxWithDeadline(t), bad); err == nil {
+				t.Fatalf("FindByMarker(%q): want error, got nil", bad)
+			}
+		})
+	}
+}
+
+// --- Get ---
+
+func TestGet(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		want    *tracker.Issue
+		wantErr bool
+	}{
+		{
+			name:   "unresolved",
+			status: http.StatusOK,
+			body:   `{"idReadable":"HEIM-7","summary":"s","description":"d\n\n[hb:g--c]","resolved":null,"customFields":[{"name":"State","value":{"name":"Open"}},{"name":"Assignee","value":{"login":"opsuser"}}],"tags":[{"name":"heimdall"}]}`,
+			want:   &tracker.Issue{ID: "HEIM-7", Summary: "s", State: "Open", Assignee: "opsuser", Tags: []string{"heimdall"}, Marker: "[hb:g--c]"},
+		},
+		{
+			name:   "resolved",
+			status: http.StatusOK,
+			body:   `{"idReadable":"HEIM-7","summary":"s","description":"[hb:g--c]","resolved":1753000000000,"customFields":[{"name":"State","value":{"name":"Fixed"}}],"tags":[]}`,
+			want:   &tracker.Issue{ID: "HEIM-7", Summary: "s", State: "Fixed", Tags: []string{}, Marker: "[hb:g--c]", Resolved: true},
+		},
+		{name: "not found is nil, nil", status: http.StatusNotFound, body: `{"error":"Not Found"}`},
+		{name: "server error is an error", status: http.StatusInternalServerError, body: `boom`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			y, _ := newTestYouTrack(t, func(w http.ResponseWriter, r *http.Request) {
+				assertAuth(t, r)
+				gotPath = r.URL.Path
+				w.WriteHeader(tc.status)
+				w.Write([]byte(tc.body))
+			})
+			got, err := y.Get(ctxWithDeadline(t), "HEIM-7")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Get: err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("issue mismatch (-want +got):\n%s", diff)
+			}
+			if gotPath != "/api/issues/HEIM-7" {
+				t.Errorf("path = %q, want /api/issues/HEIM-7", gotPath)
+			}
+		})
 	}
 }

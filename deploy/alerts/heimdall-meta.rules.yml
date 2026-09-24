@@ -135,6 +135,29 @@ groups:
           summary: "Alertmanager cannot deliver to the heimdall-bridge webhook"
           description: "Alertmanager's webhook deliveries have been failing for 10m. heimdall-bridge is down, unreachable, or refusing the requests (check its bearer token), so alerts are being detected and NOT reaching any sink or tracker. Check `curl <bridge>/healthz` and journalctl -u heimdall-bridge."
 
+      # heimdall-bridge's own heartbeat: its escalation sweep runs at start
+      # and every 15m, and advances this gauge only on a pass with no
+      # errors. Three missed passes pages. This proves the process and its
+      # sweep are alive; HeimdallBridgeUnreachable above is what proves
+      # Alertmanager can actually reach it.
+      - alert: HeimdallBridgeSweepStale
+        expr: time() - heimdall_bridge_sweep_last_success_timestamp_seconds > 2700
+        for: 5m
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall bridge escalation sweep has not completed cleanly in 45m"
+          description: "Either heimdall-bridge is down, or its escalation sweep keeps failing (heimdall_bridge_escalation_errors_total counts the failing issues and the bridge log names them). Long-firing critical groups are not being escalated. 0 means no clean sweep since the bridge started."
+      - alert: HeimdallBridgeAbsent
+        expr: absent(heimdall_bridge_sweep_last_success_timestamp_seconds)
+        labels:
+          severity: critical
+          source: heimdall-meta
+        annotations:
+          summary: "Heimdall bridge heartbeat series is absent"
+          description: "heimdall-bridge.prom is missing: the bridge is not running, HEIMDALL_TEXTFILE_DIR is not the directory node_exporter serves, or the file was deleted. Absence is never treated as ok."
+
       # ── Analyst liveness ─────────────────────────────────────────────
       # heimdall-analyst is a oneshot on a timer, and it writes its
       # heartbeat ONLY after a successful run: a dead or unhealthy LLM, an

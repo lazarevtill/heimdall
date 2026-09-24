@@ -28,7 +28,11 @@ file wins and the guide is wrong.
 - `cmd/heimdall-analyst` — Tier-3 oneshot: digest → health-gate LLM → analyze → verify/dedup/
   cap/redact → persist → POST `/hypothesis`.
 - `cmd/heimdall-bridge` — HTTP daemon: `/am` (Alertmanager webhook → YouTrack), `/hypothesis`,
-  `/healthz`; 15-min escalation sweep. `time.Now()` is allowed in `cmd/`.
+  `/healthz`; 15-min escalation sweep. Both POST routes require a bearer token
+  (`HEIMDALL_BRIDGE_TOKEN`) unless `HEIMDALL_BRIDGE_AUTH=none` is chosen explicitly; every
+  `Reconcile`/`HandleHypothesis` call is serialised (they are check-then-act, not
+  concurrency-safe); sweep heartbeat + counters go to `heimdall-bridge.prom`. `time.Now()` is
+  allowed in `cmd/`.
 - `cmd/heimdall-notifier` — daemon: Telegram getUpdates poll → button dispatch, outbox drain
   (fanned out to every routed sink), Alertmanager silence reconcile, weekly digest, own heartbeat.
 - `cmd/heimdall-ui` — operator console (HTTP daemon). READS the finding ledger, the suppression
@@ -84,11 +88,20 @@ file wins and the guide is wrong.
 - `internal/analyst` — the Tier-3 wrapper: health gate, row-id verification (drops hallucinated
   citations), wrapper-computed `hyp_fp`, 7-day dedup + per-run cap, persist-before-POST.
 - `internal/tracker` — the tracker seam + YouTrack REST implementation + `[hb:<key>]` marker
-  grammar (`<group>--<check>` / `t3-<hyp_fp>`) + configurable default assignee.
+  grammar (`<group>--<check>` / `t3-<hyp_fp>`) + configurable default assignee. `FindByMarker`
+  returns only an UNRESOLVED issue whose marker matches exactly (re-checked client-side, never
+  trusting the search); `Get` fetches by id.
 - `internal/outbox` — channel-typed, idempotent `notify_outbox` (bridge's own db).
+  `EnqueueOrRearm` re-arms a SENT entry older than a cutoff back to pending under the same idem
+  key (hypothesis cooldown, per-episode escalation re-ping) — the key shapes the notifier parses
+  never change.
 - `internal/bridge` — AM webhook v4 parse, issue ledger, `Reconcile` (one issue per group,
-  per-target checklist, close-on-group-resolved+`heimdall-auto`, mute-gated recurrence, storm
-  fuse), `HandleHypothesis` (G1: structurally never pages), `EscalationSweep`.
+  per-target checklist, close-on-group-resolved+`heimdall-auto`, per-target mute-gated
+  recurrence, storm fuse; the ledger state tracks the GROUP, and a firing after a recovery is a
+  new EPISODE with a new issue and a fresh escalation clock), `HandleHypothesis` (G1:
+  structurally never pages; hypothesis mutes enforced), `EscalationSweep`. Every tracker-bound
+  free-text field goes through one egress path (`egress.go`: fail-closed redaction, then
+  @-mention neutralising).
 - `internal/telegram` / `internal/gotify` / `internal/synology` — the three delivery transports.
   Pure transport, no policy, no clock. Each is fail-closed and scrubs its own credential out of
   any error text it returns (net/http embeds the request URL in errors; Synology's whole webhook
@@ -128,9 +141,9 @@ file wins and the guide is wrong.
 7. **The console may only ever widen what it READS.** `heimdall-ui` is a display over state the
    other binaries own. Its single write to a DECISION authority goes through `suppress.AddMute`,
    so adding any other such write means changing an authority rather than adding a handler.
-   (It is not a read-only *process*: opening the stores runs their idempotent schema DDL, and
-   `outbox.Open` runs its `notify_delivery` backfill insert — the same migrations its co-tenant
-   daemons run. Stated because "read-only" is the kind of claim that gets relied on later.) Operator actions run a
+   (It is not a read-only *process*: opening the stores runs their idempotent schema DDL,
+   `outbox.Open` runs its `notify_delivery` backfill insert, and `bridge.OpenStore` runs a
+   guarded `ALTER TABLE` — the same migrations its co-tenant daemons run. Stated because "read-only" is the kind of claim that gets relied on later.) Operator actions run a
    FIXED argv parsed from config at boot — nothing from a request reaches a command line, no
    shell is involved, and an unconfigured action answers 501 rather than being a hidden
    capability. A `make` gate keeps `internal/llm` off its dep graph too: the console displays

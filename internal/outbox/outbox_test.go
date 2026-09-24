@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lazarevtill/heimdall/internal/outbox"
 )
 
@@ -184,5 +185,119 @@ func TestTwoEntriesDifferentIdemKeysBothLand(t *testing.T) {
 	}
 	if len(pending) != 2 {
 		t.Fatalf("Pending: len=%d, want 2", len(pending))
+	}
+}
+
+// TestEnqueueOrRearm pins the recurring-event contract: insert when new;
+// re-arm (new body, created_at=now, per-sink deliveries cleared) only a SENT
+// entry created before the cutoff; leave everything else untouched —
+// crucially a still-pending entry, whose age the backlog gauge relies on.
+func TestEnqueueOrRearm(t *testing.T) {
+	const key = "t3-0123456789abcdef"
+	rearmAt := fixedNow.Add(8 * 24 * time.Hour)
+	cutoff := rearmAt.Add(-7 * 24 * time.Hour)
+
+	type seed struct {
+		channel outbox.Channel
+		sent    bool
+		created time.Time
+	}
+	type want struct {
+		outcome   outbox.EnqueueOutcome
+		pending   []outbox.Entry // IDs zeroed before comparing
+		delivered bool           // telegram delivery row still present
+	}
+	cases := []struct {
+		name string
+		seed *seed
+		want want
+	}{
+		{
+			name: "no entry: inserted",
+			want: want{outcome: outbox.Inserted, pending: []outbox.Entry{
+				{Channel: outbox.ChannelAnalyst, Body: "new", IdemKey: key, CreatedAt: rearmAt}}},
+		},
+		{
+			name: "sent before the cutoff: rearmed with the new body",
+			seed: &seed{channel: outbox.ChannelAnalyst, sent: true, created: fixedNow},
+			want: want{outcome: outbox.Rearmed, pending: []outbox.Entry{
+				{Channel: outbox.ChannelAnalyst, Body: "new", IdemKey: key, CreatedAt: rearmAt}}},
+		},
+		{
+			name: "sent after the cutoff: deduped",
+			seed: &seed{channel: outbox.ChannelAnalyst, sent: true, created: cutoff.Add(time.Hour)},
+			want: want{outcome: outbox.Deduped, delivered: true},
+		},
+		{
+			name: "still pending, however old: deduped and untouched",
+			seed: &seed{channel: outbox.ChannelAnalyst, created: fixedNow},
+			want: want{outcome: outbox.Deduped, pending: []outbox.Entry{
+				{Channel: outbox.ChannelAnalyst, Body: "old", IdemKey: key, CreatedAt: fixedNow}}},
+		},
+		{
+			name: "same key on another channel: deduped",
+			seed: &seed{channel: outbox.ChannelMain, sent: true, created: fixedNow},
+			want: want{outcome: outbox.Deduped, delivered: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTest(t)
+			if tc.seed != nil {
+				if _, err := s.Enqueue(tc.seed.created, tc.seed.channel, "old", key); err != nil {
+					t.Fatalf("seed Enqueue: %v", err)
+				}
+				if tc.seed.sent {
+					p, err := s.Pending(0)
+					if err != nil || len(p) != 1 {
+						t.Fatalf("seed Pending: %v (%d)", err, len(p))
+					}
+					if err := s.MarkDelivered(tc.seed.created, p[0].ID, "telegram"); err != nil {
+						t.Fatalf("seed MarkDelivered: %v", err)
+					}
+					if err := s.MarkSent(tc.seed.created, p[0].ID); err != nil {
+						t.Fatalf("seed MarkSent: %v", err)
+					}
+				}
+			}
+
+			got, err := s.EnqueueOrRearm(rearmAt, outbox.ChannelAnalyst, "new", key, cutoff)
+			if err != nil {
+				t.Fatalf("EnqueueOrRearm: %v", err)
+			}
+			if got != tc.want.outcome {
+				t.Errorf("outcome = %v, want %v", got, tc.want.outcome)
+			}
+			pending, err := s.Pending(0)
+			if err != nil {
+				t.Fatalf("Pending: %v", err)
+			}
+			var ids []int64
+			for i := range pending {
+				ids = append(ids, pending[i].ID)
+				pending[i].ID = 0
+			}
+			if diff := cmp.Diff(tc.want.pending, pending); diff != "" {
+				t.Errorf("pending mismatch (-want +got):\n%s", diff)
+			}
+			if tc.seed != nil && tc.seed.sent {
+				// Entry id 1 is the only row; its telegram delivery row must be
+				// cleared exactly when it was re-armed.
+				delivered, err := s.DeliveredTo(1, "telegram")
+				if err != nil {
+					t.Fatalf("DeliveredTo: %v", err)
+				}
+				if delivered != tc.want.delivered {
+					t.Errorf("telegram delivery row present = %v, want %v (pending ids %v)", delivered, tc.want.delivered, ids)
+				}
+			}
+		})
+	}
+}
+
+func TestEnqueueOrRearmUnknownChannel(t *testing.T) {
+	s := openTest(t)
+	if _, err := s.EnqueueOrRearm(fixedNow, outbox.Channel("bogus"), "b", "k", fixedNow); err == nil {
+		t.Fatal("EnqueueOrRearm: want error for an unknown channel, got nil")
 	}
 }

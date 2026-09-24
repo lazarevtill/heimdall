@@ -204,9 +204,18 @@ hex and both pass `ValidFingerprint`. They are different namespaces: give
 hypotheses their own routes and labels.
 
 **`OpenStore` writes.** `bridge.OpenStore`, `outbox.Open` and
-`analyst.OpenStore` all run `CREATE TABLE IF NOT EXISTS` on open. A
-"read-only" consumer of those files is not strictly read-only. Idempotent and
-harmless, but do not claim otherwise in a doc comment.
+`analyst.OpenStore` all run `CREATE TABLE IF NOT EXISTS` on open, and
+`bridge.OpenStore` also adds the `auto_tag_pending` column with a guarded
+`ALTER TABLE`. A "read-only" consumer of those files is not strictly
+read-only. Idempotent and harmless, but do not claim otherwise in a doc
+comment.
+
+**`bridge.Reconcile` and `bridge.HandleHypothesis` are not concurrency-safe.**
+Find-by-marker-then-open and the storm fuse's count-then-open are
+check-then-act. Two concurrent Alertmanager deliveries for one group (an HA
+peer, or a retry overlapping a slow first attempt) opened two issues. The
+bridge's HTTP server serialises every call behind one lock. A new caller must
+do the same.
 
 **SQLite stores that share a file open their own handle** with the same WAL
 config and **never touch `PRAGMA user_version`** — that counter belongs to

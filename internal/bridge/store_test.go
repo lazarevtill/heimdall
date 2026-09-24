@@ -1,11 +1,14 @@
 package bridge_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lazarevtill/heimdall/internal/bridge"
+	_ "modernc.org/sqlite"
 )
 
 func openTestStore(t *testing.T) *bridge.Store {
@@ -64,7 +67,6 @@ func TestStoreUpsertIssueThenGet(t *testing.T) {
 	// A second Upsert with new values overwrites the row (used when the
 	// engine keeps an issue open across webhooks).
 	row.State = "resolved"
-	row.Escalated = true
 	if err := s.UpsertIssue(row); err != nil {
 		t.Fatalf("UpsertIssue #2: %v", err)
 	}
@@ -72,8 +74,99 @@ func TestStoreUpsertIssueThenGet(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetIssue #2: found=%v err=%v", found, err)
 	}
-	if got2.State != "resolved" || !got2.Escalated {
-		t.Errorf("GetIssue #2 = %+v, want state=resolved escalated=true", got2)
+	if got2.State != "resolved" {
+		t.Errorf("GetIssue #2 = %+v, want state=resolved", got2)
+	}
+}
+
+// TestStoreUpsertNeverTouchesEscalationFlags pins the lost-update fix:
+// escalated/acked belong to EscalationSweep (MarkEscalated) and the ack path
+// (SetAcked), which run concurrently with Reconcile's read-modify-write.
+// UpsertIssue must leave them alone on conflict; only StartEpisode — a new
+// episode — resets them.
+func TestStoreUpsertNeverTouchesEscalationFlags(t *testing.T) {
+	marker := "[hb:disk--smart-fail]"
+	base := bridge.IssueRow{
+		Marker: marker, IssueID: "HEIM-1", Group: "disk", Check: "smart-fail",
+		Severity: "critical", FiringSince: fixedNow, OpenedAt: fixedNow, State: bridge.StateOpen,
+	}
+	type flags struct{ Escalated, Acked bool }
+	cases := []struct {
+		name  string
+		write func(s *bridge.Store, row bridge.IssueRow) error
+		want  flags
+	}{
+		{"UpsertIssue with stale false flags keeps the stored ones", (*bridge.Store).UpsertIssue, flags{true, true}},
+		{"StartEpisode resets both, whatever the row says", func(s *bridge.Store, row bridge.IssueRow) error {
+			row.Escalated, row.Acked = true, true
+			return s.StartEpisode(row)
+		}, flags{false, false}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestStore(t)
+			if err := s.UpsertIssue(base); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := s.MarkEscalated(marker); err != nil {
+				t.Fatalf("MarkEscalated: %v", err)
+			}
+			if err := s.SetAcked(marker, true); err != nil {
+				t.Fatalf("SetAcked: %v", err)
+			}
+			if err := tc.write(s, base); err != nil { // base carries Escalated/Acked=false
+				t.Fatalf("write: %v", err)
+			}
+			got, _, err := s.GetIssue(marker)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, flags{got.Escalated, got.Acked}); diff != "" {
+				t.Errorf("flags mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestOpenStoreMigratesAutoTagPending: a ledger created before the
+// auto_tag_pending column existed gains it on open, its existing rows read
+// back as not-pending (they were tagged, or deliberately de-tagged), and a
+// second open is harmless.
+func TestOpenStoreMigratesAutoTagPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-bridge.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE issues (
+  marker TEXT PRIMARY KEY, issue_id TEXT NOT NULL, grp TEXT NOT NULL, check_id TEXT NOT NULL,
+  severity TEXT NOT NULL, firing_since INTEGER NOT NULL, opened_at INTEGER NOT NULL,
+  state TEXT NOT NULL, escalated INTEGER NOT NULL DEFAULT 0, acked INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO issues VALUES ('[hb:g--c]', 'HEIM-9', 'g', 'c', 'warning', 100, 100, 'open', 1, 0);`); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	db.Close()
+
+	for i := 0; i < 2; i++ {
+		s, err := bridge.OpenStore(path)
+		if err != nil {
+			t.Fatalf("OpenStore #%d: %v", i+1, err)
+		}
+		got, found, err := s.GetIssue("[hb:g--c]")
+		s.Close()
+		if err != nil || !found {
+			t.Fatalf("GetIssue #%d: found=%v err=%v", i+1, found, err)
+		}
+		want := bridge.IssueRow{
+			Marker: "[hb:g--c]", IssueID: "HEIM-9", Group: "g", Check: "c", Severity: "warning",
+			FiringSince: time.Unix(100, 0).UTC(), OpenedAt: time.Unix(100, 0).UTC(),
+			State: "open", Escalated: true,
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("open #%d: row mismatch (-want +got):\n%s", i+1, diff)
+		}
 	}
 }
 

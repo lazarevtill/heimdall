@@ -124,6 +124,8 @@ HEIMDALL_ENGINE_STATE_DB=/var/lib/heimdall/state.db   # SAME FILE as HEIMDALL_ST
 HEIMDALL_YOUTRACK_URL=https://tracker.example.invalid
 HEIMDALL_YOUTRACK_TOKEN=...                            # via LoadCredential, never inline
 HEIMDALL_YOUTRACK_PROJECT=HEIM
+HEIMDALL_TEXTFILE_DIR=/var/lib/node_exporter           # heimdall-bridge.prom (sweep heartbeat + counters)
+HEIMDALL_BRIDGE_TOKEN=...                              # ≥24 chars, via LoadCredential; or HEIMDALL_BRIDGE_AUTH=none
 # optional
 HEIMDALL_SPOOL_DIR=/var/lib/heimdall/findings   # richer ticket bodies; falls back to annotations
 HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
@@ -137,7 +139,41 @@ sub-field tells you whether the tracker credential works. `/healthz` never
 fails on YouTrack being down — it asserts the bridge and its own db, so read
 the sub-field rather than the status code.
 
-Then point Alertmanager at `POST /am`.
+Then point Alertmanager at `POST /am`, sending the bearer token:
+
+```yaml
+receivers:
+  - name: heimdall-bridge
+    webhook_configs:
+      - url: http://bridge.example.invalid:9098/am
+        send_resolved: true          # the ONE resolve trigger (invariant 8)
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/heimdall-bridge.token
+```
+
+**Authentication.** `/am` and `/hypothesis` require
+`Authorization: Bearer <HEIMDALL_BRIDGE_TOKEN>` and `Content-Type:
+application/json`; `/healthz` stays open. There is no silent default. With no
+token the bridge refuses to start unless `HEIMDALL_BRIDGE_AUTH=none` is set
+explicitly, which it warns about loudly: `/am` can close any auto-managed
+ticket. The analyst sends the same `HEIMDALL_BRIDGE_TOKEN`.
+
+**Metrics.** The bridge writes `heimdall-bridge.prom` atomically after every
+request and sweep: `heimdall_bridge_sweep_last_success_timestamp_seconds`,
+`heimdall_bridge_escalation_errors_total`, `heimdall_bridge_storm_fused_total`
+and `heimdall_redaction_failures_total{plane="bridge"}`. The meta-rules
+watch them.
+
+**Shutdown.** `SIGTERM` lets in-flight reconciles finish, for up to 75 s, so
+give the unit `TimeoutStopSec=` of at least 80 s.
+
+**Episodes.** A group that fires again after its ticket was resolved gets a
+**new** ticket, with its own escalation clock. The resolved one is never
+commented on or re-escalated. A ticket a human owns stays open, but when the
+group recovers the bridge still records it, so the escalation sweep stops
+paging for a group that is no longer firing.
 
 ### 4. `heimdall-notifier` — delivery
 

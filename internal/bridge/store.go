@@ -46,6 +46,31 @@ CREATE TABLE IF NOT EXISTS issue_targets (
   PRIMARY KEY (marker, target)
 );`
 
+// autoTagPendingColumn is added to an EXISTING issues table by OpenStore
+// (ALTER TABLE ... ADD COLUMN, guarded by a pragma_table_info check) rather
+// than declared in schema above, because a ledger created before it existed
+// must gain it too — and, per this package's no-user_version rule, an
+// idempotent guarded ALTER is the migration. Its DEFAULT 0 is the correct
+// value for every pre-existing row: those issues were either fully tagged
+// at open or deliberately de-tagged by a human, and neither must be touched.
+const autoTagPendingColumn = "auto_tag_pending"
+
+// Ledger states (IssueRow.State). The ledger's state tracks the GROUP's
+// episode, not the tracker's issue state: "resolved" means the group
+// recovered, whether or not a human still holds the issue open.
+const (
+	// StateOpening is the intent row Reconcile writes BEFORE asking the
+	// tracker to create an issue, so a crash between the tracker's create
+	// and the ledger write is recognisable on the next delivery (the issue
+	// exists, the row says the bridge was creating it). Never a candidate
+	// for escalation (ListOpen skips it).
+	StateOpening = "opening"
+	// StateOpen: the group is firing and its issue is known.
+	StateOpen = "open"
+	// StateResolved: the group recovered. The next firing is a NEW episode.
+	StateResolved = "resolved"
+)
+
 // Store is the bridge's issue ledger.
 type Store struct{ db *sql.DB }
 
@@ -73,7 +98,37 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("bridge: create schema: %w", err)
 	}
+	if err := ensureColumn(db, "issues", autoTagPendingColumn, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bridge: migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// ensureColumn adds column to table if it is not already there. Two
+// processes opening the same file (the bridge and the console both call
+// OpenStore) can race the ALTER; the loser's "duplicate column" failure is
+// resolved by re-checking rather than by matching error text.
+func ensureColumn(db *sql.DB, table, column, decl string) error {
+	has := func() (bool, error) {
+		var n int
+		err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+		return n > 0, err
+	}
+	ok, err := has()
+	if err != nil {
+		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+	}
+	if ok {
+		return nil
+	}
+	if _, alterErr := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl); alterErr != nil {
+		if ok, err := has(); err == nil && ok {
+			return nil // a concurrent opener added it first
+		}
+		return fmt.Errorf("add %s.%s: %w", table, column, alterErr)
+	}
+	return nil
 }
 
 // Close closes the underlying handle.
@@ -84,69 +139,116 @@ func (s *Store) Close() error { return s.db.Close() }
 type IssueRow struct {
 	Marker, IssueID, Group, Check, Severity string
 	FiringSince, OpenedAt                   time.Time
-	State                                   string // "open" | "resolved"
+	State                                   string // StateOpening | StateOpen | StateResolved
 	Escalated, Acked                        bool
+	// AutoTagPending marks an issue the BRIDGE created whose ownership tags
+	// ("heimdall", "heimdall-auto") are not yet known to be applied — the
+	// tracker's create succeeded but tagging failed, or the process died in
+	// between. Reconcile finishes the tagging on the next delivery and
+	// clears it. Only this flag distinguishes "never got its tag" from "a
+	// human removed the tag to take ownership", which must be respected.
+	AutoTagPending bool
+}
+
+// issueColumns is the canonical column list every issues SELECT uses, in
+// scanIssue's order.
+const issueColumns = `marker, issue_id, grp, check_id, severity, firing_since, opened_at, state, escalated, acked, auto_tag_pending`
+
+// scanIssue decodes one row selected with issueColumns.
+func scanIssue(scan func(...any) error) (IssueRow, error) {
+	var (
+		row                          IssueRow
+		firingSince, openedAt        int64
+		escalated, acked, tagPending int
+	)
+	if err := scan(
+		&row.Marker, &row.IssueID, &row.Group, &row.Check, &row.Severity,
+		&firingSince, &openedAt, &row.State, &escalated, &acked, &tagPending,
+	); err != nil {
+		return IssueRow{}, err
+	}
+	row.FiringSince = time.Unix(firingSince, 0).UTC()
+	row.OpenedAt = time.Unix(openedAt, 0).UTC()
+	row.Escalated = escalated != 0
+	row.Acked = acked != 0
+	row.AutoTagPending = tagPending != 0
+	return row, nil
+}
+
+// b2i is SQLite's boolean encoding.
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // GetIssue returns the ledger row for marker (found=false if none).
 func (s *Store) GetIssue(marker string) (IssueRow, bool, error) {
-	var (
-		row                   IssueRow
-		firingSince, openedAt int64
-		escalated, acked      int
-	)
-	err := s.db.QueryRow(`
-SELECT marker, issue_id, grp, check_id, severity, firing_since, opened_at, state, escalated, acked
-FROM issues WHERE marker = ?`, marker,
-	).Scan(
-		&row.Marker, &row.IssueID, &row.Group, &row.Check, &row.Severity,
-		&firingSince, &openedAt, &row.State, &escalated, &acked,
-	)
+	row, err := scanIssue(s.db.QueryRow(`SELECT `+issueColumns+` FROM issues WHERE marker = ?`, marker).Scan)
 	if err == sql.ErrNoRows {
 		return IssueRow{}, false, nil
 	}
 	if err != nil {
 		return IssueRow{}, false, fmt.Errorf("bridge: get issue %s: %w", marker, err)
 	}
-	row.FiringSince = time.Unix(firingSince, 0).UTC()
-	row.OpenedAt = time.Unix(openedAt, 0).UTC()
-	row.Escalated = escalated != 0
-	row.Acked = acked != 0
 	return row, true, nil
 }
 
-// UpsertIssue records/updates the issue row for row.Marker (insert if new,
-// full overwrite of every column otherwise — the caller is expected to
-// have read the prior row first via GetIssue if it needs to preserve any
-// field, e.g. OpenedAt across a reconcile that keeps the issue open).
+// UpsertIssue records/updates the issue row for row.Marker: insert if new
+// (every column from row), otherwise overwrite every column Reconcile owns —
+// but NEVER escalated or acked. Those two are written by other actors
+// (EscalationSweep's MarkEscalated, an ack's SetAcked) that run
+// concurrently with Reconcile; a read-modify-write here would race them and
+// could reset escalated=0 behind the sweep's back, re-escalating an issue
+// that already had its one re-ping. The ONLY sanctioned reset is a new
+// episode, via StartEpisode. The caller is still expected to have read the
+// prior row via GetIssue if it needs to preserve a field it does own (e.g.
+// OpenedAt across a reconcile that keeps the issue open).
 func (s *Store) UpsertIssue(row IssueRow) error {
-	escalated, acked := 0, 0
-	if row.Escalated {
-		escalated = 1
-	}
-	if row.Acked {
-		acked = 1
-	}
-	_, err := s.db.Exec(`
-INSERT INTO issues (marker, issue_id, grp, check_id, severity, firing_since, opened_at, state, escalated, acked)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(marker) DO UPDATE SET
-  issue_id     = excluded.issue_id,
-  grp          = excluded.grp,
-  check_id     = excluded.check_id,
-  severity     = excluded.severity,
-  firing_since = excluded.firing_since,
-  opened_at    = excluded.opened_at,
-  state        = excluded.state,
-  escalated    = excluded.escalated,
-  acked        = excluded.acked`,
-		row.Marker, row.IssueID, row.Group, row.Check, row.Severity,
-		row.FiringSince.Unix(), row.OpenedAt.Unix(), row.State, escalated, acked,
-	)
-	if err != nil {
+	if err := s.upsert(row, false); err != nil {
 		return fmt.Errorf("bridge: upsert issue %s: %w", row.Marker, err)
 	}
 	return nil
+}
+
+// StartEpisode is UpsertIssue for the first row of a NEW episode of the
+// group: a first-ever open, a re-open after the previous issue resolved,
+// or a re-fire after the ledger recorded the group as recovered. It
+// overwrites every column AND resets escalated/acked to 0 — the previous
+// episode's escalation (and its one re-ping) says nothing about this one.
+func (s *Store) StartEpisode(row IssueRow) error {
+	row.Escalated, row.Acked = false, false
+	if err := s.upsert(row, true); err != nil {
+		return fmt.Errorf("bridge: start episode %s: %w", row.Marker, err)
+	}
+	return nil
+}
+
+func (s *Store) upsert(row IssueRow, resetFlags bool) error {
+	flagUpdate := ""
+	if resetFlags {
+		flagUpdate = `,
+  escalated        = excluded.escalated,
+  acked            = excluded.acked`
+	}
+	_, err := s.db.Exec(`
+INSERT INTO issues (`+issueColumns+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(marker) DO UPDATE SET
+  issue_id         = excluded.issue_id,
+  grp              = excluded.grp,
+  check_id         = excluded.check_id,
+  severity         = excluded.severity,
+  firing_since     = excluded.firing_since,
+  opened_at        = excluded.opened_at,
+  state            = excluded.state,
+  auto_tag_pending = excluded.auto_tag_pending`+flagUpdate,
+		row.Marker, row.IssueID, row.Group, row.Check, row.Severity,
+		row.FiringSince.Unix(), row.OpenedAt.Unix(), row.State,
+		b2i(row.Escalated), b2i(row.Acked), b2i(row.AutoTagPending),
+	)
+	return err
 }
 
 // SetTargets replaces the FULL checklist state for marker with
@@ -207,10 +309,12 @@ func (s *Store) GetTargets(marker string) (map[string]bool, error) {
 }
 
 // OpensSince counts issues with opened_at >= cutoff — the storm-fuse
-// rolling-window query. An issue's opened_at never moves once set (see
-// UpsertIssue's caller discipline in reconcile.go), so this is a stable
-// count of how many NEW issues the bridge has opened in [cutoff, now],
-// regardless of whether any of them have since been resolved.
+// rolling-window query. opened_at is written only when the bridge sets out
+// to open an issue (the StateOpening intent row, then the opened row) and
+// is preserved by every later reconcile of that episode (see UpsertIssue's
+// caller discipline in reconcile.go), so this counts how many issue OPENS
+// the bridge has attempted in [cutoff, now], regardless of whether any of
+// them have since been resolved.
 func (s *Store) OpensSince(cutoff time.Time) (int, error) {
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM issues WHERE opened_at >= ?`, cutoff.Unix()).Scan(&n); err != nil {
@@ -220,14 +324,14 @@ func (s *Store) OpensSince(cutoff time.Time) (int, error) {
 }
 
 // ListOpen returns every ledger row with state="open" (the escalation
-// sweep's candidate set), oldest firing_since first — so a sweep that
-// errors partway through (see EscalationSweep's per-issue error handling)
-// has already escalated the longest-overdue issues first.
+// sweep's candidate set), oldest firing_since first — so the sweep reaches
+// the longest-overdue issues first. StateOpening intent rows are excluded:
+// no issue is known for them yet.
 func (s *Store) ListOpen() ([]IssueRow, error) {
 	rows, err := s.db.Query(`
-SELECT marker, issue_id, grp, check_id, severity, firing_since, opened_at, state, escalated, acked
-FROM issues WHERE state = 'open'
-ORDER BY firing_since ASC, marker ASC`)
+SELECT `+issueColumns+`
+FROM issues WHERE state = ?
+ORDER BY firing_since ASC, marker ASC`, StateOpen)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: list open: %w", err)
 	}
@@ -235,21 +339,10 @@ ORDER BY firing_since ASC, marker ASC`)
 
 	var out []IssueRow
 	for rows.Next() {
-		var (
-			row                   IssueRow
-			firingSince, openedAt int64
-			escalated, acked      int
-		)
-		if err := rows.Scan(
-			&row.Marker, &row.IssueID, &row.Group, &row.Check, &row.Severity,
-			&firingSince, &openedAt, &row.State, &escalated, &acked,
-		); err != nil {
+		row, err := scanIssue(rows.Scan)
+		if err != nil {
 			return nil, fmt.Errorf("bridge: list open: scan: %w", err)
 		}
-		row.FiringSince = time.Unix(firingSince, 0).UTC()
-		row.OpenedAt = time.Unix(openedAt, 0).UTC()
-		row.Escalated = escalated != 0
-		row.Acked = acked != 0
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
@@ -275,11 +368,7 @@ func (s *Store) MarkEscalated(marker string) error {
 // provided now so S7's mute/ack feedback handler can call it without a
 // further store change.
 func (s *Store) SetAcked(marker string, acked bool) error {
-	a := 0
-	if acked {
-		a = 1
-	}
-	if _, err := s.db.Exec(`UPDATE issues SET acked = ? WHERE marker = ?`, a, marker); err != nil {
+	if _, err := s.db.Exec(`UPDATE issues SET acked = ? WHERE marker = ?`, b2i(acked), marker); err != nil {
 		return fmt.Errorf("bridge: set acked %s: %w", marker, err)
 	}
 	return nil

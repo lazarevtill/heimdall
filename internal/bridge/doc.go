@@ -19,16 +19,22 @@
 // S6-c (hypothesis.go, escalate.go) adds the /hypothesis ingress and the
 // periodic escalation sweep. hypothesis.go DOES import internal/contract —
 // for contract.HypothesisFinding (arrives via json.Unmarshal, never a
-// composite literal) and contract.EvidenceOrWithheld, the bridge's re-
-// redaction egress boundary — but still never constructs a
-// contract.Finding composite literal; the ADR-G09 gate is unaffected. The
-// hypothesis path (HandleHypothesis) is structurally unable to page (G1):
-// its only side effects are outbox.Enqueue(ChannelAnalyst, ...) and,
-// optionally, tracker.Open(...) a Task-priority ticket — never
-// ChannelMain, never Transition/Priority.
+// composite literal), contract.ValidFingerprint and the HypMax* bounds —
+// but still never constructs a contract.Finding composite literal; the
+// ADR-G09 gate is unaffected. The hypothesis path (HandleHypothesis) is
+// structurally unable to page (G1): its only side effects are
+// outbox.EnqueueOrRearm(ChannelAnalyst, ...) and, optionally,
+// tracker.Open(...) a Task-priority ticket — never ChannelMain, never
+// Transition/Priority.
 //
-// The HTTP server wiring (S6-d) builds on top of this package; it does not
-// exist yet in this slice.
+// egress.go is the ONE sanitising path for every free-text field the bridge
+// sends to YouTrack or the outbox: fail-closed redaction with a failure
+// count (invariant 3), then @-mention neutralising; log-derived evidence is
+// additionally fenced in issue bodies.
+//
+// The HTTP server (cmd/heimdall-bridge) serialises Reconcile and
+// HandleHypothesis: both are check-then-act against the tracker and are not
+// safe to run concurrently.
 //
 // Design ref: design/2026-07-19-final-design.md (+ at-scale doc).
 package bridge

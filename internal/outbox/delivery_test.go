@@ -208,3 +208,52 @@ VALUES ('main', 'already sent', 'idem-sent', 100, 200),
 	}
 	defer s2.Close()
 }
+
+// A sink added to routing AFTER entries were fully discharged must not
+// inherit them as a backlog: Drain never re-sends a sent entry, so counting
+// it would pin the gauge at the age of the oldest message ever sent — a
+// permanent critical page for a perfectly healthy sink.
+func TestOldestPendingByChannelIgnoresEntriesSentBeforeASinkWasAdded(t *testing.T) {
+	s := openTest(t)
+	if _, err := s.Enqueue(fixedNow, outbox.ChannelMain, "historic", "idem-historic"); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	entries, err := s.Pending(0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Pending: %v (%d entries)", err, len(entries))
+	}
+	// Discharged while telegram was the only routed sink.
+	if err := s.MarkDelivered(fixedNow, entries[0].ID, "telegram"); err != nil {
+		t.Fatalf("MarkDelivered: %v", err)
+	}
+	if err := s.MarkSent(fixedNow, entries[0].ID); err != nil {
+		t.Fatalf("MarkSent: %v", err)
+	}
+	// Gotify is routed afterwards; a fresh entry arrives later.
+	later := fixedNow.Add(24 * time.Hour)
+	if _, err := s.Enqueue(later, outbox.ChannelMain, "fresh", "idem-fresh"); err != nil {
+		t.Fatalf("Enqueue fresh: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		sink string
+		want []outbox.OldestPending
+	}{
+		{"new sink sees only the still-pending entry", "gotify",
+			[]outbox.OldestPending{{SinkID: "gotify", Channel: outbox.ChannelMain, CreatedAt: later}}},
+		{"old sink sees only the still-pending entry", "telegram",
+			[]outbox.OldestPending{{SinkID: "telegram", Channel: outbox.ChannelMain, CreatedAt: later}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.OldestPendingByChannel(tc.sink, []outbox.Channel{outbox.ChannelMain})
+			if err != nil {
+				t.Fatalf("OldestPendingByChannel: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

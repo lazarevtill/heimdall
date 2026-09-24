@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,16 +15,30 @@ import (
 
 // issueFields is the YouTrack `fields` selector used on every read/write that
 // returns an issue: idReadable to identify it, summary/description to parse
-// the marker back out, customFields for State/Assignee/Type/Priority, and
-// tags. `value(name,login)` covers both enum-shaped fields (State, Priority,
-// Type — read via .name) and user-shaped fields (Assignee — read via
-// .login); see VerifyIdentity's doc and the report for why this is the field
-// shape most likely to need live adjustment.
-const issueFields = "idReadable,summary,description,customFields(name,value(name,login)),tags(name)"
+// the marker back out, customFields for State/Assignee/Type/Priority, tags,
+// and `resolved` (the timestamp YouTrack sets when an issue enters ANY
+// resolved state, null while it is unresolved — read as Issue.Resolved, so
+// the bridge never has to guess which of an instance's State names count as
+// closed). `value(name,login)` covers both enum-shaped fields (State,
+// Priority, Type — read via .name) and user-shaped fields (Assignee — read
+// via .login); see VerifyIdentity's doc and the report for why this is the
+// field shape most likely to need live adjustment.
+const issueFields = "idReadable,summary,description,resolved,customFields(name,value(name,login)),tags(name)"
+
+// findByMarkerTop bounds one FindByMarker page. The query is already narrowed
+// to unresolved issues carrying the quoted marker phrase, so more than a
+// handful of hits means duplicates that a human should merge; 100 keeps the
+// exact-marker filter below from missing the real one behind near-matches.
+const findByMarkerTop = 100
 
 // markerRE extracts a "[hb:<key>]" marker embedded in an issue's
 // summary/description text.
 var markerRE = regexp.MustCompile(`\[hb:[a-z0-9-]{1,64}\]`)
+
+// wholeMarkerRE is markerRE anchored: FindByMarker's argument must be
+// exactly one well-formed marker. It is quoted into a YouTrack query, so
+// anything else (a stray `"` in particular) would be query injection.
+var wholeMarkerRE = regexp.MustCompile(`^\[hb:[a-z0-9-]{1,64}\]$`)
 
 // YouTrack implements Tracker over the YouTrack REST API. Auth is a
 // permanent token (Bearer). project is the short name (e.g. "HEIM"). All
@@ -135,9 +150,12 @@ type youtrackTag struct {
 // youtrackIssue is the read-side shape of a YouTrack issue as returned by
 // the `fields` selector in issueFields.
 type youtrackIssue struct {
-	IDReadable   string                `json:"idReadable"`
-	Summary      string                `json:"summary"`
-	Description  string                `json:"description"`
+	IDReadable  string `json:"idReadable"`
+	Summary     string `json:"summary"`
+	Description string `json:"description"`
+	// Resolved is YouTrack's resolution timestamp (ms since epoch), null
+	// while the issue is unresolved.
+	Resolved     *int64                `json:"resolved"`
 	CustomFields []youtrackCustomField `json:"customFields"`
 	Tags         []youtrackTag         `json:"tags"`
 }
@@ -182,16 +200,45 @@ func toIssue(yi youtrackIssue) *Issue {
 		Assignee: yi.assignee(),
 		Tags:     tags,
 		Marker:   marker,
+		Resolved: yi.Resolved != nil,
 	}
 }
 
-// FindByMarker searches GET /api/issues?query=project:{project} {marker}
-// (marker matched as a full-text phrase — YouTrack's search finds
-// "[hb:...]" literally) and parses the FIRST matching issue, or (nil, nil)
-// if none.
+// carriesMarker reports whether yi's summary or description contains
+// marker EXACTLY as one of its [hb:...] tokens. A full-text hit is not
+// proof: search engines tokenize, so "[hb:node--c1-deadman]" can match an
+// issue that merely contains those words (another group's checklist, a
+// hypothesis ticket quoting them). Comparing whole bracketed tokens is
+// exact — "[hb:a--b]" is never a token of "[hb:a--bc]".
+func carriesMarker(yi youtrackIssue, marker string) bool {
+	for _, text := range []string{yi.Summary, yi.Description} {
+		for _, m := range markerRE.FindAllString(text, -1) {
+			if m == marker {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FindByMarker searches GET /api/issues?query=project: {project}
+// #Unresolved "{marker}" and returns the first UNRESOLVED hit that carries
+// the exact marker (see carriesMarker), or (nil, nil) if none.
+//
+// Three layers, each closing a different way to act on the wrong issue:
+//   - `#Unresolved` keeps a closed past episode out of the answer, so a
+//     group that fires again gets a fresh issue instead of a comment on a
+//     ticket nobody reads (and a stale firing_since that escalates at once);
+//   - the marker is QUOTED, making it one phrase rather than a bag of words;
+//   - every hit is still re-checked client-side (not resolved, exact marker
+//     token), because the tracker's search semantics are not ours to trust:
+//     the check costs nothing and makes a loose server-side match harmless.
 func (y *YouTrack) FindByMarker(ctx context.Context, marker string) (*Issue, error) {
-	q := "project: " + y.project + " " + marker
-	path := "/api/issues?fields=" + issueFields + "&query=" + url.QueryEscape(q)
+	if !wholeMarkerRE.MatchString(marker) {
+		return nil, fmt.Errorf("youtrack: find by marker %q: not a well-formed [hb:<key>] marker", marker)
+	}
+	q := "project: " + y.project + ` #Unresolved "` + marker + `"`
+	path := "/api/issues?fields=" + issueFields + "&$top=" + fmt.Sprint(findByMarkerTop) + "&query=" + url.QueryEscape(q)
 	req, err := y.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("youtrack: find by marker %q: %w", marker, err)
@@ -200,10 +247,37 @@ func (y *YouTrack) FindByMarker(ctx context.Context, marker string) (*Issue, err
 	if err := y.do(req, &issues); err != nil {
 		return nil, fmt.Errorf("youtrack: find by marker %q: %w", marker, err)
 	}
-	if len(issues) == 0 {
-		return nil, nil
+	for _, yi := range issues {
+		if yi.Resolved != nil || !carriesMarker(yi, marker) {
+			continue
+		}
+		issue := toIssue(yi)
+		issue.Marker = marker
+		return issue, nil
 	}
-	return toIssue(issues[0]), nil
+	return nil, nil
+}
+
+// Get fetches GET /api/issues/{id} and returns it, resolved or not; a 404
+// is (nil, nil) — "no such issue" is an answer, not a failure. Any other
+// non-2xx or transport error is an error (fail-closed).
+func (y *YouTrack) Get(ctx context.Context, issueID string) (*Issue, error) {
+	if issueID == "" {
+		return nil, fmt.Errorf("youtrack: get: issue id is required")
+	}
+	req, err := y.newRequest(ctx, http.MethodGet, "/api/issues/"+url.PathEscape(issueID)+"?fields="+issueFields, nil)
+	if err != nil {
+		return nil, fmt.Errorf("youtrack: get %s: %w", issueID, err)
+	}
+	var yi youtrackIssue
+	if err := y.do(req, &yi); err != nil {
+		var se *statusError
+		if errors.As(err, &se) && se.code == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("youtrack: get %s: %w", issueID, err)
+	}
+	return toIssue(yi), nil
 }
 
 // youtrackProjectRef is the write-side {"shortName": "..."} project
@@ -474,10 +548,23 @@ func (y *YouTrack) newRequest(ctx context.Context, method, path string, body any
 	return req, nil
 }
 
+// statusError is do's non-2xx error. It is a type (not just text) so a
+// caller that has a specific answer for one status — Get's 404 = "no such
+// issue" — can recognise it with errors.As instead of matching strings.
+type statusError struct {
+	method, path string
+	code         int
+	body         []byte
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("%s %s: unexpected status %d: %s", e.method, e.path, e.code, e.body)
+}
+
 // do executes req and, on a 2xx response, decodes the JSON body into out
 // (skipped if out is nil). Fail-closed: a transport error, a non-2xx status
-// (error carries the truncated response body), or a decode failure all
-// return a non-nil error — never a silent success.
+// (a *statusError carrying the truncated response body), or a decode
+// failure all return a non-nil error — never a silent success.
 func (y *YouTrack) do(req *http.Request, out any) error {
 	resp, err := y.httpc.Do(req)
 	if err != nil {
@@ -486,7 +573,7 @@ func (y *YouTrack) do(req *http.Request, out any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("%s %s: unexpected status %d: %s", req.Method, req.URL.Path, resp.StatusCode, bytes.TrimSpace(raw))
+		return &statusError{method: req.Method, path: req.URL.Path, code: resp.StatusCode, body: bytes.TrimSpace(raw)}
 	}
 	if out == nil {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<20))
