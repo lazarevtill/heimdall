@@ -140,7 +140,10 @@ func TestRenderPromEscapesLabelValues(t *testing.T) {
 // iteration, no finding loop) — pin it exactly rather than via a golden
 // file.
 func TestRenderAnalystPromGolden(t *testing.T) {
-	got := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), 2, 7, 1, 3, 4, 5, 6))
+	got := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), emit.AnalystStats{
+		Posted: 2, PostFailed: 7, BridgeDeduped: 8, BridgeSuppressed: 9,
+		Hallucinated: 1, Deduped: 3, Capped: 4, InvalidDropped: 5, RedactionFailures: 6,
+	}))
 	want := "" +
 		"# HELP heimdall_analyst_last_success_timestamp_seconds Unix time of the last successful Tier-3 analyst run.\n" +
 		"# TYPE heimdall_analyst_last_success_timestamp_seconds gauge\n" +
@@ -148,9 +151,13 @@ func TestRenderAnalystPromGolden(t *testing.T) {
 		"# HELP heimdall_analyst_hypotheses_posted_total Hypotheses the bridge enqueued as new messages during the last analyst run.\n" +
 		"# TYPE heimdall_analyst_hypotheses_posted_total counter\n" +
 		"heimdall_analyst_hypotheses_posted_total 2\n" +
-		"# HELP heimdall_analyst_hypotheses_post_failed_total Hypotheses the bridge did not accept during the last analyst run; each stays eligible to post next run.\n" +
+		"# HELP heimdall_analyst_hypotheses_post_failed_total Hypotheses the bridge did not accept during the last analyst run; no cooldown starts, so each posts again if a later run produces it.\n" +
 		"# TYPE heimdall_analyst_hypotheses_post_failed_total counter\n" +
 		"heimdall_analyst_hypotheses_post_failed_total 7\n" +
+		"# HELP heimdall_analyst_hypotheses_bridge_held_total Hypotheses the bridge accepted but did not send during the last analyst run: deduped (it already held that hyp_fp) or suppressed (an operator's hypothesis mute).\n" +
+		"# TYPE heimdall_analyst_hypotheses_bridge_held_total counter\n" +
+		`heimdall_analyst_hypotheses_bridge_held_total{reason="deduped"} 8` + "\n" +
+		`heimdall_analyst_hypotheses_bridge_held_total{reason="suppressed"} 9` + "\n" +
 		"# HELP heimdall_analyst_hypotheses_hallucinated_total Hypotheses dropped for citing an empty or nonexistent evidence row_id.\n" +
 		"# TYPE heimdall_analyst_hypotheses_hallucinated_total counter\n" +
 		"heimdall_analyst_hypotheses_hallucinated_total 1\n" +
@@ -176,7 +183,7 @@ func TestRenderAnalystPromGolden(t *testing.T) {
 // textfile collector, never collide on an identical metric+label set.
 func TestRenderAnalystPromRedactionPlaneLabelAvoidsCollision(t *testing.T) {
 	tier1 := string(emit.RenderProm(time.Unix(1752900000, 0).UTC(), nil, 1, time.Time{}))
-	tier3 := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), 0, 0, 0, 0, 0, 0, 1))
+	tier3 := string(emit.RenderAnalystProm(time.Unix(1752900000, 0).UTC(), emit.AnalystStats{RedactionFailures: 1}))
 	if !strings.Contains(tier1, "heimdall_redaction_failures_total 1\n") {
 		t.Fatalf("tier1 fixture missing unlabeled redaction series:\n%s", tier1)
 	}

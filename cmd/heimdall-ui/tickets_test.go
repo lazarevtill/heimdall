@@ -109,7 +109,7 @@ func TestReadTicketsReportsTheStormFuse(t *testing.T) {
 		fixedNow.Add(-30 * time.Minute),
 		fixedNow.Add(-5 * time.Hour),
 	} {
-		if err := st.UpsertIssue(bridge.IssueRow{
+		if err := st.RecordOpened(bridge.IssueRow{
 			Marker: "[hb:g--c" + strings.Repeat("x", i+1) + "]", IssueID: "I", Group: "g",
 			Check: "c", Severity: "warning", FiringSince: at, OpenedAt: at, State: "open",
 		}); err != nil {

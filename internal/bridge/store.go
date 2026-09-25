@@ -44,7 +44,19 @@ CREATE TABLE IF NOT EXISTS issue_targets (
   firing      INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL,
   PRIMARY KEY (marker, target)
-);`
+);
+
+CREATE TABLE IF NOT EXISTS issue_opens (
+  marker     TEXT NOT NULL,
+  issue_id   TEXT NOT NULL,
+  opened_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS issue_opens_opened_at ON issue_opens (opened_at);`
+
+// opensRetention is how long an issue_opens row is kept. The storm fuse and
+// the console look back one hour; a day leaves room without letting an
+// append-only table grow for ever.
+const opensRetention = 24 * time.Hour
 
 // autoTagPendingColumn is added to an EXISTING issues table by OpenStore
 // (ALTER TABLE ... ADD COLUMN, guarded by a pragma_table_info check) rather
@@ -102,7 +114,34 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("bridge: migrate schema: %w", err)
 	}
+	if err := backfillIssueOpens(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bridge: migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// backfillIssueOpens copies into issue_opens the issues a bridge created
+// before issue_opens existed. Without it an upgrade forgot every issue opened
+// in the hour before the restart, and a storm in progress got a fresh full
+// MaxPerHour batch. It takes every created issue (issue_id set; an
+// "opening" intent row created nothing) opened within opensRetention of the
+// newest open, which is the same window RecordOpened keeps, so a row it has
+// pruned is never copied back. A (marker, issue_id) already present is
+// skipped, which makes it idempotent: the bridge and the console both run it
+// on every open, and it is one statement, so two openers cannot both insert.
+func backfillIssueOpens(db *sql.DB) error {
+	_, err := db.Exec(`
+INSERT INTO issue_opens (marker, issue_id, opened_at)
+SELECT i.marker, i.issue_id, i.opened_at FROM issues i
+WHERE i.issue_id <> ''
+  AND i.opened_at >= (SELECT MAX(opened_at) FROM issues) - ?
+  AND NOT EXISTS (SELECT 1 FROM issue_opens o WHERE o.marker = i.marker AND o.issue_id = i.issue_id)`,
+		int64(opensRetention/time.Second))
+	if err != nil {
+		return fmt.Errorf("backfill issue_opens: %w", err)
+	}
+	return nil
 }
 
 // ensureColumn adds column to table if it is not already there. Two
@@ -225,14 +264,83 @@ func (s *Store) StartEpisode(row IssueRow) error {
 	return nil
 }
 
+// RecordOpened is UpsertIssue for the row of an issue the bridge has just
+// CREATED in the tracker. It also appends the open to issue_opens, in the
+// same transaction, which is what the storm fuse counts. The issues table
+// has one row per marker and each new episode overwrites its opened_at, so
+// counting there saw one flapping group opening a fresh issue every few
+// minutes as a single open, and the fuse never tripped.
+func (s *Store) RecordOpened(row IssueRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("bridge: record opened %s: begin: %w", row.Marker, err)
+	}
+	defer tx.Rollback()
+	if err := upsertIssue(tx, row, false); err != nil {
+		return fmt.Errorf("bridge: record opened %s: %w", row.Marker, err)
+	}
+	if err := appendOpen(tx, row.Marker, row.IssueID, row.OpenedAt); err != nil {
+		return fmt.Errorf("bridge: record opened %s: %w", row.Marker, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("bridge: record opened %s: commit: %w", row.Marker, err)
+	}
+	return nil
+}
+
+// RecordOpen appends one created issue to issue_opens without touching its
+// ledger row. Reconcile calls it when it adopts an issue whose open a crash
+// or failed write left unrecorded (the row still "opening"), before any of
+// the paths that go on to rewrite that row.
+func (s *Store) RecordOpen(marker, issueID string, openedAt time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("bridge: record open %s: begin: %w", marker, err)
+	}
+	defer tx.Rollback()
+	if err := appendOpen(tx, marker, issueID, openedAt); err != nil {
+		return fmt.Errorf("bridge: record open %s: %w", marker, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("bridge: record open %s: commit: %w", marker, err)
+	}
+	return nil
+}
+
+// appendOpen adds (marker, issueID) to issue_opens unless it is already
+// there, so a creation counts once however many paths record it, then
+// prunes rows older than opensRetention.
+func appendOpen(db execer, marker, issueID string, openedAt time.Time) error {
+	if _, err := db.Exec(`
+INSERT INTO issue_opens (marker, issue_id, opened_at)
+SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM issue_opens WHERE marker = ? AND issue_id = ?)`,
+		marker, issueID, openedAt.Unix(), marker, issueID); err != nil {
+		return fmt.Errorf("append open: %w", err)
+	}
+	if _, err := db.Exec(`DELETE FROM issue_opens WHERE opened_at < ?`,
+		openedAt.Add(-opensRetention).Unix()); err != nil {
+		return fmt.Errorf("prune opens: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) upsert(row IssueRow, resetFlags bool) error {
+	return upsertIssue(s.db, row, resetFlags)
+}
+
+// execer is what upsertIssue needs: a *sql.DB or a *sql.Tx.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertIssue(db execer, row IssueRow, resetFlags bool) error {
 	flagUpdate := ""
 	if resetFlags {
 		flagUpdate = `,
   escalated        = excluded.escalated,
   acked            = excluded.acked`
 	}
-	_, err := s.db.Exec(`
+	_, err := db.Exec(`
 INSERT INTO issues (`+issueColumns+`)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(marker) DO UPDATE SET
@@ -308,16 +416,14 @@ func (s *Store) GetTargets(marker string) (map[string]bool, error) {
 	return out, nil
 }
 
-// OpensSince counts issues with opened_at >= cutoff — the storm-fuse
-// rolling-window query. opened_at is written only when the bridge sets out
-// to open an issue (the StateOpening intent row, then the opened row) and
-// is preserved by every later reconcile of that episode (see UpsertIssue's
-// caller discipline in reconcile.go), so this counts how many issue OPENS
-// the bridge has attempted in [cutoff, now], regardless of whether any of
-// them have since been resolved.
+// OpensSince counts the issues the bridge created at or after cutoff: the
+// storm fuse's rolling-window query. It counts issue_opens (one row per
+// created issue, see RecordOpened), not markers, so a group that resolves
+// and re-fires counts each new issue it opens. An open the tracker refused
+// created nothing and is not counted.
 func (s *Store) OpensSince(cutoff time.Time) (int, error) {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM issues WHERE opened_at >= ?`, cutoff.Unix()).Scan(&n); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM issue_opens WHERE opened_at >= ?`, cutoff.Unix()).Scan(&n); err != nil {
 		return 0, fmt.Errorf("bridge: opens since %s: %w", cutoff, err)
 	}
 	return n, nil

@@ -44,8 +44,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/lazarevtill/heimdall/internal/bridge"
@@ -120,6 +122,9 @@ const (
 	headerTimeout  = 5 * time.Second
 	probeTimeout   = 3 * time.Second
 	minTokenLength = 24
+	// shutdownTimeout lets an in-flight request finish on SIGTERM. It
+	// matches writeTimeout, the longest a request (an action) may run.
+	shutdownTimeout = writeTimeout
 )
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -402,5 +407,33 @@ func run() error {
 		log.Printf("WARNING: authentication is disabled; anyone who can reach %s can read this console%s",
 			cfg.Listen, map[bool]string{true: " AND write suppressions", false: ""}[cfg.AnonymousWrites])
 	}
-	return hs.ListenAndServe()
+	return serveUntilSignal(hs)
+}
+
+// serveUntilSignal serves until SIGTERM or SIGINT, then lets in-flight
+// requests finish (a mute being written, an action running) before the
+// deferred store handles close. Killed mid-request instead, a mute could
+// be cut off between its suppression write and its feedback row, and
+// systemd logged every stop as a failure.
+func serveUntilSignal(hs *http.Server) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- hs.ListenAndServe() }()
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("serve: %w", err)
+	case <-ctx.Done():
+	}
+	log.Printf("shutting down: finishing in-flight requests (up to %s)", shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	shutdownErr := hs.Shutdown(shutdownCtx)
+	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve: %w", err)
+	}
+	if shutdownErr != nil {
+		return fmt.Errorf("shutdown: %w", shutdownErr)
+	}
+	return nil
 }

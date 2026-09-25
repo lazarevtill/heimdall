@@ -188,14 +188,16 @@ func TestHandleUpdatesNoUpdatesLeavesOffsetUnchanged(t *testing.T) {
 // hook (e.g. cancel the loop's context, standing in for SIGTERM) while the
 // poll is in flight.
 type fakePoller struct {
-	updates []telegram.Update
-	err     error
-	during  func()
-	offsets []int64
+	updates  []telegram.Update
+	err      error
+	during   func()
+	offsets  []int64
+	timeouts []int
 }
 
-func (p *fakePoller) GetUpdates(_ context.Context, offset int64, _ int) ([]telegram.Update, error) {
+func (p *fakePoller) GetUpdates(_ context.Context, offset int64, timeoutSeconds int) ([]telegram.Update, error) {
 	p.offsets = append(p.offsets, offset)
+	p.timeouts = append(p.timeouts, timeoutSeconds)
 	if p.during != nil {
 		p.during()
 	}
@@ -346,5 +348,33 @@ func TestRunLoopReturnsOnCancellation(t *testing.T) {
 	}
 	if len(p.offsets) != 1 {
 		t.Errorf("polls = %d, want exactly 1 before the loop noticed the cancellation", len(p.offsets))
+	}
+}
+
+// On a clean shutdown the loop confirms what it already handled: Telegram
+// only drops an update once a later getUpdates carries an offset past it, so
+// without a final poll a restart replayed the last button presses.
+func TestRunLoopAcknowledgesHandledUpdatesOnShutdown(t *testing.T) {
+	cd, _, _ := iterDeps(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &fakePoller{updates: []telegram.Update{callbackUpdate(41, fakeAllowedUser, "a|node--c1-deadman")}}
+	p.during = func() {
+		if len(p.offsets) == 2 {
+			p.updates = nil
+			cancel() // SIGTERM while the second poll is in flight
+		}
+	}
+	done := make(chan struct{})
+	go func() { runLoop(ctx, p, cd, 1); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runLoop did not return after its context was cancelled")
+	}
+	if n := len(p.offsets); n != 3 {
+		t.Fatalf("polls = %v, want 3 (receive, interrupted poll, final acknowledgement)", p.offsets)
+	}
+	if got, gotTimeout := p.offsets[2], p.timeouts[2]; got != 42 || gotTimeout != 0 {
+		t.Errorf("final poll = (offset %d, timeout %d), want (42, 0): confirm update 41 without waiting", got, gotTimeout)
 	}
 }

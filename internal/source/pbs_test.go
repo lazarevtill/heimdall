@@ -196,7 +196,7 @@ func TestPBSAuthHeaderSent(t *testing.T) {
 	if _, err := s.Query(context.Background(), Query{ID: "q1", Expr: "datastore=store1"}); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	want := "PBSAPIToken " + testTokenID + ":" + testTokenSecret
+	want := "PBSAPIToken=" + testTokenID + ":" + testTokenSecret
 	if got != want {
 		t.Errorf("Authorization header = %q, want %q", got, want)
 	}

@@ -521,12 +521,44 @@ func TestReconcileStormFuse(t *testing.T) {
 	}
 }
 
-// seedIssue directly inserts a ledger row opened at openedAt, bypassing
+// One flapping group opens a fresh issue each time it re-fires after an
+// auto-close, and each of those counts toward the fuse. Counting markers
+// instead saw one open however often the group flapped, so the fuse never
+// tripped on it.
+func TestReconcileStormFuseCountsEveryIssueOneGroupOpens(t *testing.T) {
+	deps, ft := testDeps(t, 2, nil)
+	fire := func(at time.Time) bridge.ReconcileResult {
+		return mustReconcile(t, at, deps, groupWebhook(alert("firing", "192.0.2.10", "critical", "fp-a", at)))
+	}
+	at := fixedNow
+	for i := 1; i <= 2; i++ {
+		if res := fire(at); !res.Opened {
+			t.Fatalf("open %d: %+v, want Opened", i, res)
+		}
+		at = at.Add(5 * time.Minute)
+		if res := mustReconcile(t, at, deps, groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", at))); !res.Closed {
+			t.Fatalf("resolve %d: %+v, want Closed", i, res)
+		}
+		at = at.Add(5 * time.Minute)
+	}
+	if res := fire(at); !res.StormFused || res.Opened {
+		t.Errorf("third open within the hour = %+v, want StormFused and not Opened", res)
+	}
+	if len(ft.opens) != 2 {
+		t.Errorf("tracker opens = %d, want 2", len(ft.opens))
+	}
+	// Once the first open leaves the rolling hour there is room again.
+	if res := fire(fixedNow.Add(61 * time.Minute)); !res.Opened {
+		t.Errorf("open after the window moved = %+v, want Opened", res)
+	}
+}
+
+// seedIssue records an issue the bridge created at openedAt, bypassing
 // Reconcile — this is how the storm-fuse test arranges "N issues already
 // opened in the last hour" without needing N real tracker Opens.
 func seedIssue(t *testing.T, deps bridge.Deps, marker string, openedAt time.Time) {
 	t.Helper()
-	if err := deps.Store.UpsertIssue(bridge.IssueRow{
+	if err := deps.Store.RecordOpened(bridge.IssueRow{
 		Marker:      marker,
 		IssueID:     "HEIM-seed-" + marker,
 		Group:       "seed",
@@ -858,6 +890,46 @@ func TestReconcileAdoptsAnIssueCreatedBeforeACrash(t *testing.T) {
 	want := ledgerView{IssueID: "HEIM-7", State: bridge.StateOpen, Severity: "critical", FiringSince: fixedNow}
 	if diff := cmp.Diff(want, ledgerOf(t, deps, marker)); diff != "" {
 		t.Errorf("ledger (-want +got):\n%s", diff)
+	}
+	// The adopted issue was created, so it counts toward the storm fuse,
+	// once, however many deliveries follow.
+	mustReconcile(t, fixedNow.Add(2*time.Minute), deps, groupWebhook(alert("firing", "192.0.2.10", "critical", "fp-a", fixedNow)))
+	if n, err := deps.Store.OpensSince(fixedNow.Add(-time.Hour)); err != nil || n != 1 {
+		t.Errorf("OpensSince = %d, %v; want the adopted issue counted exactly once", n, err)
+	}
+}
+
+// An open that a crash left unrecorded is counted whichever path the
+// delivery that finds its issue takes, not only the still-firing one.
+func TestReconcileCountsAnUnrecordedOpenOnEveryCompletionPath(t *testing.T) {
+	resolved := groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", fixedNow))
+	partial := groupWebhook(alert("resolved", "192.0.2.10", "critical", "fp-a", fixedNow))
+	partial.TruncatedAlerts = 2 // every alert shown resolved, but not all were shown
+	for _, tc := range []struct {
+		name string
+		w    bridge.AMWebhook
+	}{
+		{"already recovered", resolved},
+		{"partial delivery", partial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, ft := testDeps(t, 10, nil)
+			marker := "[hb:disk--smart-fail]"
+			if err := deps.Store.StartEpisode(bridge.IssueRow{
+				Marker: marker, Group: "disk", Check: "smart-fail", Severity: "critical",
+				FiringSince: fixedNow, OpenedAt: fixedNow, State: bridge.StateOpening, AutoTagPending: true,
+			}); err != nil {
+				t.Fatalf("seed intent: %v", err)
+			}
+			ft.issues[marker] = &tracker.Issue{ID: "HEIM-7", State: "Open", Marker: marker}
+
+			mustReconcile(t, fixedNow.Add(time.Minute), deps, tc.w)
+			// A redelivery must not count it a second time.
+			mustReconcile(t, fixedNow.Add(2*time.Minute), deps, tc.w)
+			if n, err := deps.Store.OpensSince(fixedNow.Add(-time.Hour)); err != nil || n != 1 {
+				t.Errorf("OpensSince = %d, %v; want the created issue counted exactly once", n, err)
+			}
+		})
 	}
 }
 

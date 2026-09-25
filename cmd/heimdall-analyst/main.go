@@ -195,8 +195,13 @@ func run() error {
 	// Success: atomically write the heartbeat + per-run drop counters.
 	return emit.WriteFileAtomic(
 		filepath.Join(cfg.TextfileDir, "heimdall-analyst.prom"),
-		emit.RenderAnalystProm(now, outcome.Posted, outcome.PostFailed, outcome.Hallucinated,
-			outcome.Deduped, outcome.CapDropped, outcome.InvalidDropped, outcome.RedactionFailures),
+		emit.RenderAnalystProm(now, emit.AnalystStats{
+			Posted: outcome.Posted, PostFailed: outcome.PostFailed,
+			BridgeDeduped: outcome.BridgeDeduped, BridgeSuppressed: outcome.BridgeSuppressed,
+			Hallucinated: outcome.Hallucinated, Deduped: outcome.Deduped,
+			Capped: outcome.CapDropped, InvalidDropped: outcome.InvalidDropped,
+			RedactionFailures: outcome.RedactionFailures,
+		}),
 	)
 }
 

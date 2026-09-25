@@ -515,7 +515,7 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 		opened.IssueID = issue.ID
 		opened.State = StateOpen
 		opened.AutoTagPending = openErr != nil
-		if err := d.Store.UpsertIssue(opened); err != nil {
+		if err := d.Store.RecordOpened(opened); err != nil {
 			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: upsert issue %s: %w", marker, err)
 		}
 		if err := d.Store.SetTargets(now, marker, next); err != nil {
@@ -553,6 +553,17 @@ func Reconcile(ctx context.Context, now time.Time, d Deps, w AMWebhook) (res Rec
 	// never sets it, so that choice is never overridden.
 	tagPending := rowFound && row.AutoTagPending
 	completingOpen := rowFound && row.State == StateOpening
+	if completingOpen {
+		// An open that a crash or failed write left unrecorded: the tracker
+		// created this issue, so it counts toward the storm fuse. Recorded
+		// here, before any branch below rewrites the "opening" row (still
+		// firing, recovered, or a partial delivery), so no path can consume
+		// that state without counting it. Idempotent, so a retry that fails
+		// further on does not count it twice.
+		if err := d.Store.RecordOpen(marker, existing.ID, row.OpenedAt); err != nil {
+			return ReconcileResult{}, fmt.Errorf("bridge: reconcile: record adopted open %s: %w", marker, err)
+		}
+	}
 	if tagPending && (row.IssueID == "" || row.IssueID == existing.ID) {
 		for _, tag := range bridgeTags {
 			if hasTag(existing.Tags, tag) {

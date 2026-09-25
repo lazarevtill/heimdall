@@ -1,0 +1,26 @@
+# Heimdall findings: the ONE rule that turns the detector's heimdall_finding
+# series into Alertmanager alerts. Without it no finding ever reaches the
+# bridge's /am, and no ticket ever opens.
+#
+# Every series label passes through unchanged, and the bridge depends on
+# them: source="heimdall" (the only source /am accepts), group and check (the
+# Alertmanager grouping key and the ticket marker), target (one checklist line
+# each), fingerprint (the spool document the bridge reads for evidence),
+# severity, class and node. Do not add or override labels here. A relabelled
+# source is refused with a 400 that Alertmanager never retries, and a
+# relabelled group or check lands on another group's ticket.
+#
+# No `for:`. The detector has already decided. The series exists only while
+# a finding is firing or unknown, and it leaves heimdall.prom on the first
+# run that evaluates OK. That is what resolves the alert, and with
+# send_resolved, what closes the ticket.
+#
+# The title annotation is only the bridge's fallback, used when the spool
+# document is gone; the spool carries the real title and evidence.
+groups:
+  - name: heimdall-findings
+    rules:
+      - alert: HeimdallFinding
+        expr: heimdall_finding == 1
+        annotations:
+          title: "{{ $labels.check }} on {{ $labels.target }}"

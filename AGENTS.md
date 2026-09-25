@@ -63,7 +63,8 @@ file wins and the guide is wrong.
 - `internal/manifest` — loads + validates the IaC-rendered expectation + Tier-2 manifest
   (rejects dup id AND dup `(check,target)` fingerprint; Tier-2 severity never `critical`).
 - `internal/source` — `Source` interface + Prometheus, VictoriaLogs (LogsQL), and PBS
-  (pinned-CA, never `InsecureSkipVerify`) clients; every failure → alertable `unknown`.
+  (pinned-CA, never `InsecureSkipVerify`) clients; every failure → alertable `unknown`. The
+  detector wires each one that is configured (PBS: `HEIMDALL_PBS_URL` + CA + cred-file token).
 - `internal/detect` — pure checks (`DeadMan`, `Threshold`) + errgroup-bounded engine (panic
   boundary, never cancels siblings).
 - `internal/baseline` — Tier-2 SQLite store (features/warmup/template_baseline/crossing) over the
@@ -75,6 +76,8 @@ file wins and the guide is wrong.
 - `internal/digest` — the Tier-2 digest producer (top-N cap, redact, 32 KB byte-cap, atomic
   `latest.json` + 14-day dated history).
 - `internal/ledger` — SQLite finding ledger (`modernc.org/sqlite`, WAL, preserves `first_seen`).
+  After a run's `.prom` is written, the detector's `ResolveAbsent` marks `ok` every row that run
+  did not produce (an OK evaluation emits no finding); a failed run resolves nothing.
 - `internal/emit` — `.prom` render (frozen label set, no `state` label, no timestamps), atomic
   replace, redacted spool, analyst + notifier heartbeat renderers.
 - `internal/config` — env + optional Vault-seeded cred file, fail-fast.
@@ -83,7 +86,11 @@ file wins and the guide is wrong.
   starts afresh; a shorter press never shortens), active-silence projection.
 - `internal/plugin` — subprocess plugin host (manifest validate, `plugin_api` version gate,
   scrubbed-env/deadline/pgroup-kill/output-cap runner, capability-scoped credential injection) +
-  the `source.Source` adapter that drives a source plugin as a data source.
+  the `source.Source` adapter that drives a source plugin as a data source, and `LoadSourceDir`,
+  which the detector uses to load every plugin installed under `HEIMDALL_PLUGIN_DIR` as the
+  Tier-1 backend `plugin:<id>`. A plugin's credential is read ONLY from `HEIMDALL_PLUGIN_CRED_<ID>`
+  (the manifest names just the env var inside the child); a broken install degrades to Unknown
+  for its own expectations, never stopping the other checks.
 - `internal/llm` — llama.cpp OpenAI-compatible client: strict `json_schema`, `temperature:0`,
   health gate, redact-before-send (registered egress).
 - `internal/analyst` — the Tier-3 wrapper: health gate, row-id verification (drops hallucinated
@@ -112,6 +119,8 @@ file wins and the guide is wrong.
   fan-out, button-callback dispatcher (allow-listed → suppression writes), silence reconciler,
   weekly digest, notifier heartbeat.
 - `plugins/source-reference` — a real, stdlib-only reference source plugin.
+- `deploy/alerts/heimdall-findings.rules.yml` — `HeimdallFinding`, the one rule that turns a
+  `heimdall_finding` series into an alert (labels passed through unchanged) for the bridge.
 - `deploy/alerts/heimdall-meta.rules.yml` — the alerts that page when a component goes
   stale/absent/redaction-fails.
 

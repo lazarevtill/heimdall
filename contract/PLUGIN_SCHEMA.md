@@ -62,6 +62,44 @@ transports belong next to the core. A manifest still declaring `egress_id` is
 now a hard parse error (`LoadManifest` rejects unknown fields), rather than a
 field that is silently ignored while its author believes it is in force.
 
+## Installing a plugin (the detector)
+
+The detector loads every plugin installed under `HEIMDALL_PLUGIN_DIR`:
+
+```
+$HEIMDALL_PLUGIN_DIR/<id>/plugin.json   the manifest — its id MUST equal <id>
+$HEIMDALL_PLUGIN_DIR/<id>/plugin        the executable (regular file, exec bit set)
+```
+
+Each loaded plugin serves the Tier-1 backend **`plugin:<id>`**: an expectation
+names it as `"verify": {"backend": "plugin:<id>", "query": "..."}`. `<id>` may
+be a symlink to the real directory (a versioned install). A directory with no
+`plugin.json` (`lost+found`, a staging dir) is not an install and is ignored.
+
+**Credentials are scoped by the host, not the plugin.** A plugin that declares
+`capabilities.credential` gets the value of the cred-file key
+**`HEIMDALL_PLUGIN_CRED_<ID>`** (id uppercased), injected under the env var
+name it declared. The declared name only chooses the variable *inside the
+child*. It never selects which secret is read, so a plugin cannot ask for
+another component's token by naming it.
+
+**That scoping is about what the host hands out. It does not contain the
+plugin.** A plugin runs as the detector's own user, and nothing sandboxes its
+filesystem (see Sandbox status). It can therefore read the cred file itself,
+and with it the PBS token and every other plugin's credential. Until the infra
+layer runs plugins under a separate uid or mount namespace, install only a
+plugin you would trust with every secret the detector holds.
+
+**A broken install never stops the detector.** A plugin can be broken in
+several ways: an invalid manifest, an id that does not match its directory,
+a missing or non-executable binary, a missing credential, or a
+`detector`-kind plugin (the detector drives only sources today). In every
+case its backend answers each query **Unknown with the load error as the
+reason**, and the detector logs the problem. That makes it an alertable
+Unknown per expectation, while every other check keeps running. A manifest
+naming a `plugin:<id>` that is not installed at all yields an explicit
+Unknown per expectation ("no source wired").
+
 ## Kinds
 
 ### SOURCE: `FetchPlan` → `SignalSet`

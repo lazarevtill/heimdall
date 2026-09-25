@@ -483,6 +483,47 @@ func TestEvalZScoreDeterministicAndEpsilonGuarded(t *testing.T) {
 	}
 }
 
+// A flat baseline (IQR = 0: a counter that is always 0) has no scale to
+// divide by. The old epsilon floor made its first change 0 -> 1 read as
+// z ~ 1e9, outranking every genuinely anomalous row in the digest. An
+// unchanged value is z = 0; any real change is ±10 — strong, but below a
+// real anomaly measured on a real scale; and every z is clamped to ±100, so
+// no finite input can produce a meaningless magnitude.
+func TestEvalZScoreIsBoundedAndSaneOnAFlatBaseline(t *testing.T) {
+	tests := []struct {
+		name  string
+		seeds []float64
+		probe float64
+		want  float64
+	}{
+		{"flat and unchanged", repeat(0, 20), 0, 0},
+		{"flat, float noise is not a change", repeat(1, 20), 1 + 1e-12, 0},
+		{"flat, first change up", repeat(0, 20), 1, 10},
+		{"flat, first change down", repeat(5, 20), 4, -10},
+		{"flat, enormous change stays finite", repeat(0, 20), 1e300, 10},
+		{"real spread, extreme value is clamped", []float64{0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4}, 1e6, 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := openStore(t)
+			spec := quantileSpec()
+			spec.GraduateThreshold, spec.ClearThreshold = 1e301, 1e300 // stay out of graduation
+			probe := t0.Add(tier2.WarmupWindow).Add(time.Hour)
+			seedWindow(t, s, spec, probe, tt.seeds)
+			res, err := tier2.Eval(probe, spec, okSignal(tt.probe), s)
+			if err != nil {
+				t.Fatalf("Eval: %v", err)
+			}
+			if res.Row == nil || res.Row.Status != contract.StatusOK {
+				t.Fatalf("Row = %+v, want a measured ok row", res.Row)
+			}
+			if res.Row.ZScore != tt.want {
+				t.Errorf("ZScore = %v, want %v", res.Row.ZScore, tt.want)
+			}
+		})
+	}
+}
+
 // graduate drives spec through warm-up into a graduated (firing) trend
 // finding and returns the instant it graduated plus the finding.
 func graduate(t *testing.T, s *baseline.Store, spec manifest.Tier2Spec) (time.Time, contract.Finding) {
@@ -613,30 +654,27 @@ func TestEvalWarmingWithServedCrossingHoldsUnknown(t *testing.T) {
 // used to fail digest.Write and with it the WHOLE detector run). The row is
 // forced to unknown with every float zeroed, and it always marshals.
 func TestEvalNonFiniteNeverReachesTheRow(t *testing.T) {
-	flat := func(t *testing.T, s *baseline.Store, spec manifest.Tier2Spec) {
-		t.Helper()
-		for i := 0; i < 8; i++ {
-			if _, err := tier2.Eval(t0.Add(time.Duration(i)*time.Hour), spec, okSignal(0), s); err != nil {
-				t.Fatalf("Eval seed %d: %v", i, err)
-			}
-		}
-	}
+	flat := []float64{0, 0, 0, 0, 0, 0, 0, 0}
+	const huge = 1.7e308
 	cases := []struct {
-		name string
-		sig  source.Signal
+		name  string
+		seeds []float64
+		sig   source.Signal
 	}{
-		{"NaN sample", okSignal(math.NaN())},
-		{"+Inf sample", okSignal(math.Inf(1))},
-		{"-Inf beside a finite sample", okSignal(0.2, math.Inf(-1))},
-		// Finite in, infinite out: (1e300 - 0) / epsilon overflows.
-		{"zscore overflows on a flat baseline", okSignal(1e300)},
+		{"NaN sample", flat, okSignal(math.NaN())},
+		{"+Inf sample", flat, okSignal(math.Inf(1))},
+		{"-Inf beside a finite sample", flat, okSignal(0.2, math.Inf(-1))},
+		// Finite in, infinite out: the median interpolates across -huge..+huge,
+		// and (x[hi]-x[lo]) overflows.
+		{"quantile interpolation overflows", []float64{-huge, -huge, -huge, -huge, huge, huge, huge}, okSignal(huge)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := openStore(t)
 			spec := quantileSpec()
-			flat(t, s, spec)
-			res, err := tier2.Eval(t0.Add(tier2.WarmupWindow).Add(time.Hour), spec, tc.sig, s)
+			probe := t0.Add(tier2.WarmupWindow).Add(time.Hour)
+			seedWindow(t, s, spec, probe, tc.seeds)
+			res, err := tier2.Eval(probe, spec, tc.sig, s)
 			if err != nil {
 				t.Fatalf("Eval: %v", err)
 			}
@@ -715,4 +753,62 @@ func TestEvalStoreErrorIsAnUnknownRowNotAVanishing(t *testing.T) {
 			t.Errorf("Finding = %+v, want nil (no readable crossing)", res.Finding)
 		}
 	})
+}
+
+// seedWindow starts the spec's warm-up at t0, then records values at
+// one-minute steps ending just before probe, so every one of them lies
+// inside the baseline window when probe is evaluated — the way a real
+// baseline of many recent samples looks.
+func seedWindow(t *testing.T, s *baseline.Store, spec manifest.Tier2Spec, probe time.Time, values []float64) {
+	t.Helper()
+	if _, err := tier2.Eval(t0, spec, source.Signal{State: contract.StateUnknown, Err: "warm-up start"}, s); err != nil {
+		t.Fatalf("Eval warm-up start: %v", err)
+	}
+	for i, v := range values {
+		at := probe.Add(-time.Duration(len(values)-i) * time.Minute)
+		if _, err := tier2.Eval(at, spec, okSignal(v), s); err != nil {
+			t.Fatalf("Eval seed %d: %v", i, err)
+		}
+	}
+}
+
+// A change on a flat baseline must not outrank a real anomaly measured on a
+// real scale: the digest keeps the top rows by |z|, and a deploy that nudges
+// many flat counters must not push a genuinely anomalous row out of it.
+func TestEvalFlatChangeRanksBelowAMeasuredAnomaly(t *testing.T) {
+	probe := t0.Add(tier2.WarmupWindow).Add(time.Hour)
+	eval := func(target string, seeds []float64, v float64) contract.DigestRow {
+		t.Helper()
+		s := openStore(t)
+		spec := quantileSpec()
+		spec.Target = target
+		spec.GraduateThreshold, spec.ClearThreshold = 1e301, 1e300
+		seedWindow(t, s, spec, probe, seeds)
+		res, err := tier2.Eval(probe, spec, okSignal(v), s)
+		if err != nil || res.Row == nil {
+			t.Fatalf("Eval %s: row %v, err %v", target, res.Row, err)
+		}
+		return *res.Row
+	}
+	flat := eval("flat-counter", repeat(0, 20), 1)
+	spread := make([]float64, 0, 20)
+	for i := 0; i < 20; i++ {
+		spread = append(spread, float64(i%4)) // 0,1,2,3,... IQR = 2
+	}
+	measured := eval("real-anomaly", spread, 40) // z = (40-1.5)/(2/1.349) ~ 26
+	if !(math.Abs(measured.ZScore) > math.Abs(flat.ZScore)) {
+		t.Errorf("|z| measured = %v, flat = %v: the measured anomaly must rank above the flat baseline's change", measured.ZScore, flat.ZScore)
+	}
+	kept, _ := contract.CapRows([]contract.DigestRow{flat, measured}, 1)
+	if len(kept) != 1 || kept[0].Target != "real-anomaly" {
+		t.Errorf("CapRows kept %+v, want the measured anomaly", kept)
+	}
+}
+
+func repeat(v float64, n int) []float64 {
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = v
+	}
+	return out
 }

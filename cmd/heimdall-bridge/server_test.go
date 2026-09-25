@@ -536,7 +536,7 @@ func TestHandleAMCountsStormFusedIntoTheTextfile(t *testing.T) {
 	env := newTestEnv(t, authConfig{token: testToken})
 	now := time.Now().UTC()
 	for i := 0; i < 10; i++ {
-		if err := env.store.UpsertIssue(bridge.IssueRow{
+		if err := env.store.RecordOpened(bridge.IssueRow{
 			Marker: fmt.Sprintf("[hb:seed--s%d]", i), IssueID: fmt.Sprintf("HEIM-S%d", i), Group: "seed", Check: "s",
 			Severity: "warning", FiringSince: now, OpenedAt: now, State: bridge.StateOpen,
 		}); err != nil {

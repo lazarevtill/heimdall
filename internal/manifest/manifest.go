@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -34,7 +35,7 @@ type Expectation struct {
 }
 
 type Verify struct {
-	Backend  string  `json:"backend"` // prometheus | victorialogs | pbs
+	Backend  string  `json:"backend"` // prometheus | victorialogs | pbs | plugin:<id>
 	Query    string  `json:"query"`
 	MinCount float64 `json:"min_count"`
 }
@@ -81,6 +82,47 @@ func (t Tier2Spec) BaselineWindow() time.Duration {
 
 var validBackends = map[string]bool{"prometheus": true, "victorialogs": true, "pbs": true}
 
+// PluginBackendPrefix names a Tier-1 backend served by a source plugin:
+// "plugin:<id>", where <id> is the plugin manifest's id
+// (contract/PLUGIN_SCHEMA.md, ^[a-z0-9]{2,16}$). The detector registers
+// each plugin it loads under exactly this key.
+const PluginBackendPrefix = "plugin:"
+
+// identRE is the group/check grammar: lowercase alphanumeric words joined by
+// single hyphens (which also keeps '|', the Fingerprint separator, out).
+// Group and check become the ticket key "<group>--<check>" (at most
+// maxKeyLen, the tracker's marker-key limit), which the notifier splits on
+// the first "--": a name with "--" inside or an edge hyphen would split
+// wrongly and mute the wrong group, and a key the tracker grammar refuses is
+// answered 400 by the bridge, which Alertmanager never retries. This loader
+// is where group/check names are born, so this is the one place that
+// enforces it: a failed detector start pages; a ticket that silently never
+// opens does not. (The bridge's own check stays lenient on purpose, so
+// alerts minted under an older, looser manifest can still resolve their
+// open tickets.)
+var identRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// maxKeyLen is the tracker's marker-key limit for "<group>--<check>".
+const maxKeyLen = 64
+
+func validKeyParts(group, check string) bool {
+	return identRE.MatchString(group) && identRE.MatchString(check) && len(group)+2+len(check) <= maxKeyLen
+}
+
+// pluginIDRE mirrors internal/plugin's manifest id grammar; duplicated
+// rather than imported so the manifest loader stays free of the plugin host.
+var pluginIDRE = regexp.MustCompile(`^[a-z0-9]{2,16}$`)
+
+// validTier1Backend reports whether b names a Tier-1 source: a built-in
+// backend, or a well-formed plugin:<id>. Whether that plugin is actually
+// installed is the detector's business at startup, not the manifest's.
+func validTier1Backend(b string) bool {
+	if id, ok := strings.CutPrefix(b, PluginBackendPrefix); ok {
+		return pluginIDRE.MatchString(id)
+	}
+	return validBackends[b]
+}
+
 // tier2Backends excludes pbs: Tier-2 never reads PBS.
 var tier2Backends = map[string]bool{"prometheus": true, "victorialogs": true}
 
@@ -117,8 +159,8 @@ func Load(path string) (*Manifest, error) {
 			return nil, fmt.Errorf("%w: %s: id, check, group, target are required", ErrInvalid, where)
 		case seen[e.ID]:
 			return nil, fmt.Errorf("%w: duplicate expectation id %q", ErrInvalid, e.ID)
-		case strings.Contains(e.Check, "|"):
-			return nil, fmt.Errorf("%w: %s: check id contains reserved '|'", ErrInvalid, where)
+		case !validKeyParts(e.Group, e.Check):
+			return nil, fmt.Errorf("%w: %s: group %q and check %q must each be lowercase words joined by single hyphens (%s), %d characters at most together", ErrInvalid, where, e.Group, e.Check, identRE, maxKeyLen-2)
 		case e.Check == "c1-deadman" && e.GraceSeconds <= 0:
 			return nil, fmt.Errorf("%w: %s: c1-deadman requires grace_seconds > 0", ErrInvalid, where)
 		case e.Check == "c4-signature" && e.Verify.MinCount < 1:
@@ -126,7 +168,7 @@ func Load(path string) (*Manifest, error) {
 			// signal (0 >= 0) — a manifest-rendering omission must be
 			// rejected here, not flood warning findings.
 			return nil, fmt.Errorf("%w: %s: c4-signature requires min_count >= 1", ErrInvalid, where)
-		case !validBackends[e.Verify.Backend]:
+		case !validTier1Backend(e.Verify.Backend):
 			return nil, fmt.Errorf("%w: %s: unknown verify.backend %q", ErrInvalid, where, e.Verify.Backend)
 		case e.Verify.Query == "":
 			return nil, fmt.Errorf("%w: %s: verify.query is required", ErrInvalid, where)
@@ -157,8 +199,8 @@ func Load(path string) (*Manifest, error) {
 		switch {
 		case ts.ID == "" || ts.Check == "" || ts.Target == "" || ts.Group == "":
 			return nil, fmt.Errorf("%w: %s: id, check, group, target are required", ErrInvalid, where)
-		case strings.Contains(ts.Check, "|"):
-			return nil, fmt.Errorf("%w: %s: check id contains reserved '|'", ErrInvalid, where)
+		case !validKeyParts(ts.Group, ts.Check):
+			return nil, fmt.Errorf("%w: %s: group %q and check %q must each be lowercase words joined by single hyphens (%s), %d characters at most together", ErrInvalid, where, ts.Group, ts.Check, identRE, maxKeyLen-2)
 		case !validSignals[ts.Signal]:
 			return nil, fmt.Errorf("%w: %s: unknown signal %q", ErrInvalid, where, ts.Signal)
 		case !tier2Backends[ts.Backend]:

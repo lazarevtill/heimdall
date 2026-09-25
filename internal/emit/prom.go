@@ -34,8 +34,10 @@ const (
 		"# TYPE heimdall_analyst_last_success_timestamp_seconds gauge\n"
 	helpAnalystPosted = "# HELP heimdall_analyst_hypotheses_posted_total Hypotheses the bridge enqueued as new messages during the last analyst run.\n" +
 		"# TYPE heimdall_analyst_hypotheses_posted_total counter\n"
-	helpAnalystPostFailed = "# HELP heimdall_analyst_hypotheses_post_failed_total Hypotheses the bridge did not accept during the last analyst run; each stays eligible to post next run.\n" +
+	helpAnalystPostFailed = "# HELP heimdall_analyst_hypotheses_post_failed_total Hypotheses the bridge did not accept during the last analyst run; no cooldown starts, so each posts again if a later run produces it.\n" +
 		"# TYPE heimdall_analyst_hypotheses_post_failed_total counter\n"
+	helpAnalystBridgeHeld = "# HELP heimdall_analyst_hypotheses_bridge_held_total Hypotheses the bridge accepted but did not send during the last analyst run: deduped (it already held that hyp_fp) or suppressed (an operator's hypothesis mute).\n" +
+		"# TYPE heimdall_analyst_hypotheses_bridge_held_total counter\n"
 	helpAnalystHallucinated = "# HELP heimdall_analyst_hypotheses_hallucinated_total Hypotheses dropped for citing an empty or nonexistent evidence row_id.\n" +
 		"# TYPE heimdall_analyst_hypotheses_hallucinated_total counter\n"
 	helpAnalystDeduped = "# HELP heimdall_analyst_hypotheses_deduped_total Hypotheses dropped: the same hyp_fp was posted within the cooldown window.\n" +
@@ -138,27 +140,46 @@ func RenderDigestProm(rowsTruncated int) []byte {
 // from helpRedaction (see the package doc: inconsistent HELP across files
 // poisons the scrape).
 //
-// posted counts only hypotheses the bridge enqueued as NEW messages;
-// postFailed counts those it did not accept at all. Without the second
+// Posted counts only hypotheses the bridge enqueued as NEW messages;
+// PostFailed counts those it did not accept at all. Without the second
 // series a bridge refusing every POST (down, or rejecting the analyst's
-// token) was indistinguishable from a model with nothing to say.
-func RenderAnalystProm(now time.Time, posted, postFailed, hallucinated, deduped, capped, invalidDropped, redactionFailures int) []byte {
+// token) was indistinguishable from a model with nothing to say. The
+// bridge_held series (reason="deduped"|"suppressed", both always rendered)
+// accounts for the rest: accepted, deliberately not sent.
+func RenderAnalystProm(now time.Time, s AnalystStats) []byte {
 	var b bytes.Buffer
 	b.WriteString(helpAnalystLastSuccess)
 	b.WriteString("heimdall_analyst_last_success_timestamp_seconds " + strconv.FormatInt(now.Unix(), 10) + "\n")
 	b.WriteString(helpAnalystPosted)
-	b.WriteString("heimdall_analyst_hypotheses_posted_total " + strconv.Itoa(posted) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_posted_total " + strconv.Itoa(s.Posted) + "\n")
 	b.WriteString(helpAnalystPostFailed)
-	b.WriteString("heimdall_analyst_hypotheses_post_failed_total " + strconv.Itoa(postFailed) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_post_failed_total " + strconv.Itoa(s.PostFailed) + "\n")
+	b.WriteString(helpAnalystBridgeHeld)
+	b.WriteString(`heimdall_analyst_hypotheses_bridge_held_total{reason="deduped"} ` + strconv.Itoa(s.BridgeDeduped) + "\n")
+	b.WriteString(`heimdall_analyst_hypotheses_bridge_held_total{reason="suppressed"} ` + strconv.Itoa(s.BridgeSuppressed) + "\n")
 	b.WriteString(helpAnalystHallucinated)
-	b.WriteString("heimdall_analyst_hypotheses_hallucinated_total " + strconv.Itoa(hallucinated) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_hallucinated_total " + strconv.Itoa(s.Hallucinated) + "\n")
 	b.WriteString(helpAnalystDeduped)
-	b.WriteString("heimdall_analyst_hypotheses_deduped_total " + strconv.Itoa(deduped) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_deduped_total " + strconv.Itoa(s.Deduped) + "\n")
 	b.WriteString(helpAnalystCapped)
-	b.WriteString("heimdall_analyst_hypotheses_capped_total " + strconv.Itoa(capped) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_capped_total " + strconv.Itoa(s.Capped) + "\n")
 	b.WriteString(helpAnalystInvalid)
-	b.WriteString("heimdall_analyst_hypotheses_invalid_total " + strconv.Itoa(invalidDropped) + "\n")
+	b.WriteString("heimdall_analyst_hypotheses_invalid_total " + strconv.Itoa(s.InvalidDropped) + "\n")
 	b.WriteString(helpRedaction)
-	b.WriteString(`heimdall_redaction_failures_total{plane="tier3"} ` + strconv.Itoa(redactionFailures) + "\n")
+	b.WriteString(`heimdall_redaction_failures_total{plane="tier3"} ` + strconv.Itoa(s.RedactionFailures) + "\n")
 	return b.Bytes()
+}
+
+// AnalystStats is one analyst run's counters, by name: eight positional ints
+// were one transposition away from a counter reporting another's value.
+type AnalystStats struct {
+	Posted            int // the bridge enqueued it as a NEW message
+	PostFailed        int // the bridge did not accept it
+	BridgeDeduped     int // accepted; the bridge already held that hyp_fp
+	BridgeSuppressed  int // accepted; an operator's hypothesis mute held it back
+	Hallucinated      int // dropped: cited an empty or nonexistent row_id
+	Deduped           int // dropped: within the analyst's own cooldown
+	Capped            int // dropped: over the per-run cap
+	InvalidDropped    int // dropped: out-of-vocabulary kind or confidence
+	RedactionFailures int
 }

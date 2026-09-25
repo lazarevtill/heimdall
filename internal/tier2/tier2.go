@@ -27,9 +27,25 @@ import (
 // regardless of how far past graduate_threshold the metric sits.
 const WarmupWindow = 7 * 24 * time.Hour
 
-// zEpsilon guards the robust-zscore denominator against a degenerate
-// (near-zero) IQR, so a tight baseline yields ZScore==0 rather than Inf/NaN.
+// zEpsilon is the scale below which a baseline's robust spread (IQR/1.349)
+// counts as degenerate: a FLAT baseline (a counter that is always 0, a
+// ratio pinned at 1). There is then no scale to measure a deviation
+// against — see robustZ.
 const zEpsilon = 1e-9
+
+// zCap bounds |ZScore|. Past it the number carries no further information,
+// and an unbounded one could overflow into a non-finite row.
+const zCap = 100
+
+// zFlat is the |z| a change on a FLAT baseline reports. With no spread
+// there is no scale, so any magnitude would be invented: dividing by the
+// old epsilon floor made a counter's first tick 0 → 1 read as z ≈ 1e9, which
+// outranked every genuinely anomalous row in CapRows and dominated the
+// analyst's input. zFlat says "clearly off its history" — a strong signal —
+// while still ranking BELOW real anomalies measured on a real scale past it,
+// so a deploy that nudges fifty flat counters cannot push a z=20 row with a
+// measured spread out of the 200-row digest.
+const zFlat = 10
 
 // Result is one Tier-2 spec's evaluation. Finding is set while the spec is
 // graduated (see Eval for when that holds); Row is the digest row (always
@@ -229,22 +245,16 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 		baseOK = ok25 && ok50 && ok75
 	}
 
-	// Robust (IQR-based) zscore — deterministic, NOT a Gaussian assumption.
-	// z = (metric - p50) / max((p75-p25)/1.349, epsilon); the 1.349 divisor
-	// makes the IQR comparable to a Gaussian standard deviation, and the
-	// epsilon floor keeps a near-zero IQR from producing Inf/NaN.
+	// Robust (IQR-based) zscore — deterministic, NOT a Gaussian assumption
+	// (see robustZ).
 	var zscore float64
 	if measured && baseOK {
-		denom := (p75 - p25) / 1.349
-		if denom < zEpsilon {
-			denom = zEpsilon
-		}
-		zscore = (metric - p50) / denom
+		zscore = robustZ(metric, p25, p50, p75)
 	}
 
 	// Non-finite guard. Finite inputs can still produce a non-finite output
-	// (a huge metric over the epsilon floor overflows the zscore; quantile
-	// interpolation between huge values overflows), and a ±Inf/NaN in a row
+	// (quantile interpolation between huge values of opposite sign overflows;
+	// robustZ itself is bounded), and a ±Inf/NaN in a row
 	// cannot be JSON-encoded — one used to fail digest.Write and with it the
 	// whole detector run, Tier 1 included. Such an evaluation is unmeasurable:
 	// status unknown, every float zeroed.
@@ -362,6 +372,25 @@ func Eval(now time.Time, spec manifest.Tier2Spec, sig source.Signal, store *base
 	}
 
 	return result, nil
+}
+
+// robustZ is (metric - p50) / (IQR/1.349), clamped to ±zCap; the 1.349
+// divisor makes the IQR comparable to a Gaussian standard deviation.
+//
+// A flat baseline (scale < zEpsilon) has no scale to divide by, so it is
+// answered directly: a metric equal to the median (to a relative 1e-9, so
+// float noise in a computed ratio is not a "change") is z = 0; ANY real
+// change is ±zFlat — see zFlat for why not the cap.
+func robustZ(metric, p25, p50, p75 float64) float64 {
+	dev := metric - p50
+	scale := (p75 - p25) / 1.349
+	if scale < zEpsilon {
+		if math.Abs(dev) <= zEpsilon*math.Max(1, math.Abs(p50)) {
+			return 0
+		}
+		return math.Copysign(zFlat, dev)
+	}
+	return math.Max(-zCap, math.Min(zCap, dev/scale))
 }
 
 func minHold(spec manifest.Tier2Spec) time.Duration {

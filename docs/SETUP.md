@@ -74,6 +74,14 @@ Tier-2 spec must also have:
 - A unique `(target, feature)`. That pair is the baseline store's key, so two
   specs sharing it would read each other's history as their own.
 
+Every `group` and `check`, in expectations and Tier-2 specs alike, must be
+lowercase words joined by single hyphens (`^[a-z0-9]+(-[a-z0-9]+)*$`), and
+the two together at most 62 characters. They form the ticket key
+`<group>--<check>` (64 characters at most), and the notifier splits that key
+on the first `--`. A name outside this grammar used to be refused by the bridge
+with a `400` that Alertmanager never retries, so its tickets silently never
+opened.
+
 Check the rendered manifest against these rules **before** upgrading: a
 violation stops the detector at load, and `HeimdallDetectorStale` pages.
 
@@ -93,7 +101,23 @@ HEIMDALL_VL_URL=https://victorialogs.example.invalid   # only if LogsQL specs ex
 HEIMDALL_SUPPRESSIONS_FILE=/etc/heimdall/suppressions.json
 HEIMDALL_QUERY_LIMIT=8
 HEIMDALL_CRED_FILE=/run/credentials/heimdall/creds    # k=v lines
+HEIMDALL_PBS_URL=https://pbs.example.invalid:8007      # only if PBS expectations exist
+HEIMDALL_PBS_CA_FILE=/etc/heimdall/pbs-ca.pem          # required with PBS_URL: the pinned CA
+HEIMDALL_PLUGIN_DIR=/usr/lib/heimdall/plugins          # only if plugin:<id> backends are used
 ```
+
+**PBS** is all-or-nothing. With `HEIMDALL_PBS_URL` set (it must be `https`),
+the pinned CA file and the token pair `HEIMDALL_PBS_TOKEN_ID` /
+`HEIMDALL_PBS_TOKEN_SECRET` in the cred file are all required, or the detector
+refuses to start. Without `HEIMDALL_PBS_URL`, a `pbs` expectation is an
+explicit Unknown ("no source wired"). **Plugins** go under
+`HEIMDALL_PLUGIN_DIR/<id>/{plugin.json,plugin}` and serve the backend
+`plugin:<id>`. A plugin's credential, if it declares one, is the cred-file key
+`HEIMDALL_PLUGIN_CRED_<ID>`, whatever env var name its manifest declares. A
+broken install turns only that plugin's expectations Unknown, with the
+reason, and is logged. A plugin runs as the detector's user and can read the
+cred file directly, so install only plugins you trust with every secret in
+it. See `contract/PLUGIN_SCHEMA.md`, "Installing a plugin".
 
 `HEIMDALL_PROM_URL` and `HEIMDALL_VL_URL` must be absolute `http(s)` URLs with
 a host, or the detector refuses to start. The error names the variable, never
@@ -139,7 +163,11 @@ sub-field tells you whether the tracker credential works. `/healthz` never
 fails on YouTrack being down — it asserts the bridge and its own db, so read
 the sub-field rather than the status code.
 
-Then point Alertmanager at `POST /am`, sending the bearer token. Route **only**
+Then point Alertmanager at `POST /am`, sending the bearer token. The alerts
+come from [`../deploy/alerts/heimdall-findings.rules.yml`](../deploy/alerts/heimdall-findings.rules.yml)
+(`HeimdallFinding`, loaded in step 7): it turns each `heimdall_finding` series
+into an alert and passes the series labels through unchanged. Without that rule
+nothing reaches `/am` and no ticket ever opens. Route **only**
 `source="heimdall"` alerts to it, grouped by **exactly** `[group, check]`: the
 bridge keeps one ticket per `(group, check)`.
 - A delivery grouped by more labels (a `severity`, or `'...'`) splits one
@@ -357,13 +385,20 @@ Granting the unit permission to start those units is a PolicyKit/sudoers
 decision made outside this repo. If you would rather not, leave the variables
 unset — do not run the console as root to work around it.
 
-### 7. The meta-rules
+### 7. The alert rules
 
-Load [`../deploy/alerts/heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml)
-into Prometheus. **This is not optional polish.** Until it is loaded, a
-crashed detector, a dead notifier, a stuck delivery channel, a dead analyst
-and a bridge Alertmanager cannot reach are all silent — the alerts that watch
-the watcher live in that file.
+Load both files in [`../deploy/alerts/`](../deploy/alerts/) into Prometheus.
+**Neither is optional polish.**
+
+- [`heimdall-findings.rules.yml`](../deploy/alerts/heimdall-findings.rules.yml)
+  is the one rule that makes a finding an alert. Until it is loaded the
+  detector writes findings that nobody is paged about and the bridge never
+  opens a ticket. Its `source="heimdall"` alerts go to the bridge (step 3),
+  and to whatever native route pages people first.
+- [`heimdall-meta.rules.yml`](../deploy/alerts/heimdall-meta.rules.yml) holds
+  the alerts that watch the watcher. Until it is loaded, a crashed detector,
+  a dead notifier, a stuck delivery channel, a dead analyst and a bridge
+  Alertmanager cannot reach are all silent.
 
 Every `source="heimdall-meta"` alert must be **routed to a native Alertmanager
 receiver** (Telegram, email), never to the bridge. The bridge accepts only
@@ -393,9 +428,9 @@ Work forwards; each step depends on the one before.
 | 1 | `heimdall-detect` exits 0 | a `.prom` in the textfile dir |
 | 2 | `curl localhost:9100/metrics \| grep heimdall_` | the series is **scraped**, not merely written |
 | 3 | `curl localhost:9090/api/v1/query?query=heimdall_finding` | Prometheus has it |
-| 4 | `curl localhost:9090/api/v1/rules \| grep Heimdall` | meta-rules loaded |
+| 4 | `curl localhost:9090/api/v1/rules \| grep Heimdall` | `HeimdallFinding` and the meta-rules loaded |
 | 5 | `curl localhost:9098/healthz` | bridge up; read the YouTrack sub-field |
-| 6 | force a finding, watch Alertmanager → `/am` | a ticket appears |
+| 6 | force a finding, watch `HeimdallFinding` in Alertmanager → `/am` | a ticket appears |
 | 7 | `heimdall_notifier_sink_oldest_pending_seconds` | one sample per routed pair, `0` |
 | 8 | open the console | pages render; unset dirs say so rather than render empty |
 

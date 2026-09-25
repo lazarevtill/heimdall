@@ -138,4 +138,27 @@ func runLoop(ctx context.Context, p poller, cd cycleDeps, pollTimeoutSeconds int
 	for ctx.Err() == nil {
 		iterate(ctx, p, cd, cfg, &st)
 	}
+	acknowledge(p, st.offset)
+}
+
+// ackTimeout bounds the final acknowledging poll on shutdown.
+const ackTimeout = 5 * time.Second
+
+// acknowledge confirms, on a clean shutdown, every update already handled.
+// Telegram only forgets an update once a LATER getUpdates carries an offset
+// past it, so without this a restart re-delivered the last batch of button
+// presses and dispatched them a second time. A zero-timeout poll at the
+// current offset does exactly that confirmation and returns at once. offset
+// 0 means nothing was ever received, so there is nothing to confirm. It is
+// best-effort: on failure the worst case is the old replay, which the mute
+// semantics absorb (a repeated press never shortens a mute or re-charges it).
+func acknowledge(p poller, offset int64) {
+	if offset == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
+	defer cancel()
+	if _, err := p.GetUpdates(ctx, offset, 0); err != nil {
+		log.Printf("shutdown: acknowledging handled updates: %v", contract.Safe(err))
+	}
 }

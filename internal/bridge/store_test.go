@@ -213,7 +213,7 @@ func TestStoreOpensSinceWindow(t *testing.T) {
 	s := openTestStore(t)
 	seed := func(marker string, openedAt time.Time) {
 		t.Helper()
-		if err := s.UpsertIssue(bridge.IssueRow{
+		if err := s.RecordOpened(bridge.IssueRow{
 			Marker: marker, IssueID: "HEIM-" + marker, Group: "g", Check: "c",
 			Severity: "warning", FiringSince: openedAt, OpenedAt: openedAt, State: "open",
 		}); err != nil {
@@ -230,5 +230,53 @@ func TestStoreOpensSinceWindow(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("OpensSince = %d, want 2 (m3 is just over an hour old)", n)
+	}
+}
+
+// Issues opened before issue_opens existed are copied into it on open, so
+// an upgrade does not forget the last hour's opens and let a storm in
+// progress open another full batch. Only created issues within the
+// retention window of the newest open are copied, and only once.
+func TestOpenStoreBackfillsIssueOpensFromExistingIssues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bridge.db")
+	s, err := bridge.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What a pre-upgrade bridge left behind: rows in issues, none in
+	// issue_opens (UpsertIssue never appends there).
+	for _, r := range []struct {
+		marker, issueID string
+		openedAt        time.Time
+	}{
+		{"[hb:a--c]", "HEIM-1", fixedNow.Add(-10 * time.Minute)},
+		{"[hb:b--c]", "HEIM-2", fixedNow.Add(-40 * time.Minute)},
+		{"[hb:c--c]", "", fixedNow.Add(-5 * time.Minute)},      // an open intent: nothing was created
+		{"[hb:d--c]", "HEIM-3", fixedNow.Add(-30 * time.Hour)}, // outside the retention window
+	} {
+		if err := s.UpsertIssue(bridge.IssueRow{
+			Marker: r.marker, IssueID: r.issueID, Group: "g", Check: "c", Severity: "warning",
+			FiringSince: r.openedAt, OpenedAt: r.openedAt, State: bridge.StateOpen,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, _ := s.OpensSince(fixedNow.Add(-48 * time.Hour)); n != 0 {
+		t.Fatalf("before reopen: %d opens recorded, want 0 (the pre-upgrade state)", n)
+	}
+	s.Close()
+
+	for i := 1; i <= 2; i++ { // a second open must not duplicate anything
+		s, err = bridge.OpenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := s.OpensSince(fixedNow.Add(-time.Hour)); err != nil || n != 2 {
+			t.Errorf("open %d: OpensSince(1h) = %d, %v; want 2", i, n, err)
+		}
+		if n, _ := s.OpensSince(fixedNow.Add(-48 * time.Hour)); n != 2 {
+			t.Errorf("open %d: OpensSince(48h) = %d, want 2 (neither the intent row nor the 30h-old issue)", i, n)
+		}
+		s.Close()
 	}
 }

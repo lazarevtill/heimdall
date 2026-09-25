@@ -56,8 +56,10 @@ per-line timestamps precisely because that causes this.
 curl -s localhost:9090/api/v1/rules | grep -c Heimdall
 ```
 
-Zero means `deploy/alerts/heimdall-meta.rules.yml` is not loaded, and nothing
-is watching the watcher. Prometheus also **silently keeps the previous rule
+Look for `HeimdallFinding` and the meta-rules. Without `HeimdallFinding`
+(`deploy/alerts/heimdall-findings.rules.yml`) a finding never becomes an
+alert, so no ticket opens. Without `deploy/alerts/heimdall-meta.rules.yml`
+nothing is watching the watcher. Prometheus also **silently keeps the previous rule
 set** when a rule file fails to parse, so a bad edit elsewhere can block this
 one.
 
@@ -273,9 +275,11 @@ sqlite3 /var/lib/heimdall/bridge.db \
   'select marker, issue_id, grp, check_id, state, escalated, acked from issues;'
 ```
 
-- **No ticket** → is the storm fuse tripped? The bridge caps issues per hour
-  (default 10). Check the console's Tickets page, count recent `opened_at`,
-  or read `heimdall_bridge_storm_fused_total`. Otherwise read the bridge's
+- **No ticket** → is the storm fuse tripped? The bridge caps issues it
+  creates per hour (default 10), and every new issue counts, including a
+  flapping group's fresh issue each time it re-fires. Check the console's
+  Tickets page, count recent rows in `issue_opens`, or read
+  `heimdall_bridge_storm_fused_total`. Otherwise read the bridge's
   log for the refusal:
   - `401`: the bearer token is missing or wrong (Alertmanager's
     `http_config.authorization`, or the analyst's `HEIMDALL_BRIDGE_TOKEN`);
@@ -355,8 +359,10 @@ its page explain itself when unset or unreadable, precisely so "empty" and
 **An action returns 501** — that action has no configured command, so it does
 not exist. This is the default; nothing is wrong.
 
-**A mute is refused** — the 30-day cap on one continuous mute. The error names
-it. How it counts, per mute key:
+**A mute is refused** — either the console's own 14-day limit on a single
+mute request (it asks for no more than 14 days at once, so one mistyped form
+cannot spend the whole budget), or the 30-day cap on one continuous mute. The
+error names which. How the 30-day cap counts, per mute key:
 - a new mute, or one whose previous mute has **lapsed**, starts a fresh
   episode that costs the days asked for;
 - extending an **active** mute costs only the days it actually adds;
@@ -379,12 +385,13 @@ suppression authority, so mutes expire on their own.
 | `heimdall_last_run_timestamp_seconds{plane="tier1"}` | detector completed |
 | `heimdall_analyst_last_success_timestamp_seconds` | analyst completed |
 | `heimdall_analyst_hypotheses_post_failed_total` | hypotheses the bridge refused last run |
+| `heimdall_analyst_hypotheses_bridge_held_total{reason}` | accepted but not sent: `deduped` or `suppressed` (an operator's mute) |
 | `heimdall_notifier_last_success_timestamp_seconds` | notifier cycle completed |
 | `heimdall_bridge_sweep_last_success_timestamp_seconds` | bridge escalation sweep completed cleanly |
 | `heimdall_bridge_storm_fused_total` / `heimdall_bridge_escalation_errors_total` | issues held back by the storm fuse / escalations that failed |
 | `heimdall_notifier_last_poll_success_timestamp_seconds` | last successful Telegram poll (0 = none since start) |
 | `heimdall_notifier_sink_oldest_pending_seconds{sink,channel}` | per-destination backlog age |
-| `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle |
+| `heimdall_notifier_sink_failed_total{sink}` | deliveries refused last cycle; `0` for every routed sink that refused none |
 | `heimdall_redaction_failures_total` | **content withheld — always investigate** |
 | `heimdall_digest_generated_timestamp_seconds` | digest freshness |
 | `heimdall_finding{check,target,...}` | 1 while firing or unknown |

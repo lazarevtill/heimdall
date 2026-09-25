@@ -24,6 +24,9 @@ func Marker(key string) (string, error) {
 // group/check are already constrained upstream, but a defensive re-check
 // keeps a bad manifest from minting a bad marker.
 func FindingKey(group, check string) (string, error) {
+	// Deliberately only the whole-key grammar, not the stricter per-part one
+	// the manifest loader enforces: alerts minted under an older, looser
+	// manifest must still be able to resolve (and close) their tickets.
 	key := group + "--" + check
 	if !keyRE.MatchString(key) {
 		return "", fmt.Errorf("tracker: invalid finding key %q (from group=%q check=%q): must match ^[a-z0-9-]{1,64}$", key, group, check)
